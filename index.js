@@ -160,11 +160,16 @@ function runProcess(bin, args, { cwd, timeoutSec = 900, input } = {}) {
     const started = Date.now()
     let child
     try {
+      // stdin 必须显式给个已关闭的管道：codex 在非 TTY 下会等 stdin EOF，
+      // 继承父进程的 stdin 会一直挂着（踩过，表现为「Reading additional input from stdin...」然后超时）
       child = spawn(bin, args, {
         cwd: cwd || undefined,
         windowsHide: true,
         env: process.env,
+        stdio: ['pipe', 'pipe', 'pipe'],
       })
+      if (input) child.stdin.end(input)
+      else child.stdin.end()
     } catch (error) {
       resolve({ code: -1, stdout: '', stderr: String(error?.message ?? error), ms: 0, timedOut: false })
       return
@@ -199,14 +204,6 @@ function runProcess(bin, args, { cwd, timeoutSec = 900, input } = {}) {
       clearTimeout(timer)
       resolve({ code, stdout, stderr, ms: Date.now() - started, timedOut })
     })
-    if (input) {
-      try {
-        child.stdin?.write(input)
-        child.stdin?.end()
-      } catch {
-        /* ignore */
-      }
-    }
   })
 }
 
@@ -770,7 +767,7 @@ export function apply(ctx, config = {}) {
       const blocks = raw.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
       const answer = blocks.length ? blocks[blocks.length - 1] : ''
       const tokens = (raw.match(/tokens used\s*\n\s*([\d,]+)/i) || [])[1] || null
-      const sid = pickSessionId(raw) || (resumed ? known : null)
+      const sid = pickSessionId(raw) || pickSessionId(err) || (resumed ? known : null)
 
       if (name && sid) {
         index[name] = { id: sid, cwd: workdir, updated: new Date().toISOString() }
