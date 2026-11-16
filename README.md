@@ -53,6 +53,14 @@ codex_run(prompt="实现 scripts/x.mjs …，跑 node --test scripts/x.test.mjs"
 
 `sandbox` 默认 `read-only`，真让它改文件要显式给 `workspace-write`。
 
+## 两个坑（踩过）
+
+1. **sandbox 是在建会话时定死的**。用 read-only 建的会话，后面 resume 也不能写文件——
+   `codex exec resume` 没有 `-s` 参数。要写文件就在第一次调用时给 workspace-write，
+   给错了就把 ~/.dsh/codex-sessions.json 里那个名字删掉重开。
+2. **spawn 时必须显式关 stdin**。codex 在非 TTY 下会等 stdin EOF，继承父进程的 stdin 会一直挂着
+   （现象：打印 Reading additional input from stdin... 然后超时）。
+
 ## 验收规矩
 
 codex 交活之后**不许直接信**：
