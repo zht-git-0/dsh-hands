@@ -740,14 +740,17 @@ export function apply(ctx, config = {}) {
 
       let argv
       let resumed = false
+      // 注意：resume 会丢掉建会话时的沙箱，默认回到 read-only。
+      // 必须每次用 -c sandbox_mode=... 显式带上，否则续会话就写不了文件。
+      const sandboxArg = `sandbox_mode="${sandbox}"`
       if (known) {
         // 续同一个会话：codex exec resume <id> <prompt>
-        argv = ['exec', 'resume', '--skip-git-repo-check', known]
+        argv = ['exec', 'resume', '--skip-git-repo-check', '-c', sandboxArg, known]
         if (args?.model) argv.push('-m', String(args.model))
         argv.push(prompt)
         resumed = true
       } else if (args?.resumeLast) {
-        argv = ['exec', 'resume', '--skip-git-repo-check', '--last']
+        argv = ['exec', 'resume', '--skip-git-repo-check', '-c', sandboxArg, '--last']
         if (args?.model) argv.push('-m', String(args.model))
         argv.push(prompt)
         resumed = true
@@ -764,8 +767,18 @@ export function apply(ctx, config = {}) {
 
       const raw = String(result.stdout ?? '')
       const err = String(result.stderr ?? '')
-      const blocks = raw.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
-      const answer = blocks.length ? blocks[blocks.length - 1] : ''
+      // codex 会把最终答复在末尾再打一遍，紧跟 "tokens used" 之后。
+      // 只取最后一块会把长答复截断（踩过：要 12 条清单只回来第 12 条），
+      // 所以从最后一个 "tokens used" 之后整段取，取不到再退回最后一块。
+      const cut = raw.lastIndexOf('tokens used')
+      let answer = ''
+      if (cut >= 0) {
+        answer = raw.slice(cut).replace(/tokens used\s*\n\s*[\d,]+/i, '').trim()
+      }
+      if (!answer) {
+        const blocks = raw.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
+        answer = blocks.length ? blocks[blocks.length - 1] : ''
+      }
       const tokens = (raw.match(/tokens used\s*\n\s*([\d,]+)/i) || [])[1] || null
       const sid = pickSessionId(raw) || pickSessionId(err) || (resumed ? known : null)
 
