@@ -662,13 +662,31 @@ export function apply(ctx, config = {}) {
 
   // ── codex（OpenAI Codex CLI）：写代码这个手下 ────────────────────────────
 
+  // 会话索引：名字 -> { id, cwd, updated }，和 agy 那套一个思路
+  const CODEX_INDEX = path.join(os.homedir(), '.dsh', 'codex-sessions.json')
+
+  function loadCodexIndex() {
+    return readJson(CODEX_INDEX, {}) || {}
+  }
+
+  function saveCodexIndex(index) {
+    writeJson(CODEX_INDEX, index)
+  }
+
+  // codex 会把 "session id: <uuid>" 打在输出开头，拿来续会话
+  function pickSessionId(raw) {
+    const m = String(raw || '').match(/session id:\s*([0-9a-fA-F-]{16,})/)
+    return m ? m[1] : null
+  }
+
   ctx.tools.register({
     name: 'codex_run',
     description:
       'Run one non-interactive turn of codex (the OpenAI Codex CLI) and return its final answer. ' +
       'codex is the coding hand: it reads and writes files in the working directory and runs shell commands. ' +
       'Use it for implementation work, refactors and test writing. Its output is not trustworthy by itself — ' +
-      'rerun the tests yourself and check `git status` afterwards.',
+      'rerun the tests yourself and check `git status` afterwards. ' +
+      'Pass `session` (a stable name) to keep talking in the same codex conversation across calls.',
     parameters: {
       type: 'object',
       properties: {
@@ -679,6 +697,16 @@ export function apply(ctx, config = {}) {
             'and how it should prove the work (e.g. "run node --test scripts/x.test.mjs").',
         },
         cwd: { type: 'string', description: 'Working directory. Omit to inherit the current session directory.' },
+        session: {
+          type: 'string',
+          description:
+            'A stable name for this line of work. The same name always resumes the same codex conversation; ' +
+            'the first call with a new name starts one. Omit for a throwaway one-shot run.',
+        },
+        resumeLast: {
+          type: 'boolean',
+          description: 'Resume the most recent codex session instead of starting a new one.',
+        },
         sandbox: {
           type: 'string',
           enum: ['read-only', 'workspace-write', 'danger-full-access'],
@@ -691,32 +719,69 @@ export function apply(ctx, config = {}) {
       additionalProperties: false,
     },
     output: {
-      schema: { type: 'object', properties: { status: { type: 'string' }, response: { type: 'string' } } },
+      schema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string' },
+          response: { type: 'string' },
+          sessionId: { type: 'string' },
+          resumed: { type: 'boolean' },
+        },
+      },
       render: (_args, value) => asText(value),
     },
     async execute(args) {
       const prompt = String(args?.prompt ?? '')
       if (!prompt.trim()) throw new Error('prompt is required')
+
+      const index = loadCodexIndex()
+      const name = args?.session ? String(args.session) : ''
+      const known = name && index[name] ? index[name].id : null
+
       const sandbox = String(args?.sandbox || 'read-only')
-      const argv = ['exec', '--skip-git-repo-check', '-s', sandbox]
-      if (args?.model) argv.push('-m', String(args.model))
-      argv.push(prompt)
+      const workdir = args?.cwd ? path.resolve(String(args.cwd)) : process.cwd()
+
+      let argv
+      let resumed = false
+      if (known) {
+        // 续同一个会话：codex exec resume <id> <prompt>
+        argv = ['exec', 'resume', '--skip-git-repo-check', known]
+        if (args?.model) argv.push('-m', String(args.model))
+        argv.push(prompt)
+        resumed = true
+      } else if (args?.resumeLast) {
+        argv = ['exec', 'resume', '--skip-git-repo-check', '--last']
+        if (args?.model) argv.push('-m', String(args.model))
+        argv.push(prompt)
+        resumed = true
+      } else {
+        argv = ['exec', '--skip-git-repo-check', '-s', sandbox]
+        if (args?.model) argv.push('-m', String(args.model))
+        argv.push(prompt)
+      }
 
       const result = await runProcess(codexBin, argv, {
-        cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
+        cwd: workdir,
         timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
       })
 
       const raw = String(result.stdout ?? '')
       const err = String(result.stderr ?? '')
-      // codex 把最终答复重复打印在最后一段，取最后一个非空块就够了
       const blocks = raw.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
       const answer = blocks.length ? blocks[blocks.length - 1] : ''
       const tokens = (raw.match(/tokens used\s*\n\s*([\d,]+)/i) || [])[1] || null
+      const sid = pickSessionId(raw) || (resumed ? known : null)
+
+      if (name && sid) {
+        index[name] = { id: sid, cwd: workdir, updated: new Date().toISOString() }
+        saveCodexIndex(index)
+      }
 
       return clean({
         status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
         response: answer || raw.slice(-4000) || err.slice(-2000),
+        sessionId: sid || '',
+        resumed,
         exitCode: result.code,
         tokens: tokens ? Number(String(tokens).replace(/,/g, '')) : null,
         ms: result.ms,
