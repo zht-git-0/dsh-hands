@@ -10,7 +10,7 @@ window.__ModuleLoader__.load({
     const TAB_KIND = 'hands';
     // 灰度开关：默认仍走旧扁平列表；改成 true 才挂 v2 三列。
     // 旧 createHandsFeed / HandsSidebar 一行不删，切回 false 就是完整回滚路径。
-    const USE_V2 = false;
+    const USE_V2 = true;
 
     const en = {
       title: 'Hands',
@@ -54,6 +54,10 @@ window.__ModuleLoader__.load({
       v2Back: 'Back',
       v2Turns: '{n} turns',
       v2Today: '{n} today',
+      v2Hands: 'Hands',
+      v2TodayTimes: '{n} today',
+      v2Idle: 'Idle',
+      v2RunningN: '{n} running',
       v2Cancel: 'Cancel',
       v2Rerun: 'Rerun',
       v2Cancelling: 'Cancelling…',
@@ -113,6 +117,10 @@ window.__ModuleLoader__.load({
       v2Back: '返回',
       v2Turns: '{n} 轮',
       v2Today: '今日 {n} 轮',
+      v2Hands: '手下',
+      v2TodayTimes: '今日 {n} 次',
+      v2Idle: '空闲',
+      v2RunningN: '在跑 {n}',
       v2Cancel: '取消',
       v2Rerun: '重跑',
       v2Cancelling: '取消中…',
@@ -1490,67 +1498,84 @@ window.__ModuleLoader__.load({
     // 宽度断点由组件量出来的 data-mode 决定，这里只负责三档布局。
     const V2_CSS = `
       .dsh-hands-v2{display:flex;flex-direction:column;flex:auto;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}
-      .dsh-hands-v2-body{display:flex;flex:1;min-width:0;min-height:0}
+      .dsh-hands-v2-body{display:flex;flex:1;min-width:0;min-height:0;overflow:hidden}
       .dsh-hands-v2-error{flex:none;margin:6px 8px 0;padding:5px 8px;border:.5px solid var(--dsw-alias-state-error-primary);border-radius:var(--dsw-radius-sm);color:var(--dsw-alias-state-error-primary);font-size:11px;line-height:16px;overflow-wrap:anywhere}
-      .dsh-hands-v2-rail{flex:none;width:52px;display:flex;flex-direction:column;gap:2px;padding:6px 4px;border-right:.5px solid var(--dsw-alias-border-l2);overflow:auto;overscroll-behavior:contain}
-      .dsh-hands-v2-rail[data-drill=true]{width:100%;padding:8px;border-right:0}
-      .dsh-hands-v2-railItem{display:flex;flex-direction:column;align-items:center;gap:1px;padding:5px 2px;border:0;border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer}
-      .dsh-hands-v2-rail[data-drill=true] .dsh-hands-v2-railItem{flex-direction:row;justify-content:flex-start;gap:8px;width:100%;padding:8px 10px}
-      .dsh-hands-v2-railItem:hover{background:var(--dsw-alias-interactive-bg-hover)}
-      .dsh-hands-v2-railItem[data-active=true]{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
-      .dsh-hands-v2-railShort{font-size:11px;line-height:15px;font-weight:600;letter-spacing:.02em}
-      .dsh-hands-v2-railToday{font-size:10px;line-height:14px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
+      .dsh-hands-v2,.dsh-hands-v2 *{box-sizing:border-box}
+      .dsh-hands-v2-rail{flex:none;display:flex;flex-direction:column;width:clamp(168px,24%,220px);min-width:0;padding:8px 6px;border-right:.5px solid var(--dsw-alias-border-l2);overflow:hidden}
+      .dsh-hands-v2-railHead{flex:none;padding:0 6px 6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:16px}
+      .dsh-hands-v2-agentList{flex:1;min-height:0;display:flex;flex-direction:column;gap:6px;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain}
+      .dsh-hands-v2-agent{position:relative;flex:none;display:flex;align-items:center;gap:10px;width:100%;min-height:56px;padding:8px 10px;border:0;border-radius:10px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
+      .dsh-hands-v2-agent:hover{background:var(--dsw-alias-interactive-bg-hover)}
+      .dsh-hands-v2-agent[data-active=true]{background:var(--dsw-alias-interactive-bg-hover);box-shadow:inset 0 0 0 1px var(--dsw-alias-brand-primary)}
+      .dsh-hands-v2-agentIcon{flex:none;display:flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:10px;color:#fff;font-size:11.5px;font-weight:600;letter-spacing:.02em}
+      .dsh-hands-v2-agentText{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
+      .dsh-hands-v2-agentName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:14px;color:var(--dsw-alias-label-primary);font-size:12.5px;line-height:17px;font-weight:500}
+      .dsh-hands-v2-agentMeta{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:15px}
+      .dsh-hands-v2-agentDot{position:absolute;top:8px;right:8px;width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-label-tertiary);opacity:.4}
+      .dsh-hands-v2-agentDot[data-tone=running]{background:var(--dsw-alias-state-success-primary);opacity:1;--tone-color:var(--dsw-alias-state-success-primary);animation:dsh-hands-pulse 1.6s ease-out infinite}
       .dsh-hands-v2-dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--tone-color,var(--dsw-alias-label-tertiary))}
       .dsh-hands-v2-dot[data-tone=running]{animation:dsh-hands-pulse 1.6s ease-out infinite}
-      .dsh-hands-v2-sessions{flex:none;display:flex;flex-direction:column;min-width:0;width:clamp(116px,28%,180px);border-right:.5px solid var(--dsw-alias-border-l2)}
-      .dsh-hands-v2[data-mode=drill] .dsh-hands-v2-sessions,.dsh-hands-v2[data-mode=drill] .dsh-hands-v2-thread{width:100%;border-right:0}
-      .dsh-hands-v2-colHead{display:flex;align-items:center;gap:6px;flex:none;padding:7px 8px;border-bottom:.5px solid var(--dsw-alias-border-l2)}
-      .dsh-hands-v2-colTitle{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:600}
+      .dsh-hands-v2-sessions{flex:none;display:flex;flex-direction:column;width:clamp(150px,22%,200px);min-width:0;border-right:.5px solid var(--dsw-alias-border-l2);overflow:hidden}
+      .dsh-hands-v2[data-mode=narrow] .dsh-hands-v2-rail{width:130px}
+      .dsh-hands-v2[data-mode=narrow] .dsh-hands-v2-sessions{width:120px}
+      .dsh-hands-v2[data-mode=narrow] .dsh-hands-v2-railHead{padding:0 4px 6px}
+      .dsh-hands-v2[data-mode=drill] .dsh-hands-v2-rail,.dsh-hands-v2[data-mode=drill] .dsh-hands-v2-sessions,.dsh-hands-v2[data-mode=drill] .dsh-hands-v2-thread{width:100%;border-right:0}
+      .dsh-hands-v2-colHead{display:flex;align-items:center;gap:6px;flex:none;min-width:0;padding:8px 8px 6px}
+      .dsh-hands-v2-colTitle{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px;font-weight:600}
       .dsh-hands-v2-liveTag{flex:none;font-size:10px;line-height:14px;color:var(--dsw-alias-label-tertiary);border:.5px solid var(--dsw-alias-border-l2);border-radius:999px;padding:0 5px;white-space:nowrap}
       .dsh-hands-v2-liveTag[data-connected=true]{color:var(--dsw-alias-state-success-primary);border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary) 35%,var(--dsw-alias-border-l2))}
       .dsh-hands-v2-iconBtn{flex:none;width:22px;height:22px;padding:0;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;line-height:1;cursor:pointer}
       .dsh-hands-v2-iconBtn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
-      .dsh-hands-v2-list{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain}
-      .dsh-hands-v2-row{display:flex;flex-direction:column;gap:1px;width:100%;padding:6px 8px;border:0;border-bottom:.5px solid var(--dsw-alias-border-l2);background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
+      .dsh-hands-v2-list{flex:1;min-height:0;display:flex;flex-direction:column;gap:4px;padding:0 6px 8px;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain}
+      .dsh-hands-v2-row{position:relative;flex:none;display:flex;flex-direction:column;gap:2px;width:100%;padding:6px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:inherit;font:inherit;text-align:left;cursor:pointer;overflow:hidden}
       .dsh-hands-v2-row:hover{background:var(--dsw-alias-interactive-bg-hover)}
       .dsh-hands-v2-row[data-active=true]{background:var(--dsw-alias-interactive-bg-hover)}
-      .dsh-hands-v2-rowName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
-      .dsh-hands-v2-rowMeta{display:flex;align-items:center;gap:4px;overflow:hidden;color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:14px;white-space:nowrap}
-      .dsh-hands-v2-thread{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
-      .dsh-hands-v2-threadHead{display:flex;align-items:center;gap:6px;flex:none;min-width:0;padding:7px 10px;border-bottom:.5px solid var(--dsw-alias-border-l2)}
-      .dsh-hands-v2-threadMain{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
-      .dsh-hands-v2-threadName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:600}
-      .dsh-hands-v2-threadMeta{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:14px}
+      .dsh-hands-v2-row[data-active=true]::before{content:'';position:absolute;top:7px;bottom:7px;left:0;width:2px;border-radius:1px;background:var(--dsw-alias-brand-primary)}
+      .dsh-hands-v2-rowTop{display:flex;align-items:center;gap:5px;min-width:0}
+      .dsh-hands-v2-rowName{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:16px}
+      .dsh-hands-v2-rowTurns{flex:none;color:var(--dsw-alias-label-tertiary);font-size:10.5px;line-height:14px;font-variant-numeric:tabular-nums}
+      .dsh-hands-v2-rowTime{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:15px}
+      .dsh-hands-v2-thread{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden}
+      .dsh-hands-v2-threadHead{display:flex;flex-direction:column;gap:4px;flex:none;min-width:0;padding:8px 10px 6px;border-bottom:.5px solid var(--dsw-alias-border-l2)}
+      .dsh-hands-v2-threadTop{display:flex;align-items:center;gap:6px;min-width:0}
+      .dsh-hands-v2-threadMain{flex:1;min-width:0;display:flex;align-items:center;gap:6px}
+      .dsh-hands-v2-threadName{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px;font-weight:600}
+      .dsh-hands-v2-threadChips{display:flex;align-items:center;flex-wrap:wrap;gap:4px;min-width:0}
+      .dsh-hands-v2-chip{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0 6px;border:.5px solid var(--dsw-alias-border-l2);border-radius:999px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-tertiary);font-size:10.5px;line-height:16px}
       .dsh-hands-v2-threadActions{display:flex;align-items:center;gap:4px;flex:none}
       .dsh-hands-v2-btn{flex:none;height:20px;padding:0 7px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:10px;line-height:18px;white-space:nowrap;cursor:pointer}
       .dsh-hands-v2-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
       .dsh-hands-v2-btn:disabled{opacity:.45;cursor:default}
       .dsh-hands-v2-headError{flex:none;padding:4px 10px;border-bottom:.5px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-state-error-primary);font-size:10px;line-height:15px;overflow-wrap:anywhere}
       .dsh-hands-v2-threadBody{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain}
-      .dsh-hands-v2-turns{display:flex;flex-direction:column;gap:14px;padding:10px 10px 14px}
-      .dsh-hands-v2-turn{display:flex;flex-direction:column;gap:5px;min-width:0;border-radius:8px}
+      .dsh-hands-v2-turns{display:flex;flex-direction:column;gap:14px;padding:12px 10px 16px;min-width:0}
+      .dsh-hands-v2-turn{display:flex;flex-direction:column;gap:4px;min-width:0;border-radius:10px}
       .dsh-hands-v2-turn[data-active=true]{outline:1px solid color-mix(in srgb,var(--dsw-alias-state-business-primary) 35%,transparent);outline-offset:2px}
-      .dsh-hands-v2-bubble{box-sizing:border-box;min-width:0;max-width:88%;padding:6px 9px;border:.5px solid var(--dsw-alias-border-l2);border-radius:10px;overflow-wrap:anywhere}
-      .dsh-hands-v2-bubbleUser{align-self:flex-start;background:var(--dsw-alias-interactive-bg-hover);border-color:transparent}
-      .dsh-hands-v2-bubbleAgent{align-self:flex-end;background:var(--dsw-alias-bg-layer-1)}
-      .dsh-hands-v2-bubbleLabel{margin-bottom:2px;font-size:10px;line-height:14px;font-weight:600;color:var(--dsw-alias-label-tertiary)}
-      .dsh-hands-v2-bubbleAgent .dsh-hands-v2-bubbleLabel{color:var(--hand-color,var(--dsw-alias-label-tertiary))}
-      .dsh-hands-v2-bubbleText{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:19px;color:var(--dsw-alias-label-primary)}
+      .dsh-hands-v2-msg{display:flex;flex-direction:column;gap:4px;min-width:0;max-width:88%}
+      .dsh-hands-v2-msgUser{align-self:flex-end;align-items:flex-end}
+      .dsh-hands-v2-msgAgent{align-self:flex-start;align-items:flex-start}
+      .dsh-hands-v2-bubble{box-sizing:border-box;min-width:0;max-width:100%;padding:9px 12px;color:var(--dsw-alias-label-primary);font-size:12px;line-height:19px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
+      .dsh-hands-v2-bubbleUser{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 16%,transparent);border-radius:14px 14px 4px 14px}
+      .dsh-hands-v2-bubbleAgent{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:14px 14px 14px 4px}
+      .dsh-hands-v2-bubbleLabel{display:inline-flex;align-items:center;gap:4px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:10.5px;line-height:14px}
+      .dsh-hands-v2-bubbleText{margin:0;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:12px;line-height:19px;color:var(--dsw-alias-label-primary)}
       .dsh-hands-v2-bubbleAgent .dsh-hands-stream{max-height:46vh;min-height:20px;overflow:auto;overscroll-behavior:contain}
-      .dsh-hands-v2-bubbleAgent .dsh-hands-streamText{display:block;margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;font-size:12px;line-height:19px;color:var(--dsw-alias-label-primary)}
+      .dsh-hands-v2-bubbleAgent .dsh-hands-streamText{display:block;margin:0;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font:inherit;font-size:12px;line-height:19px;color:var(--dsw-alias-label-primary)}
       .dsh-hands-v2-waiting{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:19px}
       .dsh-hands-v2 .dsh-hands-cursor{display:inline-block;width:6px;height:13px;margin-left:2px;vertical-align:-2px;background:var(--dsw-alias-brand-primary);border-radius:1px;animation:dsh-hands-blink 1s steps(1) infinite}
       .dsh-hands-v2-expand{align-self:flex-start;margin-top:4px;padding:0;border:0;background:transparent;color:var(--dsw-alias-state-business-primary);font:inherit;font-size:11px;line-height:16px;cursor:pointer}
+      .dsh-hands-v2-msgUser .dsh-hands-v2-expand{align-self:flex-end}
       .dsh-hands-v2-expand:hover{text-decoration:underline}
-      .dsh-hands-v2-metaRow{display:flex;align-items:center;flex-wrap:wrap;gap:2px 8px;min-width:0;padding:0 2px;color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:14px}
+      .dsh-hands-v2-metaRow{align-self:flex-start;display:flex;align-items:center;flex-wrap:wrap;gap:2px 8px;min-width:0;max-width:100%;padding:0 2px;color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:14px}
       .dsh-hands-v2-metaStatus{display:inline-flex;align-items:center;gap:4px;white-space:nowrap;color:var(--tone-color,var(--dsw-alias-label-tertiary))}
       .dsh-hands-v2-metaBit{white-space:nowrap;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;max-width:100%}
       .dsh-hands-v2-older{align-self:center;padding:3px 10px;border:.5px solid var(--dsw-alias-border-l2);border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:10px;line-height:16px;cursor:pointer}
       .dsh-hands-v2-older:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
       .dsh-hands-v2-older:disabled{opacity:.5;cursor:default}
-      .dsh-hands-v2-hint{display:flex;align-items:center;justify-content:center;min-height:80px;padding:20px 12px;text-align:center;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+      .dsh-hands-v2-hint{flex:1;display:flex;align-items:center;justify-content:center;min-height:80px;padding:20px 12px;text-align:center;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+      @keyframes dsh-hands-pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--tone-color,var(--dsw-alias-label-tertiary)) 45%,transparent)}70%{box-shadow:0 0 0 5px transparent}100%{box-shadow:0 0 0 0 transparent}}
       @keyframes dsh-hands-blink{0%,49%{opacity:1}50%,100%{opacity:0}}
-      @media (prefers-reduced-motion:reduce){.dsh-hands-v2-dot[data-tone=running]{animation:none}.dsh-hands-v2 .dsh-hands-cursor{animation:none}}
+      @media (prefers-reduced-motion:reduce){.dsh-hands-v2-dot[data-tone=running],.dsh-hands-v2-agentDot[data-tone=running]{animation:none}.dsh-hands-v2 .dsh-hands-cursor{animation:none}}
     `;
 
     // ── 单条输出：自己管滚动，贴底时自动跟随 ──────────────────────────────
@@ -1880,76 +1905,107 @@ window.__ModuleLoader__.load({
       return React.useSyncExternalStore(store.subscribe, read, read);
     }
 
+    // 图标里只放两个字母，四家一人一种底色（和 HAND_COLOR 同一套 token）。
     function handShort(hand) {
       const key = String(hand || '').toLowerCase();
-      if (key === 'agy') return 'AGY';
-      if (key === 'codex') return 'CDX';
-      if (key === 'claude') return 'CLD';
+      if (key === 'agy') return 'AG';
+      if (key === 'codex') return 'CD';
+      if (key === 'claude') return 'CL';
       if (key === 'opencode') return 'OC';
-      return key.slice(0, 3).toUpperCase() || '—';
+      return key.slice(0, 2).toUpperCase() || '—';
+    }
+
+    // agent 卡片主标题：服务端 label 形如「agy（文案）」，去掉括号里的注解只留名字。
+    function handTitle(agent) {
+      const label = String(agent?.label || '').trim();
+      const hand = String(agent?.hand || '');
+      const stripped = label
+        .replace(/[（(][^（()）]*[）)]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return stripped || hand || '—';
+    }
+
+    // 第三列的 cwd chip 只显示最后一段，整条路径放 title。
+    function lastPathPart(value) {
+      const text = String(value || '').replace(/[\\/]+$/, '');
+      if (!text) return '';
+      const parts = text.split(/[\\/]/);
+      return parts[parts.length - 1] || text;
     }
 
     function HandsRail(props) {
-      const { store, t, mode, onPick } = props;
+      const { store, t, onPick } = props;
       const slice = useStoreSlice(store, 'agents');
-      const drill = mode === 'drill';
       return h(
         'div',
-        {
-          className: 'dsh-hands-v2-rail',
-          'data-drill': drill ? 'true' : 'false',
-          style: drill ? undefined : { width: mode === 'narrow' ? 44 : 52 },
-        },
-        slice.agents.map((agent) => {
-          const hand = String(agent.hand || '');
-          const running = Number(agent.running) || 0;
-          const tone = running > 0 ? 'running' : toneOf(agent);
-          return h(
-            'button',
-            {
-              key: hand || 'hand',
-              type: 'button',
-              className: 'dsh-hands-v2-railItem',
-              'data-active': slice.hand === hand ? 'true' : 'false',
-              title: agent.label || hand,
-              onClick: () => onPick(hand),
-            },
-            h('span', {
-              className: 'dsh-hands-v2-dot',
-              'data-tone': tone,
-              style: { '--tone-color': TONE_COLOR[tone] || TONE_COLOR.unknown },
-            }),
-            h(
-              'span',
+        { className: 'dsh-hands-v2-rail' },
+        h('div', { className: 'dsh-hands-v2-railHead' }, t('v2Hands')),
+        h(
+          'div',
+          { className: 'dsh-hands-v2-agentList' },
+          slice.agents.map((agent) => {
+            const hand = String(agent.hand || '');
+            const running = Number(agent.running) || 0;
+            const tone = running > 0 ? 'running' : toneOf(agent);
+            const sub = [
+              t('v2TodayTimes', { n: Number(agent.today) || 0 }),
+              running > 0 ? t('v2RunningN', { n: running }) : t('v2Idle'),
+            ].join(' · ');
+            return h(
+              'button',
               {
-                className: 'dsh-hands-v2-railShort',
-                style: { color: HAND_COLOR[hand] || 'inherit' },
+                key: hand || 'hand',
+                type: 'button',
+                className: 'dsh-hands-v2-agent',
+                'data-active': slice.hand === hand ? 'true' : 'false',
+                title: agent.label || hand,
+                onClick: () => onPick(hand),
               },
-              handShort(hand),
-            ),
-            h('span', { className: 'dsh-hands-v2-railToday' }, String(Number(agent.today) || 0)),
-            drill ? h('span', { className: 'dsh-hands-v2-railToday' }, agent.label || hand) : null,
-          );
-        }),
-        !slice.agents.length
-          ? h(
-              'div',
-              { className: 'dsh-hands-v2-hint' },
-              slice.phase === 'error' ? t('loadFailed') : t('loading'),
-            )
-          : null,
+              h(
+                'span',
+                {
+                  className: 'dsh-hands-v2-agentIcon',
+                  style: { background: HAND_COLOR[hand] || 'var(--dsw-alias-label-tertiary)' },
+                  'aria-hidden': true,
+                },
+                handShort(hand),
+              ),
+              h(
+                'span',
+                { className: 'dsh-hands-v2-agentText' },
+                h('span', { className: 'dsh-hands-v2-agentName' }, handTitle(agent)),
+                h('span', { className: 'dsh-hands-v2-agentMeta' }, sub),
+              ),
+              h('span', { className: 'dsh-hands-v2-agentDot', 'data-tone': tone }),
+            );
+          }),
+          !slice.agents.length
+            ? h(
+                'div',
+                { className: 'dsh-hands-v2-hint' },
+                slice.phase === 'error' ? t('loadFailed') : t('loading'),
+              )
+            : null,
+        ),
       );
     }
 
     function HandsSessions(props) {
       const { store, t, mode, meta, onPick, onBack } = props;
       const slice = useStoreSlice(store, 'sessions');
+      const agents = useStoreSlice(store, 'agents');
+      const current =
+        agents.agents.find((agent) => String(agent?.hand || '') === String(slice.hand || '')) ||
+        null;
+      const title = current
+        ? handTitle(current)
+        : slice.hand
+          ? handLabel(slice.hand, t)
+          : t('v2PickHand');
       return h(
         'div',
-        {
-          className: 'dsh-hands-v2-sessions',
-          style: mode === 'narrow' ? { width: 100 } : undefined,
-        },
+        { className: 'dsh-hands-v2-sessions' },
         h(
           'div',
           { className: 'dsh-hands-v2-colHead' },
@@ -1966,19 +2022,14 @@ window.__ModuleLoader__.load({
                 '‹',
               )
             : null,
-          h(
-            'span',
-            { className: 'dsh-hands-v2-colTitle' },
-            slice.hand ? handLabel(slice.hand, t) : t('v2PickHand'),
-          ),
-          h(
-            'span',
-            {
-              className: 'dsh-hands-v2-liveTag',
-              'data-connected': meta.connected ? 'true' : 'false',
-            },
-            meta.connected ? t('live') : t('reconnecting'),
-          ),
+          h('span', { className: 'dsh-hands-v2-colTitle', title }, title),
+          meta.connected
+            ? null
+            : h(
+                'span',
+                { className: 'dsh-hands-v2-liveTag', 'data-connected': 'false' },
+                t('reconnecting'),
+              ),
           h(
             'button',
             {
@@ -2007,18 +2058,25 @@ window.__ModuleLoader__.load({
                     'data-active': slice.selectedKey && key === slice.selectedKey ? 'true' : 'false',
                     onClick: () => onPick(String(row.hand || slice.hand || ''), key),
                   },
-                  h('span', { className: 'dsh-hands-v2-rowName' }, row.name || t('noSession')),
                   h(
                     'span',
-                    { className: 'dsh-hands-v2-rowMeta' },
+                    { className: 'dsh-hands-v2-rowTop' },
+                    h('span', { className: 'dsh-hands-v2-rowName' }, row.name || t('noSession')),
+                    h(
+                      'span',
+                      { className: 'dsh-hands-v2-rowTurns' },
+                      t('v2Turns', { n: Number(row.turns) || 0 }),
+                    ),
                     h('span', {
                       className: 'dsh-hands-v2-dot',
                       'data-tone': tone,
                       style: { '--tone-color': TONE_COLOR[tone] || TONE_COLOR.unknown },
                     }),
-                    h('span', null, formatTime(row.lastAt, t) || '—'),
-                    h('span', null, '·'),
-                    h('span', null, t('v2Turns', { n: Number(row.turns) || 0 })),
+                  ),
+                  h(
+                    'span',
+                    { className: 'dsh-hands-v2-rowTime' },
+                    formatTime(row.lastAt || row.startedAt, t) || '—',
                   ),
                 );
               }),
@@ -2053,24 +2111,28 @@ window.__ModuleLoader__.load({
       const canExpand = full.length > PROMPT_LIMIT;
       return h(
         'div',
-        { className: 'dsh-hands-v2-bubble dsh-hands-v2-bubbleUser' },
+        { className: 'dsh-hands-v2-msg dsh-hands-v2-msgUser' },
         h('div', { className: 'dsh-hands-v2-bubbleLabel' }, t('youToHand')),
         h(
           'div',
-          { className: 'dsh-hands-v2-bubbleText' },
-          canExpand && !expanded ? `${full.slice(0, PROMPT_LIMIT)}…` : full,
+          { className: 'dsh-hands-v2-bubble dsh-hands-v2-bubbleUser' },
+          h(
+            'div',
+            { className: 'dsh-hands-v2-bubbleText' },
+            canExpand && !expanded ? `${full.slice(0, PROMPT_LIMIT)}…` : full,
+          ),
+          canExpand
+            ? h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-hands-v2-expand',
+                  onClick: () => setExpanded((value) => !value),
+                },
+                expanded ? t('v2Collapse') : t('v2Expand'),
+              )
+            : null,
         ),
-        canExpand
-          ? h(
-              'button',
-              {
-                type: 'button',
-                className: 'dsh-hands-v2-expand',
-                onClick: () => setExpanded((value) => !value),
-              },
-              expanded ? t('v2Collapse') : t('v2Expand'),
-            )
-          : null,
       );
     }
 
@@ -2084,32 +2146,45 @@ window.__ModuleLoader__.load({
       const hand = String(turn?.hand || '').toLowerCase();
       const loadFull = source === 'excerpt' && typeof props.onNeedBody === 'function';
       const showToggle = canExpand || loadFull;
+      const handColor = HAND_COLOR[hand] || 'var(--dsw-alias-label-secondary)';
       const toggle = () => {
         if (loadFull) props.onNeedBody();
         if (canExpand) setExpanded((value) => !value);
       };
       return h(
         'div',
-        {
-          className: 'dsh-hands-v2-bubble dsh-hands-v2-bubbleAgent',
-          'data-source': source,
-          style: { '--hand-color': HAND_COLOR[hand] || 'var(--dsw-alias-label-secondary)' },
-        },
-        h('div', { className: 'dsh-hands-v2-bubbleLabel' }, handLabel(hand, t)),
-        full || running
-          ? h(Stream, {
-              text: canExpand && !expanded ? full.slice(0, BODY_LIMIT) : full,
-              running,
-              t,
-            })
-          : h('div', { className: 'dsh-hands-v2-waiting' }, t('noOutput')),
-        showToggle
-          ? h(
-              'button',
-              { type: 'button', className: 'dsh-hands-v2-expand', onClick: toggle },
-              expanded ? t('v2Collapse') : loadFull ? t('v2LoadFull') : t('v2Expand'),
-            )
-          : null,
+        { className: 'dsh-hands-v2-msg dsh-hands-v2-msgAgent' },
+        h(
+          'div',
+          { className: 'dsh-hands-v2-bubbleLabel' },
+          h('span', {
+            className: 'dsh-hands-v2-dot',
+            'data-tone': running ? 'running' : 'idle',
+            style: { '--tone-color': handColor },
+          }),
+          handLabel(hand, t),
+        ),
+        h(
+          'div',
+          {
+            className: 'dsh-hands-v2-bubble dsh-hands-v2-bubbleAgent',
+            'data-source': source,
+          },
+          full || running
+            ? h(Stream, {
+                text: canExpand && !expanded ? full.slice(0, BODY_LIMIT) : full,
+                running,
+                t,
+              })
+            : h('div', { className: 'dsh-hands-v2-waiting' }, t('noOutput')),
+          showToggle
+            ? h(
+                'button',
+                { type: 'button', className: 'dsh-hands-v2-expand', onClick: toggle },
+                expanded ? t('v2Collapse') : loadFull ? t('v2LoadFull') : t('v2Expand'),
+              )
+            : null,
+        ),
       );
     }
 
@@ -2290,66 +2365,80 @@ window.__ModuleLoader__.load({
       const running = turnIsRunning(activeTurn);
       const finished = !!activeTurn && !running;
       const busy = !!action?.pending;
-      const metaBits = [];
-      if (row?.cwd) metaBits.push(row.cwd);
-      if (row?.model) metaBits.push(row.model);
-      metaBits.push(t('v2Today', { n: Number(row?.today ?? turns.length) || 0 }));
-      const meta = metaBits.join(' · ');
+      const chips = [];
+      if (row?.cwd) {
+        chips.push({ key: 'cwd', text: lastPathPart(row.cwd), title: String(row.cwd) });
+      }
+      if (row?.model) chips.push({ key: 'model', text: String(row.model), title: String(row.model) });
+      chips.push({
+        key: 'today',
+        text: t('v2Today', { n: Number(row?.today ?? turns.length) || 0 }),
+      });
       return h(
         'div',
         { className: 'dsh-hands-v2-threadHead' },
-        mode === 'drill'
-          ? h(
+        h(
+          'div',
+          { className: 'dsh-hands-v2-threadTop' },
+          mode === 'drill'
+            ? h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-hands-v2-iconBtn',
+                  title: t('v2Back'),
+                  'aria-label': t('v2Back'),
+                  onClick: onBack,
+                },
+                '‹',
+              )
+            : null,
+          h(
+            'div',
+            { className: 'dsh-hands-v2-threadMain' },
+            h('span', {
+              className: 'dsh-hands-v2-dot',
+              'data-tone': tone,
+              style: { '--tone-color': TONE_COLOR[tone] || TONE_COLOR.unknown },
+            }),
+            h(
+              'div',
+              { className: 'dsh-hands-v2-threadName' },
+              row?.name || fallbackName || t('v2PickSession'),
+            ),
+          ),
+          h(
+            'div',
+            { className: 'dsh-hands-v2-threadActions' },
+            h(
               'button',
               {
                 type: 'button',
-                className: 'dsh-hands-v2-iconBtn',
-                title: t('v2Back'),
-                'aria-label': t('v2Back'),
-                onClick: onBack,
+                className: 'dsh-hands-v2-btn',
+                disabled: !running || busy,
+                title: t('v2Cancel'),
+                onClick: onCancel,
               },
-              '‹',
-            )
-          : null,
-        h('span', {
-          className: 'dsh-hands-v2-dot',
-          'data-tone': tone,
-          style: { '--tone-color': TONE_COLOR[tone] || TONE_COLOR.unknown },
-        }),
-        h(
-          'div',
-          { className: 'dsh-hands-v2-threadMain' },
-          h(
-            'div',
-            { className: 'dsh-hands-v2-threadName' },
-            row?.name || fallbackName || t('v2PickSession'),
+              action?.pending === 'cancel' ? t('v2Cancelling') : t('v2Cancel'),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-hands-v2-btn',
+                disabled: !finished || busy,
+                title: t('v2Rerun'),
+                onClick: onRerun,
+              },
+              action?.pending === 'rerun' ? t('v2Rerunning') : t('v2Rerun'),
+            ),
           ),
-          h('div', { className: 'dsh-hands-v2-threadMeta', title: meta }, meta),
         ),
         h(
           'div',
-          { className: 'dsh-hands-v2-threadActions' },
-          h(
-            'button',
-            {
-              type: 'button',
-              className: 'dsh-hands-v2-btn',
-              disabled: !running || busy,
-              title: t('v2Cancel'),
-              onClick: onCancel,
-            },
-            action?.pending === 'cancel' ? t('v2Cancelling') : t('v2Cancel'),
-          ),
-          h(
-            'button',
-            {
-              type: 'button',
-              className: 'dsh-hands-v2-btn',
-              disabled: !finished || busy,
-              title: t('v2Rerun'),
-              onClick: onRerun,
-            },
-            action?.pending === 'rerun' ? t('v2Rerunning') : t('v2Rerun'),
+          { className: 'dsh-hands-v2-threadChips' },
+          chips.map((chip) =>
+            h('span', { key: chip.key, className: 'dsh-hands-v2-chip', title: chip.title }, chip.text),
           ),
         ),
       );
@@ -2447,7 +2536,8 @@ window.__ModuleLoader__.load({
         return () => observer.disconnect();
       }, []);
 
-      const mode = width === 0 ? 'wide' : width >= 520 ? 'wide' : width >= 360 ? 'narrow' : 'drill';
+      // 三档宽度：>=560 双列 + 对话，420–560 收窄两列，<420 钻取一次只看一列。
+      const mode = width === 0 ? 'wide' : width >= 560 ? 'wide' : width >= 420 ? 'narrow' : 'drill';
       const meta = useStoreSlice(store, 'meta');
       const selection = useStoreSlice(store, 'selection');
       const leaf = mode === 'drill' ? view : 'all';
@@ -2475,7 +2565,7 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'dsh-hands-v2-body' },
-          showRail ? h(HandsRail, { key: 'rail', store, t, mode, onPick: pickHand }) : null,
+          showRail ? h(HandsRail, { key: 'rail', store, t, onPick: pickHand }) : null,
           showSessions
             ? h(HandsSessions, {
                 key: 'sessions',

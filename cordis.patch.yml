@@ -3,8 +3,9 @@
       name: 'dsh-hands'
       config:
         agyBin: 'C:/Users/Administrator/AppData/Local/agy/bin/agy.exe'
-        codexBin: 'C:/Users/Administrator/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe'
-        claudeBin: 'C:/Users/Administrator/.local/bin/claude.exe'
+        codexBin: 'D:/Program/environment/nodejs/codex.cmd'
+        claudeBin: 'D:/Program/environment/nodejs/claude.exe'
         opencodeBin: 'D:/Program/environment/nodejs/opencode.cmd'
         timeoutSec: 900
         skipPermissions: true
+        acpHands: ['opencode']

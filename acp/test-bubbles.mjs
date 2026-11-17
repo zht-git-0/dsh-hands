@@ -194,4 +194,29 @@ const t = (key, vars) => {
   console.log('4) BubbleUser 截断 ok')
 }
 
+// ── 5. 气泡左右对调：你（右，msgUser）/ 手下（左，msgAgent）─────────────────
+{
+  const userTree = render(h(BubbleUser, { t, prompt: 'ship it' }))
+  assert.ok(hasClass(userTree, 'dsh-hands-v2-msg'), 'user 气泡有 msg 容器（负责 align-self）')
+  assert.ok(hasClass(userTree, 'dsh-hands-v2-msgUser'), 'user 气泡靠右（msgUser）')
+  assert.equal(hasClass(userTree, 'dsh-hands-v2-msgAgent'), false, 'user 气泡不混用 agent 容器')
+  assert.ok(hasClass(userTree, 'dsh-hands-v2-bubbleUser'), '保留 bubbleUser 配色类')
+  assert.match(allText(userTree), /youToHand/, 'user 气泡上方是「你 → 手下」小字')
+
+  const agentTree = render(
+    h(BubbleAgent, {
+      t,
+      turn: { id: 'a1', hand: 'opencode', status: 'OK', ok: true },
+      view: resolveTurnBody({ id: 'a1', hand: 'opencode', status: 'OK', ok: true }, 'done body', ''),
+      onNeedBody() {},
+    }),
+  )
+  assert.ok(hasClass(agentTree, 'dsh-hands-v2-msgAgent'), 'agent 气泡靠左（msgAgent）')
+  assert.equal(hasClass(agentTree, 'dsh-hands-v2-msgUser'), false, 'agent 气泡不混用 user 容器')
+  assert.ok(hasClass(agentTree, 'dsh-hands-v2-bubbleAgent'), '保留 bubbleAgent 描边类')
+  assert.ok(hasClass(agentTree, 'dsh-hands-v2-dot'), 'agent 气泡上方带身份色点')
+  assert.match(allText(agentTree), /handOpencode/, 'agent 小字用手下名字')
+  console.log('5) 气泡左右对调 ok')
+}
+
 console.log('ok')
