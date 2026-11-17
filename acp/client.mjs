@@ -13,6 +13,14 @@ const SPECS = {
     command: process.env.AGY_BIN || "C:\\Users\\Administrator\\AppData\\Local\\agy\\bin\\agy.exe",
     args: ["acp"],
   },
+  codex: {
+    command: "cmd.exe",
+    args: ["/c", "codex-acp"],
+  },
+  claude: {
+    command: "cmd.exe",
+    args: ["/c", "claude-agent-acp"],
+  },
 };
 
 export class AcpClient {

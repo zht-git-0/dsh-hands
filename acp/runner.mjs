@@ -46,16 +46,18 @@ class RunnerClient extends AcpClient {
 
 // 选模型：标准 ACP 是 session/set_model；opencode 没有这个方法，
 // 退到 session/set_config_option（configId=model）。尽力而为，选不上不搅黄任务。
-async function selectModel(client, sessionId, model) {
-  if (!model) return;
+// 没显式给 model 时，用 session 自带的 currentModelId 兜底（agy 不选就报 plan model not specified）。
+async function selectModel(client, sessionId, model, session) {
+  const mid = model || session?.models?.currentModelId;
+  if (!mid) return;
   try {
-    await client.request("session/set_model", { sessionId, modelId: model }, MODEL_TIMEOUT_MS);
+    await client.request("session/set_model", { sessionId, modelId: mid }, MODEL_TIMEOUT_MS);
     return;
   } catch {
     /* 换 config option 再试 */
   }
   try {
-    await client.request("session/set_config_option", { sessionId, configId: "model", value: model }, MODEL_TIMEOUT_MS);
+    await client.request("session/set_config_option", { sessionId, configId: "model", value: mid }, MODEL_TIMEOUT_MS);
   } catch {
     /* 两条路都不通就算了 */
   }
@@ -103,12 +105,13 @@ async function openSession({ agent, cwd, onUpdate, permission, sessionId }) {
         }
       }
     }
+    let sessionValue = null;
     if (resumed) {
       client.sessionId = sessionId; // client.prompt 依赖这个字段
     } else {
-      await client.newSession(dir);
+      sessionValue = await client.newSession(dir);
     }
-    return { client, state, sessionId: client.sessionId, resumed };
+    return { client, state, sessionId: client.sessionId, resumed, session: sessionValue };
   } catch (error) {
     client.close();
     throw error;
@@ -121,13 +124,13 @@ async function openSession({ agent, cwd, onUpdate, permission, sessionId }) {
  * prompt(text, { timeoutMs, model }) → { text, stopReason, usage }，失败会抛，由调用方处理。
  */
 export async function createAcpSession({ agent, cwd, onUpdate, permission } = {}) {
-  const { client, state, sessionId } = await openSession({ agent, cwd, onUpdate, permission });
+  const { client, state, sessionId, session } = await openSession({ agent, cwd, onUpdate, permission });
   return {
     sessionId,
     async prompt(text, opts = {}) {
       state.chunks = [];
       state.usage = null;
-      await selectModel(client, sessionId, opts.model);
+      await selectModel(client, sessionId, opts.model, session);
       const result = await client.prompt(text, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
       return {
         text: state.chunks.join(""),
@@ -172,7 +175,7 @@ export async function runAcpTask({
     opened = await openSession({ agent, cwd, onUpdate, permission, sessionId });
     out.sessionId = opened.sessionId;
     out.resumed = opened.resumed;
-    await selectModel(opened.client, opened.sessionId, model);
+    await selectModel(opened.client, opened.sessionId, model, opened.session);
     opened.state.chunks = []; // load 重放的历史不算这轮的输出
     opened.state.usage = null;
     const result = await opened.client.prompt(prompt, timeoutMs);
