@@ -6,7 +6,10 @@
 |---|---|---|
 | `agy`（Antigravity CLI） | 文案、写作、风格 | `agy_run` `agy_session` `agy_sessions` `agy_agents` `agy_models` |
 | `codex`（OpenAI Codex CLI） | 写代码、跑测试 | `codex_run` |
+| `claude`（Claude Code） | 架构级规划、设计评审 | `claude_run` |
 | — | 探活 | `hands_status` |
+
+三层分工：**claude 出方案 → codex 落地 → 希可验收**。
 
 ## 装
 
@@ -42,6 +45,15 @@ agy_run(prompt="写一支 60 秒口播稿…", cwd="…", session="deepseek 限�
 ```
 
 同一 `session` 名字会一直续同一个会话，适合反复改稿。
+
+**架构规划找 claude**
+
+```
+claude_run(prompt="读 docs/runtime.md，给「多游戏实例化」出一个分层方案…",
+           cwd="D:/Program/projects/AI_game", session="架构规划")
+```
+
+`permissionMode` 默认 `plan`（只读推理）。它读代码、出方案，但**它说的每一条关于代码的话都要自己核**。
 
 **写代码找 codex**
 

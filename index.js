@@ -226,6 +226,11 @@ function parseJsonOutput(stdout) {
   }
 }
 
+const DEFAULT_CLAUDE_BIN =
+  process.platform === 'win32'
+    ? path.join(os.homedir(), '.local', 'bin', 'claude.exe')
+    : 'claude'
+
 const DEFAULT_CODEX_BIN =
   process.platform === 'win32'
     ? path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'OpenAI', 'Codex', 'bin', 'codex.exe')
@@ -234,6 +239,7 @@ const DEFAULT_CODEX_BIN =
 export function apply(ctx, config = {}) {
   const bin = config.agyBin || config.bin || DEFAULT_BIN
   const codexBin = config.codexBin || DEFAULT_CODEX_BIN
+  const claudeBin = config.claudeBin || DEFAULT_CLAUDE_BIN
   const defaultTimeout = Number(config.timeoutSec) || 900
   const skipPermissions = config.skipPermissions !== false
 
@@ -824,6 +830,107 @@ export function apply(ctx, config = {}) {
         await probe('codex 写代码', codexBin, ['--version']),
       ]
       return { text: lines.join('\n') }
+    },
+  })
+
+  // ── claude（Claude Code CLI）：架构规划这个手下 ───────────────────────────
+
+  const CLAUDE_INDEX = path.join(os.homedir(), '.dsh', 'claude-sessions.json')
+
+  ctx.tools.register({
+    name: 'claude_run',
+    description:
+      'Run one non-interactive turn of Claude Code (the `claude` CLI) and return its answer. ' +
+      'Use it for architecture-level planning and design review: it reads the repo and reasons about structure. ' +
+      'Pass `session` (a stable name) to keep talking in the same conversation. ' +
+      'Its claims are not verified — check anything it asserts about the code before acting on it.',
+    parameters: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'The complete brief: goal, what to read, what to report.' },
+        cwd: { type: 'string', description: 'Working directory. Omit to inherit the current session directory.' },
+        session: {
+          type: 'string',
+          description:
+            'A stable name for this line of work. The same name resumes the same conversation; ' +
+            'the first call with a new name starts one. Omit for a throwaway run.',
+        },
+        model: { type: 'string', description: 'Model id override, e.g. "claude-opus-4-6". Omit to use ~/.claude/settings.json.' },
+        permissionMode: {
+          type: 'string',
+          enum: ['plan', 'acceptEdits', 'auto'],
+          description: 'plan = read-only reasoning (default); acceptEdits lets it edit files; auto also runs commands.',
+        },
+        timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900).' },
+      },
+      required: ['prompt'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string' },
+          response: { type: 'string' },
+          sessionId: { type: 'string' },
+          resumed: { type: 'boolean' },
+        },
+      },
+      render: (_args, value) => asText(value),
+    },
+    async execute(args) {
+      const prompt = String(args?.prompt ?? '')
+      if (!prompt.trim()) throw new Error('prompt is required')
+
+      const index = readJson(CLAUDE_INDEX, {}) || {}
+      const name = args?.session ? String(args.session) : ''
+      const known = name && index[name] ? index[name].id : null
+
+      const argv = ['-p', prompt, '--output-format', 'json']
+      if (args?.model) argv.push('--model', String(args.model))
+      if (args?.permissionMode) argv.push('--permission-mode', String(args.permissionMode))
+      if (known) argv.push('--resume', known)
+
+      const result = await runProcess(claudeBin, argv, {
+        cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
+        timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
+      })
+
+      const raw = String(result.stdout ?? '')
+      const err = String(result.stderr ?? '')
+      let parsed = null
+      try {
+        parsed = JSON.parse(raw.trim())
+      } catch {
+        // 有时前面会有杂行，取第一个 { 到最后一个 } 再试一次
+        const a = raw.indexOf('{')
+        const b = raw.lastIndexOf('}')
+        if (a >= 0 && b > a) {
+          try {
+            parsed = JSON.parse(raw.slice(a, b + 1))
+          } catch {}
+        }
+      }
+
+      const sid = (parsed && parsed.session_id) || known || ''
+      if (name && sid) {
+        index[name] = { id: sid, cwd: args?.cwd || '', updated: new Date().toISOString() }
+        writeJson(CLAUDE_INDEX, index)
+      }
+
+      const usage = (parsed && parsed.usage) || {}
+      return clean({
+        status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
+        response: parsed
+          ? String(parsed.result ?? '')
+          : raw.slice(-4000) || err.slice(-2000),
+        sessionId: sid,
+        resumed: !!known,
+        cost: parsed ? parsed.total_cost_usd : null,
+        cacheRead: usage.cache_read_input_tokens ?? null,
+        exitCode: result.code,
+        ms: result.ms,
+      })
     },
   })
 }

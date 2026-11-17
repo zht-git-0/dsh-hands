@@ -4,5 +4,6 @@
       config:
         agyBin: 'C:/Users/Administrator/AppData/Local/agy/bin/agy.exe'
         codexBin: 'C:/Users/Administrator/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe'
+        claudeBin: 'C:/Users/Administrator/.local/bin/claude.exe'
         timeoutSec: 900
         skipPermissions: true
