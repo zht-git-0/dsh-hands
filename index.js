@@ -247,8 +247,62 @@ function tailUtf8(value, maxBytes) {
   return buf.subarray(start).toString('utf8')
 }
 
+// 杀一整棵进程树。只针对我们自己 spawn 出来的 pid，绝不按镜像名连坐。
+// Windows 上 CLI 常常再套一层 cmd/孙进程，child.kill() 会留下孤儿，所以走 taskkill /T /F；
+// 其它平台先按进程组杀（spawn 时若 detach 过），再退回单 pid。
+// 纯函数、只吃 pid，方便 acp/test-cancel.mjs 直接 import。
+export function killProcessTree(pid) {
+  const target = Number(pid)
+  if (!Number.isFinite(target) || target <= 0) return Promise.resolve(false)
+
+  if (process.platform === 'win32') {
+    return new Promise((resolve) => {
+      let settled = false
+      const settle = (value) => {
+        if (settled) return
+        settled = true
+        resolve(value)
+      }
+      let killer
+      try {
+        killer = spawn('taskkill', ['/PID', String(target), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+        })
+      } catch {
+        settle(false)
+        return
+      }
+      // taskkill 自己卡住时别把 HTTP 响应拖死
+      const timer = setTimeout(() => settle(false), 10000)
+      killer.on('error', () => {
+        clearTimeout(timer)
+        settle(false)
+      })
+      killer.on('close', (code) => {
+        clearTimeout(timer)
+        settle(code === 0)
+      })
+    })
+  }
+
+  // 先试进程组（pid 前面加负号），不行再单杀
+  try {
+    process.kill(-target, 'SIGTERM')
+    return Promise.resolve(true)
+  } catch {
+    /* 不是组长 */
+  }
+  try {
+    process.kill(target, 'SIGTERM')
+    return Promise.resolve(true)
+  } catch {
+    return Promise.resolve(false)
+  }
+}
+
 // 跑一次 agy。不经过 shell，参数数组直接交给 spawn，中文和空格都不会被拆坏。
-function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk } = {}) {
+function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk, onSpawn } = {}) {
   return new Promise((resolve) => {
     const started = Date.now()
     let child
@@ -270,6 +324,12 @@ function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk } = {}) {
       })
       if (input) child.stdin.end(input)
       else child.stdin.end()
+      // spawn 成功就把句柄交出去记账（RUNNING_PROCS）；这里出错不能影响进程本体
+      try {
+        onSpawn?.(child)
+      } catch {
+        /* 记账失败不影响跑活 */
+      }
     } catch (error) {
       resolve({ code: -1, stdout: '', stderr: String(error?.message ?? error), ms: 0, timedOut: false })
       return
@@ -757,7 +817,15 @@ export function apply(ctx, config = {}) {
   }
 
   const RUNNING = new Map()
+  // 在跑的进程句柄：id -> { child, startedAt, run }。单独存一份，绝不塞进 RUNNING：
+  // RUNNING 会被 clean() 递归序列化，ChildProcess 有循环引用会直接炸。
+  const RUNNING_PROCS = new Map()
   let runSeq = 0
+
+  function trackProc(id, child, run) {
+    if (!id) return
+    RUNNING_PROCS.set(String(id), { child, startedAt: Date.now(), run })
+  }
 
   function startDispatch(fields = {}) {
     const id = `${Date.now().toString(36)}-${(++runSeq).toString(36)}`
@@ -806,6 +874,8 @@ export function apply(ctx, config = {}) {
       id,
       startedMs,
       entry,
+      cancelled: false,
+      finished: false,
       push(chunk, source) {
         live.feed(chunk, source)
         entry.output = live.render()
@@ -820,8 +890,10 @@ export function apply(ctx, config = {}) {
   }
 
   // 把一次派发收尾：从运行中移除，元信息进日志，全文进 hands-jobs。
+  // 幂等：cancel 先收尾之后，工具那条 await 分支再收一次就是空操作，不会写出两条 end。
   function finishDispatch(run, fields = {}) {
-    if (!run) return
+    if (!run || run.finished) return false
+    run.finished = true
     run.flush?.()
     const output = String(run.entry.output || '')
     const endMs = Date.now()
@@ -831,6 +903,7 @@ export function apply(ctx, config = {}) {
     const sessionKey =
       run.entry.sessionKey || sessionKeyOf(run.entry.hand, run.entry.session, startedMs)
     RUNNING.delete(run.id)
+    RUNNING_PROCS.delete(run.id)
     appendRecord(
       clean({
         v: 2,
@@ -859,6 +932,7 @@ export function apply(ctx, config = {}) {
       }),
     )
     touchHistory()
+    return true
   }
 
   function runningList() {
@@ -909,11 +983,15 @@ export function apply(ctx, config = {}) {
   }
 
   // 各家 exit code / 自报状态不一致，统一折算成「成没成」。
+  // CANCELLED 是单独一类：不算成功，也别被下面的 code !== 0 兜底改写成 ERROR。
+  const FAILED_STATUS = ['ERROR', 'FAILED', 'UNPARSED']
   function outcome(result, reported) {
+    if (result?.cancelled) return { status: 'CANCELLED', ok: false }
     if (result.timedOut) return { status: 'TIMEOUT', ok: false }
     let status = String(reported || (result.code === 0 ? 'OK' : 'ERROR')).toUpperCase()
-    if (result.code !== 0 && !['ERROR', 'FAILED', 'UNPARSED'].includes(status)) status = 'ERROR'
-    const failed = status === 'ERROR' || status === 'FAILED' || status === 'UNPARSED'
+    if (status === 'CANCELLED') return { status, ok: false }
+    if (result.code !== 0 && !FAILED_STATUS.includes(status)) status = 'ERROR'
+    const failed = FAILED_STATUS.includes(status)
     return { status, ok: result.code === 0 && !failed }
   }
 
@@ -1099,6 +1177,70 @@ export function apply(ctx, config = {}) {
               }
             }
 
+            if (u.pathname === '/dsh-hands/cancel') {
+              if (req.method !== 'POST') return fail(405, 'POST only')
+              try {
+                const body = parseBody(await readBody(req))
+                const id = String(body.id || '')
+                if (!id) return fail(400, 'id is required')
+                const proc = RUNNING_PROCS.get(id)
+                if (!proc || proc.run?.finished) {
+                  // 幂等：跑完的、取消过的、不存在的 id 都按「没在跑」回，别谎报成功
+                  return send(404, {
+                    ok: false,
+                    error: 'not running',
+                    id,
+                    hint: 'already finished or unknown id',
+                  })
+                }
+                const pid = proc.child?.pid
+                // 先收尾再杀：工具那条 await 回来时会看到 run.finished，不会写出第二条 end
+                if (proc.run) {
+                  proc.run.cancelled = true
+                  finishDispatch(proc.run, {
+                    status: 'CANCELLED',
+                    ok: false,
+                    ms: Number.isFinite(proc.startedAt) ? Date.now() - proc.startedAt : undefined,
+                    error: 'cancelled',
+                    excerpt: 'cancelled',
+                  })
+                }
+                RUNNING_PROCS.delete(id)
+                // 只杀自己起的 pid 的进程树；taskkill /T /F 因为 CLI 常留孙进程。
+                const treeKilled = await killProcessTree(pid)
+                return send(200, { ok: true, id, killed: true, pid: pid || null, treeKilled })
+              } catch (e) {
+                return fail(500, e)
+              }
+            }
+
+            if (u.pathname === '/dsh-hands/rerun') {
+              if (req.method !== 'POST') return fail(405, 'POST only')
+              try {
+                const body = parseBody(await readBody(req))
+                const id = String(body.id || '')
+                if (!id) return fail(400, 'id is required')
+                const job = mergedJobs().find((item) => String(item.id || '') === id)
+                if (!job) return fail(404, 'not found')
+                const prompt =
+                  body.prompt === undefined || body.prompt === null
+                    ? String(job.prompt || '')
+                    : String(body.prompt)
+                if (!prompt.trim()) return fail(400, 'prompt is required')
+                // 只起进程、不 await：HTTP 先回新 id，活跑后台
+                const run = rerunInBackground(job, prompt)
+                if (!run) return fail(400, `unknown hand: ${job.hand || ''}`)
+                return send(200, {
+                  ok: true,
+                  id: run.id,
+                  hand: String(job.hand || ''),
+                  sessionKey: run.entry.sessionKey,
+                })
+              } catch (e) {
+                return fail(500, e)
+              }
+            }
+
             return send(404, { error: 'unknown path' })
           } catch (e) {
             return send(500, { error: String(e?.message ?? e) })
@@ -1203,7 +1345,12 @@ export function apply(ctx, config = {}) {
         cwd: args?.cwd || '',
         model: args?.model || '',
       })
-      const result = await runProcess(bin, argv, { cwd: args?.cwd, timeoutSec, onChunk: run.push })
+      const result = await runProcess(bin, argv, {
+        cwd: args?.cwd,
+        timeoutSec,
+        onChunk: run.push,
+        onSpawn: (child) => trackProc(run.id, child, run),
+      })
       const parsed = collectAgy(result.stdout)
       const verdict = outcome(result, parsed?.status ?? (result.code === 0 ? 'SUCCESS' : 'ERROR'))
       finishDispatch(run, {
@@ -1572,6 +1719,7 @@ export function apply(ctx, config = {}) {
         cwd: workdir,
         timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
         onChunk: run.push,
+        onSpawn: (child) => trackProc(run.id, child, run),
       })
       const raw = String(result.stdout ?? '')
       const err = String(result.stderr ?? '')
@@ -1729,6 +1877,7 @@ export function apply(ctx, config = {}) {
         cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
         timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
         onChunk: run.push,
+        onSpawn: (child) => trackProc(run.id, child, run),
       })
 
       const raw = String(result.stdout ?? '')
@@ -1846,6 +1995,7 @@ export function apply(ctx, config = {}) {
         cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
         timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
         onChunk: run.push,
+        onSpawn: (child) => trackProc(run.id, child, run),
       })
 
       // opencode 出的是 JSONL 事件流
@@ -2020,6 +2170,98 @@ export function apply(ctx, config = {}) {
     return {}
   }
 
+  // ── rerun：从一条历史记录重放 ─────────────────────────────────────────────
+  //
+  // prompt 默认沿用原记录，body.prompt 给了就替换；hand/session/cwd/write/model
+  // 全照抄。argv 复用 HANDS[hand].build()（各 *_run 的细节参数没落日志，重建不了）。
+  function withModel(handKey, argv, model) {
+    const value = String(model || '')
+    if (!value) return argv
+    const flag = handKey === 'codex' ? '-m' : '--model'
+    if (argv.includes(flag)) return argv
+    // codex / opencode 的 prompt 固定在末尾，别把参数塞到它后面
+    if (handKey === 'codex' || handKey === 'opencode') {
+      return [...argv.slice(0, -1), flag, value, argv[argv.length - 1]]
+    }
+    return [...argv, flag, value]
+  }
+
+  function rerunInBackground(job, prompt) {
+    const handKey = String(job?.hand || '')
+    const handDef = HANDS[handKey]
+    if (!handDef) return null
+
+    const name = String(job.session || '')
+    let known = String(job.conversationId || '')
+    if (!known && name) {
+      const index = readJson(handDef.index(), {}) || {}
+      if (index[name]?.id) known = String(index[name].id)
+    }
+    const write = !!job.write
+    const model = String(job.model || '')
+    const runCwd = job.cwd ? path.resolve(String(job.cwd)) : process.cwd()
+    const argv = withModel(handKey, handDef.build(prompt, { write, model }, known || null), model)
+
+    const run = startDispatch({
+      hand: handKey,
+      tool: String(job.tool || 'hands_run'),
+      prompt,
+      write,
+      session: name,
+      conversationId: known,
+      cwd: runCwd,
+      model,
+    })
+
+    // 后台跑：调用方已经拿到新 id，这里任何失败都只能落进日志，不能往外抛。
+    void (async () => {
+      let result
+      try {
+        result = await runProcess(handDef.bin(), argv, {
+          cwd: runCwd,
+          timeoutSec: defaultTimeout,
+          onChunk: run.push,
+          onSpawn: (child) => trackProc(run.id, child, run),
+        })
+      } catch (error) {
+        result = { code: -1, stdout: '', stderr: String(error?.message ?? error), ms: 0, timedOut: false }
+      }
+      if (run.finished) return // 中途被 /cancel 收尾过了
+      try {
+        const raw = String(result.stdout ?? '')
+        const err = String(result.stderr ?? '')
+        const sid = handDef.pick(raw, runCwd) || handDef.pick(err, runCwd) || known || ''
+        if (name && sid && sid !== known) {
+          const index = readJson(handDef.index(), {}) || {}
+          index[name] = { id: sid, cwd: job.cwd || '', updated: new Date().toISOString() }
+          writeJson(handDef.index(), index)
+        }
+        const answer =
+          extractAnswer(handKey, raw) ||
+          String(run.entry.output || '').slice(-3000) ||
+          err.slice(-3000) ||
+          raw.slice(-3000)
+        const verdict = outcome(result, reportedStatus(handKey, raw))
+        const usage = usageOf(handKey, raw)
+        finishDispatch(run, {
+          status: verdict.status,
+          ok: verdict.ok,
+          ms: result.ms,
+          exitCode: result.code,
+          excerpt: answer,
+          error: result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
+          conversationId: sid,
+          tokens: usage.tokens,
+          cost: usage.cost,
+        })
+      } catch (error) {
+        finishDispatch(run, { status: 'ERROR', ok: false, error: String(error?.message ?? error) })
+      }
+    })()
+
+    return run
+  }
+
   ctx.tools.register({
     name: 'hands_run',
     description:
@@ -2084,6 +2326,7 @@ export function apply(ctx, config = {}) {
         cwd: runCwd,
         timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
         onChunk: run.push,
+        onSpawn: (child) => trackProc(run.id, child, run),
       })
 
       const raw = String(result.stdout ?? '')
