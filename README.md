@@ -34,6 +34,7 @@ plugin_manager install_bundle  target=D:\Program\projects\dsh-hands
         codexBin: '...codex.exe'
         timeoutSec: 900
         skipPermissions: true
+        acpHands: []          # 例如 ['opencode']：该家改走 ACP（失败自动回退 CLI）
 ```
 
 路径用正斜杠，别写反斜杠（YAML 里的 `\U` 会被当成转义）。
@@ -112,6 +113,64 @@ hands_run(to="opencode", prompt="…", cwd="…", session="aigame", write=true)
 
 桌面端第一次加载新面板需要重启一次（link bundle 的 HMR 不生效）；之后改 `client.js` 也要重开页面或重启才能看到新代码。设置里的旧「手下调度」页已经删掉。
 
+## 三层面板 v2（默认关，`USE_V2 = false`）
+
+目标形态：**agent 名字条 → 会话列表 → 对话气泡**，越往左越细。
+
+```
+┌──────────┬──────────────┬─────────────────────────────┐
+│ 对话     │ 会话列表      │  交互详情                    │
+│ （已有）  │ 某 agent 下   │  左我说 / 右它说，流式 + 元信息 │
+└──────────┴──────────────┴─────────────────────────────┘
+     最右窄条：agent 名字 + 状态点 + 今日次数
+```
+
+- 开关：`client.js` 顶部 `const USE_V2 = false`；打开前旧扁平列表原样保留，出问题改回 false 即可。
+- 数据层：`createHandsStore()`（SSE v2 + 轮询回退 + 选中持久化 `localStorage['dsh.hands.sel']` + 正文增量）。
+- 宽度自适应：`>=520` 三列；`360–520` 窄三列；`<360` 钻取（agents → sessions → thread）。
+- 正文回落：`liveByTurn` → `/turn?id=&from=` 增量 → `excerpt`；增量由服务端算 `next`，前端只拼。
+
+### v2 HTTP 接口（前缀 `/dsh-hands`）
+
+| 接口 | 说明 |
+|---|---|
+| `GET /agents` | 四个手下的状态、今日次数、会话数、最近时间 |
+| `GET /sessions?hand=` | 会话列表（日志 ∪ 四个 `*-sessions.json`，含 NOT_STARTED） |
+| `GET /turns?key=&before=&limit=` | 某会话的轮次头（不含正文） |
+| `GET /turn?id=` | 单轮完整记录（含 output） |
+| `GET /turn?id=&from=N` | 正文增量：`{delta,next,eof}` |
+| `GET /health` | 四家并行探活 + 30s 缓存 |
+| `GET /stream?key=` | v2 SSE：`agents` / `sessions` / `turns` / `live` 四种事件 |
+| `POST /cancel` | `{id}`，`taskkill /T /F` 杀自己的进程树，状态记 `CANCELLED` |
+| `POST /rerun` | `{id,prompt?}`，从历史记录重放，后台跑、立刻回新 id |
+
+旧接口 `/log`、`/job`、`/ping`、无 key 的 `/stream` 保持原行为不变。
+
+### ACP 接入
+
+`acp/runner.mjs` 把四家统一成 ACP 客户端（`runAcpTask` / `createAcpSession`）：
+
+- opencode：`opencode acp`（原生）
+- agy：`agy acp`（原生，必须 `session/set_model` 指定模型）
+- codex：`codex-acp`
+- claude：`@agentclientprotocol/claude-agent-acp`
+
+`session/load` 会把历史重放成 `session/update`，runner 给这些更新标 `replay:true`，`stream.js` 的 `feedEvent` 直接丢弃，不会灌进本轮气泡。
+
+自测脚本（都在 `acp/`）：
+
+```bash
+node acp/four-agents.mjs        # 四家各跑一句
+node acp/runner.test.mjs        # 跨进程 resume，两轮
+node acp/test-turns.mjs         # /turns 纯函数
+node acp/test-live-delta.mjs    # live 增量
+node acp/test-health.mjs        # health 缓存/并发
+node acp/test-store.mjs         # 前端 store（SSE/轮询/选中）
+node acp/test-bubbles.mjs       # 气泡回落/元信息
+node acp/test-acp-map.mjs       # ACP update → 文本映射（含 replay 丢弃）
+node acp/test-cancel.mjs        # 进程树击杀
+```
+
 ## 调度上还没解决的问题（已知）
 
 - **改完插件要手动 toggle 一次**才生效：`set_bundle false` 再 `true`。HMR 对 link 类型的 bundle 不生效。
@@ -145,3 +204,5 @@ codex 交活之后**不许直接信**：
 插件名改 `hands`，加了 codex、claude、opencode 和统一入口。2.1.0 重新加了
 `client.js`，但只做「手下调度」这一个设置页，旧的 agy 会话管理页没有搬回来。
 2.2.0 把可视化从设置页搬到对话右侧边栏，并把四家的输出改成事件流，加了 SSE 实时推送。
+2.3.0 v2 数据层：派发改 start/end 双记录、启动时补 INTERRUPTED、`sessionKey`、全文另存 `~/.dsh/hands-jobs/`。
+2.4.0 三层面板：`/agents /sessions /turns /turn /health /cancel /rerun` + `/stream?key=` 四种事件；前端 `createHandsStore`、三列骨架、气泡与增量正文；ACP runner 接入（`acpHands` 开关，失败回退 CLI）。`USE_V2` 默认关，实机验证后再打开。
