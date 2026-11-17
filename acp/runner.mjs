@@ -65,9 +65,14 @@ async function selectModel(client, sessionId, model, session) {
 
 // 内部公共流程：起进程 → initialize → resume（load 优先，resume 次之）→ 不行就新建。
 // state 挂在 onUpdate 上收文本和 usage，prompt 失败时调用方还能拿到已收到的部分。
+//
+// onUpdate 语义：onUpdate(update) 收到的是 ACP 原始 session/update。
+// session/load、session/resume 会把历史重放成 session/update；这段时间内转发出去的对象
+// 一律带 replay:true，调用方（尤其 live view）应当整块丢弃。恢复完成后恢复正常（不带该字段）。
 async function openSession({ agent, cwd, onUpdate, permission, sessionId }) {
   const dir = cwd || process.cwd();
   const state = { chunks: [], usage: null };
+  let replaying = false;
   const client = new RunnerClient(agent, {
     cwd: dir,
     permission,
@@ -79,7 +84,7 @@ async function openSession({ agent, cwd, onUpdate, permission, sessionId }) {
         const { sessionUpdate, ...rest } = update;
         state.usage = update.usage ?? (Object.keys(rest).length ? rest : null);
       }
-      if (onUpdate) onUpdate(update);
+      if (onUpdate) onUpdate(replaying ? { ...update, replay: true } : update);
     },
   }).start();
 
@@ -87,22 +92,28 @@ async function openSession({ agent, cwd, onUpdate, permission, sessionId }) {
     const init = await client.initialize();
     let resumed = false;
     if (sessionId) {
-      // loadSession=true 才声明支持 session/load；load 会把历史重放成 session/update
-      if (init.agentCapabilities?.loadSession) {
-        try {
-          await client.request("session/load", { sessionId, cwd: dir, mcpServers: [] }, RESUME_TIMEOUT_MS);
-          resumed = true;
-        } catch {
-          /* 再试 resume */
+      // load / resume 全程打 replay 标：这两步会把历史重放成 session/update
+      replaying = true;
+      try {
+        // loadSession=true 才声明支持 session/load
+        if (init.agentCapabilities?.loadSession) {
+          try {
+            await client.request("session/load", { sessionId, cwd: dir, mcpServers: [] }, RESUME_TIMEOUT_MS);
+            resumed = true;
+          } catch {
+            /* 再试 resume */
+          }
         }
-      }
-      if (!resumed) {
-        try {
-          await client.request("session/resume", { sessionId, cwd: dir, mcpServers: [] }, RESUME_TIMEOUT_MS);
-          resumed = true;
-        } catch {
-          /* 都失败就新建会话 */
+        if (!resumed) {
+          try {
+            await client.request("session/resume", { sessionId, cwd: dir, mcpServers: [] }, RESUME_TIMEOUT_MS);
+            resumed = true;
+          } catch {
+            /* 都失败就新建会话 */
+          }
         }
+      } finally {
+        replaying = false;
       }
     }
     let sessionValue = null;
@@ -122,6 +133,9 @@ async function openSession({ agent, cwd, onUpdate, permission, sessionId }) {
  * 开一个常驻 ACP 会话（async：要等握手和建会话完成）。
  * 返回 { sessionId, prompt(text, opts), close() }；
  * prompt(text, { timeoutMs, model }) → { text, stopReason, usage }，失败会抛，由调用方处理。
+ *
+ * onUpdate(update)：ACP 原始 session/update，语义和 runAcpTask 相同：
+ * resume 重放的历史块带 replay:true（本函数目前不 resume，正常不会出现）。
  */
 export async function createAcpSession({ agent, cwd, onUpdate, permission } = {}) {
   const { client, state, sessionId, session } = await openSession({ agent, cwd, onUpdate, permission });
@@ -148,6 +162,10 @@ export async function createAcpSession({ agent, cwd, onUpdate, permission } = {}
  * 派一票活：起 agent → （可选 resume 同一会话）→ prompt → 关进程。
  * 永不抛异常；失败时 ok=false、error 带原因，已收到的文本保留在 text。
  * 返回 { ok, text, stopReason, sessionId, usage, ms, error, resumed }。
+ *
+ * onUpdate(update)：ACP 原始 session/update，用于流式展示。
+ * resume（session/load / session/resume）期间重放的历史块带 replay:true，调用方应丢弃；
+ * prompt 期间的更新不带 replay。
  */
 export async function runAcpTask({
   agent,

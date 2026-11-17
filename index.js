@@ -588,6 +588,14 @@ export function apply(ctx, config = {}) {
   const opencodeBin = config.opencodeBin || DEFAULT_OPENCODE_BIN
   const defaultTimeout = Number(config.timeoutSec) || 900
   const skipPermissions = config.skipPermissions !== false
+  // ACP 开关（第 6 步）：默认空 = 四家全走 CLI，和以前完全一样。
+  // 填 ['opencode'] 就让 opencode 走 ACP runner，其余照旧；一家一家切，出事删掉这个配置即可回退。
+  const acpHands = new Set(
+    (Array.isArray(config.acpHands) ? config.acpHands : String(config.acpHands || '').split(','))
+      .map((hand) => String(hand || '').trim().toLowerCase())
+      .filter(Boolean),
+  )
+  const useAcp = (hand) => acpHands.has(String(hand || '').toLowerCase())
   // /health 的四家探测：30s 缓存 + in-flight 合并，别让并发请求同时起四份进程。
   const healthCache = withHealthCache(
     () => healthPayload({ agy: bin, codex: codexBin, claude: claudeBin, opencode: opencodeBin }),
@@ -1073,6 +1081,13 @@ export function apply(ctx, config = {}) {
         entry.outputAt = Date.now()
         touchRunning()
       },
+      // ACP 的结构化更新走同一套 live view（feedEvent 内部丢弃 replay:true 的历史块）
+      feedEvent(update) {
+        live.feedEvent(update)
+        entry.output = live.render()
+        entry.outputAt = Date.now()
+        touchRunning()
+      },
       flush() {
         live.flush()
         entry.output = live.render()
@@ -1119,6 +1134,8 @@ export function apply(ctx, config = {}) {
         jobFile: jobFile || undefined,
         tokens: fields.tokens,
         cost: fields.cost,
+        stopReason: fields.stopReason ? String(fields.stopReason) : undefined,
+        runner: fields.runner ? String(fields.runner) : undefined,
         error: fields.error ? String(fields.error).slice(0, 1200) : undefined,
       }),
     )
@@ -1230,6 +1247,70 @@ export function apply(ctx, config = {}) {
     if (result.code !== 0 && !FAILED_STATUS.includes(status)) status = 'ERROR'
     const failed = FAILED_STATUS.includes(status)
     return { status, ok: result.code === 0 && !failed }
+  }
+
+  // ── ACP 分支（第 6 步）：config.acpHands 点名的手下先走 ACP，失败再回退 CLI ──────
+  //
+  // usage 各家形状不一：标准 ACP 是 { used, size, cost: { amount } }，
+  // opencode 实测把 used/size/cost 平铺在 update 上（runner 已摊平）；取不到就给 null，
+  // 面板成本栏留空可以接受，别为了凑数字瞎猜。
+  function acpUsageOf(usage) {
+    if (!usage || typeof usage !== 'object') return { tokens: null, cost: null }
+    let tokens = null
+    if (Number.isFinite(usage.used)) tokens = usage.used
+    else if (Number.isFinite(usage.totalTokens)) tokens = usage.totalTokens
+    else if (Number.isFinite(usage.inputTokens) || Number.isFinite(usage.outputTokens)) {
+      tokens = (Number(usage.inputTokens) || 0) + (Number(usage.outputTokens) || 0)
+    }
+    const raw = usage.cost && typeof usage.cost === 'object' ? usage.cost.amount : usage.cost
+    const cost = Number.isFinite(raw) ? raw : Number.isFinite(usage.totalCostUsd) ? usage.totalCostUsd : null
+    return { tokens, cost }
+  }
+
+  // 回退只记一行日志：phase 不写 start/end，也没有 id，mergedJobs 会直接跳过它，
+  // 不污染会话/轮次聚合。
+  function noteAcpFallback(hand, runId, error) {
+    appendRecord(
+      clean({
+        v: 2,
+        phase: 'acp-fallback',
+        at: new Date().toISOString(),
+        hand: String(hand || ''),
+        runId: String(runId || ''),
+        error: String(error || 'acp failed'),
+      }),
+    )
+  }
+
+  // 走一次 ACP。拿不到可用结果（动态 import 失败 / 抛异常 / ok=false）就返回 null，
+  // 由调用方回退一次 CLI —— ACP 挂了不能把工具本身弄失败。
+  // 权限按 write 折：write=false 一律拒（和 CLI 只读语义对齐），true 才自动放行。
+  // 注意：ACP 的进程句柄留在 runner 内部，本轮没接进 RUNNING_PROCS，/cancel 只对 CLI 生效。
+  async function runAcpTurn(hand, { run, prompt, cwd, model, timeoutSec, sessionId, write }) {
+    try {
+      const { runAcpTask } = await import('./acp/runner.mjs')
+      const result = await runAcpTask({
+        agent: hand,
+        cwd,
+        prompt,
+        model: model || undefined,
+        sessionId: sessionId || undefined,
+        timeoutMs: (Number(timeoutSec) || defaultTimeout) * 1000,
+        permission: write ? 'allow' : 'reject',
+        onUpdate: (update) => run.feedEvent?.(update),
+      })
+      if (result?.ok) return result
+      noteAcpFallback(hand, run.id, result?.error || 'acp failed')
+      return null
+    } catch (error) {
+      noteAcpFallback(hand, run.id, error?.message ?? error)
+      return null
+    }
+  }
+
+  // ACP 没有 exit code，用 ok 折算成 outcome() 认的形状；超时按错误文本认。
+  function acpOutcome(acp) {
+    return outcome({ code: acp?.ok ? 0 : 1, timedOut: /timeout/i.test(String(acp?.error || '')) })
   }
 
   // 宿主重启后先把上次的孤儿 start 收尸，再算今天的次数。
@@ -2340,12 +2421,9 @@ export function apply(ctx, config = {}) {
       const index = readJson(OPENCODE_INDEX, {}) || {}
       const name = args?.session ? String(args.session) : ''
       const known = name && index[name] ? index[name].id : null
-
-      const argv = ['run', '--format', 'json']
-      if (args?.model) argv.push('--model', String(args.model))
-      if (known) argv.push('--session', known)
-      if (args?.auto) argv.push('--auto')
-      argv.push(prompt)
+      const runCwd = args?.cwd ? path.resolve(String(args.cwd)) : process.cwd()
+      const model = args?.model ? String(args.model) : ''
+      const timeoutSec = Number(args?.timeoutSec) || defaultTimeout
 
       const run = startDispatch({
         hand: 'opencode',
@@ -2354,54 +2432,103 @@ export function apply(ctx, config = {}) {
         write: !!args?.auto,
         session: name,
         conversationId: known || '',
-        cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
-        model: args?.model || '',
-      })
-      const result = await runProcess(opencodeBin, argv, {
-        cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
-        timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
-        onChunk: run.push,
-        onSpawn: (child) => trackProc(run.id, child, run),
+        cwd: runCwd,
+        model,
       })
 
-      // opencode 出的是 JSONL 事件流
-      const raw = String(result.stdout ?? '')
-      const err = String(result.stderr ?? '')
-      const collected = collectOpencode(raw)
-      const sid = collected.sessionId || known || ''
+      // 开关命中就先走 ACP；拿不到结果（异常 / ok=false）runAcpTurn 已记日志并返回 null，
+      // 下面的 CLI 分支就是那次回退，行为与以前完全一致。
+      const acp = useAcp('opencode')
+        ? await runAcpTurn('opencode', {
+            run,
+            prompt,
+            cwd: runCwd,
+            model,
+            timeoutSec,
+            sessionId: known || '',
+            write: !!args?.auto,
+          })
+        : null
+
+      let result = null
+      let raw = ''
+      let err = ''
+      let sid = ''
+      let answer = ''
+      let verdict = null
+      let tokens = null
+      let cost = null
+      let stopReason = ''
+
+      if (acp) {
+        sid = String(acp.sessionId || known || '')
+        answer = String(acp.text || '').trim() || String(run.entry.output || '').slice(-3000)
+        verdict = acpOutcome(acp)
+        const usage = acpUsageOf(acp.usage)
+        tokens = usage.tokens
+        cost = usage.cost
+        stopReason = String(acp.stopReason || '')
+      } else {
+        const argv = ['run', '--format', 'json']
+        if (model) argv.push('--model', model)
+        if (known) argv.push('--session', known)
+        if (args?.auto) argv.push('--auto')
+        argv.push(prompt)
+        result = await runProcess(opencodeBin, argv, {
+          cwd: runCwd,
+          timeoutSec,
+          onChunk: run.push,
+          onSpawn: (child) => trackProc(run.id, child, run),
+        })
+        // opencode 出的是 JSONL 事件流
+        raw = String(result.stdout ?? '')
+        err = String(result.stderr ?? '')
+        const collected = collectOpencode(raw)
+        sid = collected.sessionId || known || ''
+        answer =
+          collected.answer ||
+          String(run.entry.output || '').slice(-3000) ||
+          err.slice(-3000) ||
+          raw.slice(-3000)
+        verdict = outcome(result)
+        tokens = collected.tokens
+        cost = collected.cost
+      }
 
       if (name && sid) {
         index[name] = { id: sid, cwd: args?.cwd || '', updated: new Date().toISOString() }
         writeJson(OPENCODE_INDEX, index)
       }
 
-      const answer =
-        collected.answer ||
-        String(run.entry.output || '').slice(-3000) ||
-        err.slice(-3000) ||
-        raw.slice(-3000)
-      const verdict = outcome(result)
       finishDispatch(run, {
         status: verdict.status,
         ok: verdict.ok,
-        ms: result.ms,
-        exitCode: result.code,
+        ms: acp ? acp.ms : result.ms,
+        exitCode: acp ? undefined : result.code,
         excerpt: answer,
-        error: result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
+        error: acp
+          ? String(acp.error || '')
+          : result.timedOut
+            ? 'timeout'
+            : result.code === 0
+              ? ''
+              : err,
         conversationId: sid,
-        tokens: collected.tokens,
-        cost: collected.cost,
+        tokens,
+        cost,
+        stopReason,
+        runner: acp ? 'acp' : 'cli',
       })
 
       return clean({
-        status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
+        status: acp ? verdict.status : result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
         response: answer,
         sessionId: sid,
-        resumed: !!known,
-        cost: collected.cost,
-        tokens: collected.tokens || null,
-        exitCode: result.code,
-        ms: result.ms,
+        resumed: acp ? !!acp.resumed : !!known,
+        cost,
+        tokens: tokens || null,
+        exitCode: acp ? undefined : result.code,
+        ms: acp ? acp.ms : result.ms,
       })
     },
   })
@@ -2675,8 +2802,8 @@ export function apply(ctx, config = {}) {
       const known = name && index[name] ? index[name].id : null
 
       const opts = { write: !!args?.write, model: args?.model || '' }
-      const argv = hand.build(prompt, opts, known)
       const runCwd = args?.cwd ? path.resolve(String(args.cwd)) : process.cwd()
+      const timeoutSec = Number(args?.timeoutSec) || defaultTimeout
       const run = startDispatch({
         hand: to,
         tool: 'hands_run',
@@ -2688,47 +2815,94 @@ export function apply(ctx, config = {}) {
         model: opts.model,
       })
 
-      const result = await runProcess(hand.bin(), argv, {
-        cwd: runCwd,
-        timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
-        onChunk: run.push,
-        onSpawn: (child) => trackProc(run.id, child, run),
-      })
+      // config.acpHands 点名的手下先走 ACP；没命中 / 失败回退 CLI，argv 仍按老配方 build。
+      const acp = useAcp(to)
+        ? await runAcpTurn(to, {
+            run,
+            prompt,
+            cwd: runCwd,
+            model: opts.model,
+            timeoutSec,
+            sessionId: known || '',
+            write: opts.write,
+          })
+        : null
 
-      const raw = String(result.stdout ?? '')
-      const err = String(result.stderr ?? '')
-      const sid = hand.pick(raw, runCwd) || hand.pick(err, runCwd) || known || ''
+      let result = null
+      let raw = ''
+      let err = ''
+      let sid = ''
+      let answer = ''
+      let status = ''
+      let verdict = null
+      let tokens = null
+      let cost = null
+      let stopReason = ''
+
+      if (acp) {
+        sid = String(acp.sessionId || known || '')
+        answer = String(acp.text || '').trim() || String(run.entry.output || '').slice(-3000)
+        verdict = acpOutcome(acp)
+        status = verdict.status
+        const usage = acpUsageOf(acp.usage)
+        tokens = usage.tokens
+        cost = usage.cost
+        stopReason = String(acp.stopReason || '')
+      } else {
+        const argv = hand.build(prompt, opts, known)
+        result = await runProcess(hand.bin(), argv, {
+          cwd: runCwd,
+          timeoutSec,
+          onChunk: run.push,
+          onSpawn: (child) => trackProc(run.id, child, run),
+        })
+        raw = String(result.stdout ?? '')
+        err = String(result.stderr ?? '')
+        sid = hand.pick(raw, runCwd) || hand.pick(err, runCwd) || known || ''
+        answer =
+          extractAnswer(to, raw) ||
+          String(run.entry.output || '').slice(-3000) ||
+          err.slice(-3000) ||
+          raw.slice(-3000)
+        verdict = outcome(result, reportedStatus(to, raw))
+        status = result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR'
+        const usage = usageOf(to, raw)
+        tokens = usage.tokens
+        cost = usage.cost
+      }
+
       if (name && sid && sid !== known) {
         index[name] = { id: sid, cwd: args?.cwd || '', updated: new Date().toISOString() }
         writeJson(idxFile, index)
       }
 
-      const answer =
-        extractAnswer(to, raw) ||
-        String(run.entry.output || '').slice(-3000) ||
-        err.slice(-3000) ||
-        raw.slice(-3000)
-      const verdict = outcome(result, reportedStatus(to, raw))
-      const usage = usageOf(to, raw)
       finishDispatch(run, {
         status: verdict.status,
         ok: verdict.ok,
-        ms: result.ms,
-        exitCode: result.code,
+        ms: acp ? acp.ms : result.ms,
+        exitCode: acp ? undefined : result.code,
         excerpt: answer,
-        error: result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
+        error: acp
+          ? String(acp.error || '')
+          : result.timedOut
+            ? 'timeout'
+            : result.code === 0
+              ? ''
+              : err,
         conversationId: sid,
-        tokens: usage.tokens,
-        cost: usage.cost,
+        tokens,
+        cost,
+        stopReason,
+        runner: acp ? 'acp' : 'cli',
       })
       return clean({
-        status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
+        status,
         hand: hand.label,
         response: answer,
         sessionId: sid,
-        resumed: !!known,
-        exitCode: result.code,
-        ms: result.ms,
+        resumed: acp ? !!acp.resumed : !!known,
+        exitCode: acp ? undefined : result.code,
+        ms: acp ? acp.ms : result.ms,
       })
     },
   })

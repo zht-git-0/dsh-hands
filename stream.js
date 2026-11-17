@@ -39,8 +39,76 @@ export function parseJsonLines(raw) {
 }
 
 /**
+ * ACP 的 session/update → live view 的「对面在说什么」，纯函数、不碰 IO。
+ * state = { toolCalls: Map<id, title> }，就地更新；内部再用 toolStatus 去重。
+ * 返回 { text?, usage?, thought?, status? }：
+ * - agent_message_chunk → text 追加正文
+ * - agent_thought_chunk → thought（只留字段，不进正文）
+ * - tool_call → text 追加 "\n[tool] <title>\n"，并记 id
+ * - tool_call_update 落到 completed / failed → text 追加 "[tool] <title> done/失败\n"（同一终态只报一次）
+ * - usage_update → usage（优先 update.usage；opencode 把 used/size/cost 平铺在外层）
+ * - replay:true → 空对象（session/load 重放的历史，整块丢弃）
+ */
+export function mapAcpUpdate(update, state) {
+  const out = {}
+  if (!update || typeof update !== 'object') return out
+  if (update.replay === true) return out
+
+  const store = state && typeof state === 'object' ? state : {}
+  if (!(store.toolCalls instanceof Map)) store.toolCalls = new Map()
+  if (!(store.toolStatus instanceof Map)) store.toolStatus = new Map()
+
+  const kind = update.sessionUpdate
+  const contentText = (content) => (typeof content?.text === 'string' ? content.text : '')
+  const titleOf = (fallback = '') => {
+    const value = update.title ?? update.toolName ?? update.kind ?? fallback
+    const title = typeof value === 'string' ? value.trim() : ''
+    return title || 'tool'
+  }
+
+  if (kind === 'agent_message_chunk') {
+    const text = contentText(update.content)
+    if (text) out.text = text
+    return out
+  }
+  if (kind === 'agent_thought_chunk') {
+    const thought = contentText(update.content)
+    if (thought) out.thought = thought
+    return out
+  }
+  if (kind === 'tool_call') {
+    const id = String(update.toolCallId ?? update.id ?? '')
+    const title = titleOf()
+    if (id) store.toolCalls.set(id, title)
+    out.text = `\n[tool] ${title}\n`
+    return out
+  }
+  if (kind === 'tool_call_update') {
+    const id = String(update.toolCallId ?? update.id ?? '')
+    const title = titleOf(id ? store.toolCalls.get(id) : '')
+    if (id) store.toolCalls.set(id, title)
+    const status = String(update.status || '').toLowerCase()
+    if (status !== 'completed' && status !== 'failed') return out
+    // 同一个工具可能重复上报同一个终态（比如先 completed 再 completed），只报一次
+    if (id && store.toolStatus.get(id) === status) return out
+    if (id) store.toolStatus.set(id, status)
+    out.status = status
+    out.text = `[tool] ${title} ${status === 'completed' ? 'done' : '失败'}\n`
+    return out
+  }
+  if (kind === 'usage_update') {
+    // 标准形状是 update.usage；opencode 把 used/size/cost 平铺在 update 上，退而取整体
+    const { sessionUpdate, replay, ...rest } = update
+    out.usage = update.usage ?? (Object.keys(rest).length ? rest : null)
+    return out
+  }
+  return out
+}
+
+/**
  * 造一个只属于这次派发的实时视图。
  * feed() 吃 stdout / stderr 的原始 chunk，render() 给出可直接显示的文本。
+ * feedEvent() 吃 ACP 的 session/update，和 feed() 共用同一个文本缓冲。
  */
 export function createLiveView(hand) {
   let text = ''
@@ -48,6 +116,8 @@ export function createLiveView(hand) {
   let lastPart = { id: '', length: 0 }
   let claude = { messageId: '', sawDelta: false }
   let agy = { step: null, last: '' }
+  // ACP 的结构化状态：工具 id → 标题，以及 thought / usage 留给以后用
+  const acp = { toolCalls: new Map(), toolStatus: new Map(), thought: '', usage: null }
 
   const append = (value) => {
     const chunk = asText(value)
@@ -236,7 +306,26 @@ export function createLiveView(hand) {
     else handleOpencode(ev)
   }
 
+  // ACP 给的是纯文本（已经是增量），不能再走 feed()：正文以 { 开头时会被当 JSONL 吃掉。
+  // 只共用同一个 text 缓冲，工具行前后补换行，别和正文粘在一起。
+  function feedAcpText(value) {
+    let fragment = asText(value)
+    if (!fragment) return
+    if (fragment.startsWith('\n') && (!text || text.endsWith('\n'))) {
+      fragment = fragment.replace(/^\n+/, '')
+    }
+    if (fragment && !fragment.startsWith('\n') && text && !text.endsWith('\n')) fragment = '\n' + fragment
+    append(fragment)
+  }
+
   return {
+    feedEvent(update) {
+      const mapped = mapAcpUpdate(update, acp)
+      if (mapped.thought) acp.thought += mapped.thought
+      if (mapped.usage !== undefined) acp.usage = mapped.usage
+      if (mapped.text) feedAcpText(mapped.text)
+      return mapped
+    },
     feed(chunk, source = 'stdout') {
       const data = String(chunk || '')
       if (!data) return
