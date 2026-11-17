@@ -5,11 +5,12 @@
 | 手下 | 干什么 | 工具 |
 |---|---|---|
 | `agy`（Antigravity CLI） | 文案、写作、风格 | `agy_run` `agy_session` `agy_sessions` `agy_agents` `agy_models` |
-| `codex`（OpenAI Codex CLI） | 写代码、跑测试 | `codex_run` |
+| `codex`（OpenAI Codex CLI） | 规划、评审（旗舰后） | `codex_run` |
 | `claude`（Claude Code） | 架构级规划、设计评审 | `claude_run` |
+| `opencode` | **核心写代码**（用订阅，不按 token 计费） | `opencode_run` |
 | — | 探活 | `hands_status` |
 
-三层分工：**claude 出方案 → codex 落地 → 希可验收**。
+分工：**claude / codex 出方案 → opencode 落地 → 希可验收**，agy 只管文案。
 
 ## 装
 
@@ -55,7 +56,16 @@ claude_run(prompt="读 docs/runtime.md，给「多游戏实例化」出一个分
 
 `permissionMode` 默认 `plan`（只读推理）。它读代码、出方案，但**它说的每一条关于代码的话都要自己核**。
 
-**写代码找 codex**
+**写代码主力找 opencode**
+
+```
+opencode_run(prompt="…", cwd="D:/Program/projects/AI_game",
+             session="aigame 主力开发", auto=true)
+```
+
+`auto: true` 才会真的写文件。它按订阅计费，成本那一栏常常是 0。
+
+**写代码也可以找 codex**
 
 ```
 codex_run(prompt="实现 scripts/x.mjs …，跑 node --test scripts/x.test.mjs",

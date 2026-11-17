@@ -162,11 +162,18 @@ function runProcess(bin, args, { cwd, timeoutSec = 900, input } = {}) {
     try {
       // stdin 必须显式给个已关闭的管道：codex 在非 TTY 下会等 stdin EOF，
       // 继承父进程的 stdin 会一直挂着（踩过，表现为「Reading additional input from stdin...」然后超时）
-      child = spawn(bin, args, {
+      // Windows 上 .cmd 不能直接 spawn（会报 ENOENT），必须走 shell；
+      // 走 shell 时参数要自己加引号，否则带空格的 prompt 会被拆开。
+      const needsShell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(bin)
+      const spawnArgs = needsShell
+        ? args.map((a) => (/[\s"&|<>^]/.test(a) ? `"${String(a).replace(/"/g, '""')}"` : a))
+        : args
+      child = spawn(bin, spawnArgs, {
         cwd: cwd || undefined,
         windowsHide: true,
         env: process.env,
         stdio: ['pipe', 'pipe', 'pipe'],
+        shell: needsShell,
       })
       if (input) child.stdin.end(input)
       else child.stdin.end()
@@ -226,6 +233,11 @@ function parseJsonOutput(stdout) {
   }
 }
 
+const DEFAULT_OPENCODE_BIN =
+  process.platform === 'win32'
+    ? path.join(process.env.ProgramFiles || 'C:\Program Files', 'nodejs', 'opencode.cmd')
+    : 'opencode'
+
 const DEFAULT_CLAUDE_BIN =
   process.platform === 'win32'
     ? path.join(os.homedir(), '.local', 'bin', 'claude.exe')
@@ -240,6 +252,7 @@ export function apply(ctx, config = {}) {
   const bin = config.agyBin || config.bin || DEFAULT_BIN
   const codexBin = config.codexBin || DEFAULT_CODEX_BIN
   const claudeBin = config.claudeBin || DEFAULT_CLAUDE_BIN
+  const opencodeBin = config.opencodeBin || DEFAULT_OPENCODE_BIN
   const defaultTimeout = Number(config.timeoutSec) || 900
   const skipPermissions = config.skipPermissions !== false
 
@@ -829,6 +842,7 @@ export function apply(ctx, config = {}) {
         await probe('agy 写作', bin, ['--version']),
         await probe('codex 写代码', codexBin, ['--version']),
         await probe('claude 架构规划', claudeBin, ['--version']),
+        await probe('opencode 写代码', opencodeBin, ['--version']),
       ]
       return { text: lines.join('\n') }
     },
@@ -929,6 +943,115 @@ export function apply(ctx, config = {}) {
         resumed: !!known,
         cost: parsed ? parsed.total_cost_usd : null,
         cacheRead: usage.cache_read_input_tokens ?? null,
+        exitCode: result.code,
+        ms: result.ms,
+      })
+    },
+  })
+
+  // ── opencode：主力写代码这个手下 ─────────────────────────────────────────
+
+  const OPENCODE_INDEX = path.join(os.homedir(), '.dsh', 'opencode-sessions.json')
+
+  ctx.tools.register({
+    name: 'opencode_run',
+    description:
+      'Run one non-interactive turn of opencode (the opencode CLI agent) and return its answer. ' +
+      'This is the main coding hand: it reads and writes files and runs commands in the working directory. ' +
+      'Pass `session` (a stable name) to keep talking in the same session. ' +
+      'Its output is not trustworthy by itself — rerun the tests yourself and check `git status` afterwards.',
+    parameters: {
+      type: 'object',
+      properties: {
+        prompt: {
+          type: 'string',
+          description:
+            'What opencode should do. A complete brief: goal, exact interfaces, files that must not be touched, ' +
+            'and how it should prove the work.',
+        },
+        cwd: { type: 'string', description: 'Working directory. Omit to inherit the current session directory.' },
+        session: {
+          type: 'string',
+          description:
+            'A stable name for this line of work. The same name always resumes the same opencode session.',
+        },
+        model: { type: 'string', description: 'Model as provider/model[#variant], e.g. "deepseek/deepseek-chat".' },
+        auto: {
+          type: 'boolean',
+          description: 'Auto-approve permissions that are not explicitly denied. Required for it to actually write files.',
+        },
+        timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900).' },
+      },
+      required: ['prompt'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string' },
+          response: { type: 'string' },
+          sessionId: { type: 'string' },
+          resumed: { type: 'boolean' },
+        },
+      },
+      render: (_args, value) => asText(value),
+    },
+    async execute(args) {
+      const prompt = String(args?.prompt ?? '')
+      if (!prompt.trim()) throw new Error('prompt is required')
+
+      const index = readJson(OPENCODE_INDEX, {}) || {}
+      const name = args?.session ? String(args.session) : ''
+      const known = name && index[name] ? index[name].id : null
+
+      const argv = ['run', '--format', 'json']
+      if (args?.model) argv.push('--model', String(args.model))
+      if (known) argv.push('--session', known)
+      if (args?.auto) argv.push('--auto')
+      argv.push(prompt)
+
+      const result = await runProcess(opencodeBin, argv, {
+        cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
+        timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
+      })
+
+      // opencode 出的是 JSONL 事件流，逐行解析
+      const raw = String(result.stdout ?? '')
+      const err = String(result.stderr ?? '')
+      let sid = known || ''
+      const texts = []
+      let cost = null
+      let tokens = null
+      for (const line of raw.split('\n')) {
+        const s = line.trim()
+        if (!s.startsWith('{')) continue
+        let ev = null
+        try {
+          ev = JSON.parse(s)
+        } catch {
+          continue
+        }
+        if (ev.sessionID) sid = ev.sessionID
+        if (ev.type === 'text' && ev.part && typeof ev.part.text === 'string') texts.push(ev.part.text)
+        if (ev.part && ev.part.type === 'step-finish') {
+          if (typeof ev.part.cost === 'number') cost = (cost || 0) + ev.part.cost
+          tokens = ev.part.tokens || tokens
+        }
+      }
+
+      if (name && sid) {
+        index[name] = { id: sid, cwd: args?.cwd || '', updated: new Date().toISOString() }
+        writeJson(OPENCODE_INDEX, index)
+      }
+
+      return clean({
+        status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
+        response: texts.join('\n').trim() || raw.slice(-3000) || err.slice(-2000),
+        sessionId: sid,
+        resumed: !!known,
+        cost,
+        tokens: tokens || null,
         exitCode: result.code,
         ms: result.ms,
       })
