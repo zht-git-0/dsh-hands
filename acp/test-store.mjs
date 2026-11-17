@@ -328,4 +328,103 @@ async function until(check, label, tries = 200) {
   console.log('6) loadTurnBody 增量拼接 ok')
 }
 
+// ── 7. ensureTurnBody：用 next 继续拉，直到 eof；同一轮只拉一次 ──────────────
+{
+  const FULL = 'abcdefghijkl'
+  const calls = []
+  const fetchImpl = async (url) => {
+    const u = new URL(String(url))
+    calls.push(`${u.pathname}${u.search}`)
+    if (u.pathname === '/dsh-hands/turn') {
+      const from = Math.max(0, Number(u.searchParams.get('from')) || 0)
+      const delta = FULL.slice(from, from + 4)
+      const next = from + delta.length
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: 'c1', from, next, eof: next >= FULL.length, delta }),
+      }
+    }
+    return { ok: false, status: 404, json: async () => ({}) }
+  }
+  const store = createHandsStore({ fetchImpl, storage: makeStorage() })
+  const [firstA, firstB] = await Promise.all([
+    store.ensureTurnBody('c1'),
+    store.ensureTurnBody('c1'),
+  ])
+  assert.equal(firstA, true)
+  assert.equal(firstB, true, '并发调用共享同一份 promise')
+  assert.equal(store.snapshotSlice('live').liveByTurn.c1, FULL, '分三页拼成全文')
+  assert.equal(calls.length, 3, '每页 4 字，12 字共 3 次请求')
+  await store.ensureTurnBody('c1')
+  assert.equal(calls.length, 3, '同一轮成功后再调不再发请求')
+  store.stop()
+  console.log('7) ensureTurnBody 分页补齐 + 只拉一次 ok')
+}
+
+// ── 8. cancel / rerun：POST 带 id，成功刷新 turns；失败原样回错误 ─────────────
+{
+  const calls = []
+  let cancelOk = true
+  const fetchImpl = async (url, init = {}) => {
+    const u = new URL(String(url))
+    const method = init.method || 'GET'
+    calls.push({ method, path: u.pathname, body: init.body ? JSON.parse(init.body) : null })
+    if (u.pathname === '/dsh-hands/cancel') {
+      return cancelOk
+        ? { ok: true, status: 200, json: async () => ({ ok: true, id: 't2', killed: true }) }
+        : {
+            ok: false,
+            status: 404,
+            json: async () => ({ ok: false, error: 'not running', id: 't2' }),
+          }
+    }
+    if (u.pathname === '/dsh-hands/rerun') {
+      return { ok: true, status: 200, json: async () => ({ ok: true, id: 'new1', sessionKey: 'opencode/alpha' }) }
+    }
+    if (u.pathname === '/dsh-hands/agents') {
+      return { ok: true, status: 200, json: async () => ({ checkedAt: '', agents: AGENTS }) }
+    }
+    if (u.pathname === '/dsh-hands/sessions') {
+      const hand = u.searchParams.get('hand') || ''
+      return { ok: true, status: 200, json: async () => ({ hand, sessions: SESSIONS[hand] || [] }) }
+    }
+    if (u.pathname === '/dsh-hands/turns') {
+      const key = u.searchParams.get('key') || ''
+      return { ok: true, status: 200, json: async () => ({ key, turns: TURNS[key] || [] }) }
+    }
+    return { ok: false, status: 404, json: async () => ({}) }
+  }
+
+  const storage = makeStorage({
+    'dsh.hands.sel': JSON.stringify({
+      hand: 'opencode',
+      key: 'opencode/alpha',
+      turnId: 't2',
+      at: '2026-11-18T00:00:00.000Z',
+    }),
+  })
+  const store = createHandsStore({ fetchImpl, storage })
+  await store.refreshAll()
+
+  const cancelled = await store.cancelTurn('t2')
+  assert.equal(cancelled.ok, true)
+  const cancelCall = calls.find((call) => call.path === '/dsh-hands/cancel')
+  assert.equal(cancelCall?.method, 'POST')
+  assert.deepEqual(cancelCall?.body, { id: 't2' })
+  await until(() => calls.some((call) => call.path === '/dsh-hands/turns'), 'cancel 后刷新 turns')
+
+  const rerun = await store.rerunTurn('t2')
+  assert.equal(rerun.ok, true)
+  const rerunCall = calls.find((call) => call.path === '/dsh-hands/rerun')
+  assert.deepEqual(rerunCall?.body, { id: 't2' })
+
+  cancelOk = false
+  const failed = await store.cancelTurn('t2')
+  assert.equal(failed.ok, false)
+  assert.equal(failed.error, 'not running', '失败原因透传')
+  store.stop()
+  console.log('8) cancel / rerun ok')
+}
+
 console.log('ok')

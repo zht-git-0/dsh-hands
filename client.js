@@ -38,6 +38,7 @@ window.__ModuleLoader__.load({
       statusTimeout: 'Timed out',
       statusUnparsed: 'Unparsed',
       statusRunning: 'Running',
+      statusCancelled: 'Cancelled',
       statusUnknown: 'Unknown',
       exitCode: 'Exit code',
       loadFailed: 'Could not read the dispatch feed.',
@@ -52,6 +53,18 @@ window.__ModuleLoader__.load({
       v2NoTurns: 'No turns yet',
       v2Back: 'Back',
       v2Turns: '{n} turns',
+      v2Today: '{n} today',
+      v2Cancel: 'Cancel',
+      v2Rerun: 'Rerun',
+      v2Cancelling: 'Cancelling…',
+      v2Rerunning: 'Rerunning…',
+      v2CancelFailed: 'Could not cancel',
+      v2RerunFailed: 'Could not rerun',
+      v2Expand: 'Show more',
+      v2Collapse: 'Show less',
+      v2LoadFull: 'Load full text',
+      v2LoadOlder: 'Load older turns',
+      v2Tokens: 'tokens',
       handAgy: 'agy · copy',
       handCodex: 'codex · planning',
       handClaude: 'claude · architecture',
@@ -84,6 +97,7 @@ window.__ModuleLoader__.load({
       statusTimeout: '超时',
       statusUnparsed: '输出未解析',
       statusRunning: '进行中',
+      statusCancelled: '已取消',
       statusUnknown: '未知',
       exitCode: '退出码',
       loadFailed: '读取调度输出失败。',
@@ -98,6 +112,18 @@ window.__ModuleLoader__.load({
       v2NoTurns: '还没有轮次',
       v2Back: '返回',
       v2Turns: '{n} 轮',
+      v2Today: '今日 {n} 轮',
+      v2Cancel: '取消',
+      v2Rerun: '重跑',
+      v2Cancelling: '取消中…',
+      v2Rerunning: '重跑中…',
+      v2CancelFailed: '取消失败',
+      v2RerunFailed: '重跑失败',
+      v2Expand: '展开',
+      v2Collapse: '收起',
+      v2LoadFull: '加载全文',
+      v2LoadOlder: '加载更早',
+      v2Tokens: 'tokens',
       handAgy: 'agy · 文案',
       handCodex: 'codex · 规划',
       handClaude: 'claude · 架构',
@@ -150,6 +176,7 @@ window.__ModuleLoader__.load({
       if (status === 'OK' || status === 'SUCCESS') return t('statusOk');
       if (status === 'TIMEOUT') return t('statusTimeout');
       if (status === 'UNPARSED') return t('statusUnparsed');
+      if (status === 'CANCELLED') return t('statusCancelled');
       if (status === 'ERROR' || status === 'FAILED') return t('statusError');
       return status || t('statusUnknown');
     }
@@ -181,6 +208,88 @@ window.__ModuleLoader__.load({
       });
     }
 
+    // ── 轮次元信息（纯函数，acp/test-bubbles.mjs 直接断言）────────────────────
+    //
+    // tokens 的形状每家不一样：codex 给数字（input+output），claude 给
+    // {input_tokens, output_tokens, cache_read_input_tokens}，opencode 给
+    // {input, output, reasoning, cache:{read,write}}，agy 直接透传上游 usage。
+    // 这里只判断「有没有」，有 in/out 就分开显示，否则显示总数。
+    function tokenCounts(tokens) {
+      if (tokens === null || tokens === undefined || tokens === '') return null;
+      if (typeof tokens === 'number') {
+        return Number.isFinite(tokens) ? { input: 0, output: 0, total: tokens } : null;
+      }
+      if (typeof tokens !== 'object') {
+        const value = Number(tokens);
+        return Number.isFinite(value) ? { input: 0, output: 0, total: value } : null;
+      }
+      const pick = (...keys) => {
+        for (const key of keys) {
+          const value = Number(tokens[key]);
+          if (Number.isFinite(value) && value !== 0) return value;
+        }
+        return 0;
+      };
+      const input = pick('input', 'input_tokens', 'prompt_tokens');
+      const output = pick('output', 'output_tokens', 'completion_tokens');
+      const total = pick('total', 'total_tokens') || input + output;
+      if (!input && !output && !total) return null;
+      return { input, output, total };
+    }
+
+    function formatTokens(tokens) {
+      const counts = tokenCounts(tokens);
+      if (!counts) return '';
+      const round = (value) => String(Math.round(value));
+      if (counts.input && counts.output) return `${round(counts.input)}/${round(counts.output)}`;
+      return counts.total ? round(counts.total) : '';
+    }
+
+    function formatCost(cost) {
+      if (cost === null || cost === undefined || cost === '') return '';
+      const value = Number(cost);
+      if (!Number.isFinite(value) || value <= 0) return '';
+      return `$${value.toFixed(2)}`;
+    }
+
+    // 元信息行只给「有值」的片段，顺序固定：耗时 → tokens → cost → 退出码 → 模型。
+    // status 单独渲染（要带颜色点），这里不重复。
+    function formatTurnMeta(turn, t = (key) => key) {
+      const row = turn || {};
+      const parts = [];
+      const ms = Number(row.ms);
+      if (Number.isFinite(ms) && ms > 0) parts.push({ key: 'ms', text: formatDuration(ms, t) });
+      const tokens = formatTokens(row.tokens);
+      if (tokens) parts.push({ key: 'tokens', text: `${t('v2Tokens')} ${tokens}` });
+      const cost = formatCost(row.cost);
+      if (cost) parts.push({ key: 'cost', text: cost });
+      if (row.exitCode !== undefined && row.exitCode !== null && row.exitCode !== '') {
+        parts.push({ key: 'exit', text: `${t('exitCode')} ${row.exitCode}` });
+      }
+      if (row.model) parts.push({ key: 'model', text: String(row.model) });
+      return parts;
+    }
+
+    function turnIsRunning(turn) {
+      if (!turn) return false;
+      if (turn.running === true) return true;
+      return String(turn.status || '').toUpperCase() === 'RUNNING';
+    }
+
+    // 气泡正文回落：liveByTurn（服务端 live 增量 + /turn 增量都按绝对偏移拼在这里）
+    // → 单独缓存的拉取正文 → turn.excerpt（可能被截，最后的兜底）。
+    // cursor 只表示「还在跑」，光标由 BubbleAgent / Stream 画。
+    function resolveTurnBody(turn, live, fetched) {
+      const row = turn || {};
+      const liveText = typeof live === 'string' ? live : '';
+      if (liveText) return { text: liveText, source: 'live', cursor: turnIsRunning(row) };
+      const fetchedText = typeof fetched === 'string' ? fetched : '';
+      if (fetchedText) return { text: fetchedText, source: 'fetched', cursor: turnIsRunning(row) };
+      const excerpt = typeof row.excerpt === 'string' ? row.excerpt : '';
+      if (excerpt) return { text: excerpt, source: 'excerpt', cursor: turnIsRunning(row) };
+      return { text: '', source: 'none', cursor: turnIsRunning(row) };
+    }
+
     function endpointOf(name) {
       const base =
         typeof document !== 'undefined' && document.baseURI
@@ -197,6 +306,10 @@ window.__ModuleLoader__.load({
     // 切片只在对应 revision 变了才换引用 —— 每次都新建对象会让 React 一帧一帧重渲整棵树。
     const SEL_STORAGE_KEY = 'dsh.hands.sel';
     const EMPTY_LIST = [];
+    // 一页轮次数；loadOlderTurns 用最早的 startedAt 作 before 游标。
+    const TURN_PAGE = 50;
+    // 一次 ensureTurnBody 最多翻多少页，防止服务端 eof 一直算错时死循环。
+    const BODY_PAGE_MAX = 40;
     const SLICE_BY_FIELD = {
       agents: 'agents',
       sessionsByHand: 'sessions',
@@ -275,6 +388,15 @@ window.__ModuleLoader__.load({
       const liveApplied = new Map();
       const sessionSeq = new Map();
       const turnSeq = new Map();
+      // key → 还有没有更早的一页；bodyDone 保证同一轮正文只拉一次。
+      const turnsMore = new Map();
+      const olderSeq = new Map();
+      const bodyPending = new Map();
+      const bodyDone = new Set();
+      // 一次只拉两轮正文：选中会话时可能一次挂上几十个 Turn，别把本地 HTTP 打满。
+      const bodyQueue = [];
+      const bodyWaiters = new Map();
+      let bodyDraining = false;
 
       let started = false;
       let mode = 'idle'; // idle | sse | poll
@@ -419,6 +541,28 @@ window.__ModuleLoader__.load({
         return String(error?.message ?? error);
       }
 
+      // 只有 cancel / rerun 走 POST；服务端约定 {ok:false,error} 也算失败。
+      async function postJson(path, payload) {
+        if (!fetchImpl) throw new Error('fetch unavailable');
+        const response = await fetchImpl(endpointOf(path), {
+          method: 'POST',
+          cache: 'no-store',
+          credentials: 'same-origin',
+          headers: { accept: 'application/json', 'content-type': 'application/json' },
+          body: JSON.stringify(payload || {}),
+        });
+        let data = null;
+        try {
+          data = await response.json();
+        } catch {
+          data = null;
+        }
+        if (!response || !response.ok || data?.ok === false) {
+          throw new Error(String(data?.error || `HTTP ${response ? response.status : 0}`));
+        }
+        return data || {};
+      }
+
       async function loadAgents() {
         const life = lifeToken;
         try {
@@ -480,11 +624,12 @@ window.__ModuleLoader__.load({
         const life = lifeToken;
         try {
           const data = await getJson(
-            `dsh-hands/turns?key=${encodeURIComponent(wanted)}&limit=50`,
+            `dsh-hands/turns?key=${encodeURIComponent(wanted)}&limit=${TURN_PAGE}`,
           );
           if (life !== lifeToken) return [];
           if (turnSeq.get(wanted) !== seq) return [];
           const turns = Array.isArray(data?.turns) ? data.turns : [];
+          turnsMore.set(wanted, turns.length >= TURN_PAGE);
           emit({
             turnsByKey: { ...state.turnsByKey, [wanted]: turns },
             connected: true,
@@ -560,6 +705,144 @@ window.__ModuleLoader__.load({
         }
       }
 
+      // 更早的一页：before 用当前最早一轮的 startedAt；回来的行按 id 去重后
+      // 和现有列表合并，仍然保持 startedAt 倒序（TurnList 渲染时再 reverse）。
+      async function loadOlderTurns(key) {
+        const wanted = String(key || '');
+        if (!wanted || turnsMore.get(wanted) === false) return [];
+        const rows = state.turnsByKey[wanted] || [];
+        const earliest = String(rows[rows.length - 1]?.startedAt || '');
+        if (!earliest) return [];
+        const seq = (olderSeq.get(wanted) || 0) + 1;
+        olderSeq.set(wanted, seq);
+        const life = lifeToken;
+        try {
+          const data = await getJson(
+            `dsh-hands/turns?key=${encodeURIComponent(wanted)}&before=${encodeURIComponent(earliest)}&limit=${TURN_PAGE}`,
+          );
+          if (life !== lifeToken) return [];
+          if (olderSeq.get(wanted) !== seq) return [];
+          const incoming = Array.isArray(data?.turns) ? data.turns : [];
+          const existing = state.turnsByKey[wanted] || [];
+          const seen = new Set(existing.map((row) => String(row?.id || '')).filter(Boolean));
+          const extra = incoming.filter((row) => {
+            const id = String(row?.id || '');
+            return !id || !seen.has(id);
+          });
+          const merged = existing.concat(extra).sort((a, b) => String(b.startedAt || '').localeCompare(String(a.startedAt || '')));
+          turnsMore.set(wanted, incoming.length >= TURN_PAGE);
+          emit({ turnsByKey: { ...state.turnsByKey, [wanted]: merged }, error: null });
+          return merged;
+        } catch (error) {
+          if (life !== lifeToken) return [];
+          emit({ connected: false, error: failureOf(error) });
+          return [];
+        }
+      }
+
+      function turnsMoreFor(key) {
+        const wanted = String(key || '');
+        if (!wanted) return false;
+        return turnsMore.get(wanted) !== false;
+      }
+
+      // 正文增量补齐：从 store 已经拼到的绝对偏移继续要，直到 eof。
+      // 同一轮并发调用共享一个 promise，成功一次就记住了（bodyDone），
+      // 失败不记，下次滚动/展开还能重试。
+      // 真正发请求走队列（一次 2 条）：选中会话时几十个气泡同时挂载，串行化更稳。
+      async function fetchTurnBody(id) {
+        let from = Number(liveApplied.get(id));
+        if (!Number.isFinite(from)) from = String(state.liveByTurn[id] || '').length;
+        for (let page = 0; page < BODY_PAGE_MAX; page += 1) {
+          const data = await loadTurnBody(id, from);
+          if (!data) return null;
+          const delta = String(data?.delta ?? '');
+          const next = Number(data?.next);
+          if (Number.isFinite(next)) from = Math.max(from, next);
+          else from += delta.length;
+          if (data.eof || !delta) break;
+        }
+        bodyDone.add(id);
+        return true;
+      }
+
+      async function drainBodyQueue() {
+        if (bodyDraining) return;
+        bodyDraining = true;
+        try {
+          while (bodyQueue.length) {
+            const batch = bodyQueue.splice(0, 2);
+            await Promise.all(
+              batch.map(async (id) => {
+                let ok = null;
+                try {
+                  ok = await fetchTurnBody(id);
+                } catch {
+                  ok = null;
+                }
+                bodyPending.delete(id);
+                const waiter = bodyWaiters.get(id);
+                bodyWaiters.delete(id);
+                waiter?.(ok);
+              }),
+            );
+          }
+        } finally {
+          bodyDraining = false;
+        }
+      }
+
+      function ensureTurnBody(id, priority) {
+        const wanted = String(id || '');
+        if (!wanted) return Promise.resolve(null);
+        if (bodyDone.has(wanted)) return Promise.resolve(null);
+        const inflight = bodyPending.get(wanted);
+        if (inflight) return inflight;
+        const job = new Promise((resolve) => {
+          bodyWaiters.set(wanted, resolve);
+        });
+        bodyPending.set(wanted, job);
+        if (priority) bodyQueue.unshift(wanted);
+        else bodyQueue.push(wanted);
+        void drainBodyQueue();
+        return job;
+      }
+
+      // 取消 / 重跑：成功后刷新该会话轮次和 agent 计数（今日数、运行数都会变）。
+      async function afterTurnAction() {
+        const key = state.selection.key;
+        const hand = state.selection.hand;
+        if (key) loadTurns(key);
+        if (hand) loadSessions(hand);
+        loadAgents();
+      }
+
+      async function cancelTurn(id) {
+        const wanted = String(id || '');
+        if (!wanted) return { ok: false, error: 'id is required' };
+        try {
+          const data = await postJson('dsh-hands/cancel', { id: wanted });
+          await afterTurnAction();
+          bodyDone.delete(wanted);
+          return { ok: true, data };
+        } catch (error) {
+          return { ok: false, error: failureOf(error) };
+        }
+      }
+
+      async function rerunTurn(id, prompt) {
+        const wanted = String(id || '');
+        if (!wanted) return { ok: false, error: 'id is required' };
+        try {
+          const payload = prompt === undefined || prompt === null ? { id: wanted } : { id: wanted, prompt: String(prompt) };
+          const data = await postJson('dsh-hands/rerun', payload);
+          await afterTurnAction();
+          return { ok: true, data };
+        } catch (error) {
+          return { ok: false, error: failureOf(error) };
+        }
+      }
+
       function applySelection(next) {
         const hand = String(next?.hand || '');
         const key = String(next?.key || '');
@@ -601,7 +884,7 @@ window.__ModuleLoader__.load({
         if (!key) return;
         applySelection({ hand: state.selection.hand, key, turnId: String(turnId || '') });
         const id = String(turnId || '');
-        if (id && state.liveByTurn[id] === undefined) loadTurnBody(id, 0);
+        if (id && state.liveByTurn[id] === undefined) ensureTurnBody(id, true);
       }
 
       // 读存档 → key 还在就恢复 → 否则该 hand 下 lastAt 最新 → 否则第一个 hand 的第一个会话。
@@ -707,7 +990,17 @@ window.__ModuleLoader__.load({
 
       function pollTurnsOnce() {
         if (!started || !state.selection.key) return;
-        loadTurns(state.selection.key);
+        const key = state.selection.key;
+        loadTurns(key).then((turns) => {
+          // 轮询回退时没有 live 事件：对还在跑的轮次按已拼偏移再要一段，
+          // 这样退到轮询也能看到正文在长（SSE 在线时不会走这里）。
+          for (const turn of Array.isArray(turns) ? turns : []) {
+            if (!turnIsRunning(turn)) continue;
+            const id = String(turn.id || '');
+            const from = Number(liveApplied.get(id));
+            if (id && Number.isFinite(from)) loadTurnBody(id, from);
+          }
+        });
       }
 
       function startPolling() {
@@ -886,7 +1179,12 @@ window.__ModuleLoader__.load({
         loadAgents,
         loadSessions,
         loadTurns,
+        loadOlderTurns,
+        turnsMore: turnsMoreFor,
         loadTurnBody,
+        ensureTurnBody,
+        cancelTurn,
+        rerunTurn,
         appendLive,
         // 测试用：断言 timer / EventSource / live 记账都清干净
         debug() {
@@ -1223,17 +1521,36 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-threadMain{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
       .dsh-hands-v2-threadName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:600}
       .dsh-hands-v2-threadMeta{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:14px}
+      .dsh-hands-v2-threadActions{display:flex;align-items:center;gap:4px;flex:none}
+      .dsh-hands-v2-btn{flex:none;height:20px;padding:0 7px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:10px;line-height:18px;white-space:nowrap;cursor:pointer}
+      .dsh-hands-v2-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+      .dsh-hands-v2-btn:disabled{opacity:.45;cursor:default}
+      .dsh-hands-v2-headError{flex:none;padding:4px 10px;border-bottom:.5px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-state-error-primary);font-size:10px;line-height:15px;overflow-wrap:anywhere}
       .dsh-hands-v2-threadBody{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain}
-      .dsh-hands-v2-turns{display:flex;flex-direction:column}
-      .dsh-hands-v2-turn{border-bottom:.5px solid var(--dsw-alias-border-l2)}
-      .dsh-hands-v2-turnHead{display:flex;align-items:center;gap:6px;width:100%;padding:6px 10px;border:0;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
-      .dsh-hands-v2-turnHead:hover{background:var(--dsw-alias-interactive-bg-hover)}
-      .dsh-hands-v2-turnHead[data-active=true]{background:var(--dsw-alias-interactive-bg-hover)}
-      .dsh-hands-v2-turnPrompt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--dsw-alias-label-secondary)}
-      .dsh-hands-v2-turnTime{flex:none;font-size:10px;line-height:14px;color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
-      .dsh-hands-v2-turnBody{margin:0 10px 8px;padding:6px 8px;max-height:220px;overflow:auto;border:.5px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:19px}
+      .dsh-hands-v2-turns{display:flex;flex-direction:column;gap:14px;padding:10px 10px 14px}
+      .dsh-hands-v2-turn{display:flex;flex-direction:column;gap:5px;min-width:0;border-radius:8px}
+      .dsh-hands-v2-turn[data-active=true]{outline:1px solid color-mix(in srgb,var(--dsw-alias-state-business-primary) 35%,transparent);outline-offset:2px}
+      .dsh-hands-v2-bubble{box-sizing:border-box;min-width:0;max-width:88%;padding:6px 9px;border:.5px solid var(--dsw-alias-border-l2);border-radius:10px;overflow-wrap:anywhere}
+      .dsh-hands-v2-bubbleUser{align-self:flex-start;background:var(--dsw-alias-interactive-bg-hover);border-color:transparent}
+      .dsh-hands-v2-bubbleAgent{align-self:flex-end;background:var(--dsw-alias-bg-layer-1)}
+      .dsh-hands-v2-bubbleLabel{margin-bottom:2px;font-size:10px;line-height:14px;font-weight:600;color:var(--dsw-alias-label-tertiary)}
+      .dsh-hands-v2-bubbleAgent .dsh-hands-v2-bubbleLabel{color:var(--hand-color,var(--dsw-alias-label-tertiary))}
+      .dsh-hands-v2-bubbleText{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:19px;color:var(--dsw-alias-label-primary)}
+      .dsh-hands-v2-bubbleAgent .dsh-hands-stream{max-height:46vh;min-height:20px;overflow:auto;overscroll-behavior:contain}
+      .dsh-hands-v2-bubbleAgent .dsh-hands-streamText{display:block;margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;font-size:12px;line-height:19px;color:var(--dsw-alias-label-primary)}
+      .dsh-hands-v2-waiting{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:19px}
+      .dsh-hands-v2 .dsh-hands-cursor{display:inline-block;width:6px;height:13px;margin-left:2px;vertical-align:-2px;background:var(--dsw-alias-brand-primary);border-radius:1px;animation:dsh-hands-blink 1s steps(1) infinite}
+      .dsh-hands-v2-expand{align-self:flex-start;margin-top:4px;padding:0;border:0;background:transparent;color:var(--dsw-alias-state-business-primary);font:inherit;font-size:11px;line-height:16px;cursor:pointer}
+      .dsh-hands-v2-expand:hover{text-decoration:underline}
+      .dsh-hands-v2-metaRow{display:flex;align-items:center;flex-wrap:wrap;gap:2px 8px;min-width:0;padding:0 2px;color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:14px}
+      .dsh-hands-v2-metaStatus{display:inline-flex;align-items:center;gap:4px;white-space:nowrap;color:var(--tone-color,var(--dsw-alias-label-tertiary))}
+      .dsh-hands-v2-metaBit{white-space:nowrap;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+      .dsh-hands-v2-older{align-self:center;padding:3px 10px;border:.5px solid var(--dsw-alias-border-l2);border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:10px;line-height:16px;cursor:pointer}
+      .dsh-hands-v2-older:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
+      .dsh-hands-v2-older:disabled{opacity:.5;cursor:default}
       .dsh-hands-v2-hint{display:flex;align-items:center;justify-content:center;min-height:80px;padding:20px 12px;text-align:center;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
-      @media (prefers-reduced-motion:reduce){.dsh-hands-v2-dot[data-tone=running]{animation:none}}
+      @keyframes dsh-hands-blink{0%,49%{opacity:1}50%,100%{opacity:0}}
+      @media (prefers-reduced-motion:reduce){.dsh-hands-v2-dot[data-tone=running]{animation:none}.dsh-hands-v2 .dsh-hands-cursor{animation:none}}
     `;
 
     // ── 单条输出：自己管滚动，贴底时自动跟随 ──────────────────────────────
@@ -1714,110 +2031,387 @@ window.__ModuleLoader__.load({
       );
     }
 
-    function HandsThread(props) {
-      const { store, t, mode, onBack } = props;
-      const sel = useStoreSlice(store, 'selection');
-      const turnsSlice = useStoreSlice(store, 'turns');
-      const live = useStoreSlice(store, 'live');
-      const sessions = useStoreSlice(store, 'sessions');
-      const row = findSession(sessions.sessions, sel.key);
-      const turns = turnsSlice.turns;
-      const activeTurn = turns.find((turn) => String(turn.id || '') === sel.turnId) || null;
-      const metaBits = [];
-      if (row?.cwd) metaBits.push(row.cwd);
-      if (row?.model) metaBits.push(row.model);
-      metaBits.push(t('v2Turns', { n: Number(row?.today ?? turns.length) || 0 }));
+    // ── v2 对话气泡 ─────────────────────────────────────────────────────────
+    //
+    // 正文按 id 单独订阅：一条流式增量只换那一个 Turn 的字符串，父组件（TurnList）
+    // 不跟着每 250ms 重渲整棵树。'live' 切片仍保留，给需要整表的场景。
+    const PROMPT_LIMIT = 2000;
+    const BODY_LIMIT = 4000;
 
-      let body;
-      if (!sel.key) {
-        body = h('div', { className: 'dsh-hands-v2-hint' }, t('v2PickSession'));
-      } else if (!turns.length) {
-        body = h('div', { className: 'dsh-hands-v2-hint' }, t('v2NoTurns'));
-      } else {
-        body = h(
+    function useTurnText(store, id) {
+      const read = React.useCallback(() => {
+        const live = store.getSnapshot().liveByTurn || {};
+        return String(live[id] || '');
+      }, [store, id]);
+      return React.useSyncExternalStore(store.subscribe, read, read);
+    }
+
+    function BubbleUser(props) {
+      const { t, prompt } = props;
+      const [expanded, setExpanded] = React.useState(false);
+      const full = String(prompt || '') || t('noPrompt');
+      const canExpand = full.length > PROMPT_LIMIT;
+      return h(
+        'div',
+        { className: 'dsh-hands-v2-bubble dsh-hands-v2-bubbleUser' },
+        h('div', { className: 'dsh-hands-v2-bubbleLabel' }, t('youToHand')),
+        h(
           'div',
-          { className: 'dsh-hands-v2-turns' },
-          turns.map((turn) => {
-            const id = String(turn.id || '');
-            const tone = toneOf(turn);
-            const active = !!id && id === sel.turnId;
-            const text = live.liveByTurn[id] || turn.excerpt || '';
-            return h(
-              'div',
-              { key: id || String(turn.startedAt || turn.at || 'turn'), className: 'dsh-hands-v2-turn' },
-              h(
-                'button',
-                {
-                  type: 'button',
-                  className: 'dsh-hands-v2-turnHead',
-                  'data-active': active ? 'true' : 'false',
-                  onClick: () => {
-                    store.selectTurn(id);
-                    if (id && live.liveByTurn[id] === undefined) store.loadTurnBody(id, 0);
-                  },
-                },
-                h('span', {
-                  className: 'dsh-hands-v2-dot',
-                  'data-tone': tone,
-                  style: { '--tone-color': TONE_COLOR[tone] || TONE_COLOR.unknown },
-                }),
-                h(
-                  'span',
-                  { className: 'dsh-hands-v2-turnPrompt' },
-                  (turn.prompt || t('noPrompt')).split(/\r?\n/)[0],
-                ),
-                h(
-                  'span',
-                  { className: 'dsh-hands-v2-turnTime' },
-                  formatTime(turn.startedAt || turn.at, t),
-                ),
-              ),
-              active
-                ? h('div', { className: 'dsh-hands-v2-turnBody' }, text || t('noOutput'))
-                : null,
-            );
-          }),
+          { className: 'dsh-hands-v2-bubbleText' },
+          canExpand && !expanded ? `${full.slice(0, PROMPT_LIMIT)}…` : full,
+        ),
+        canExpand
+          ? h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-hands-v2-expand',
+                onClick: () => setExpanded((value) => !value),
+              },
+              expanded ? t('v2Collapse') : t('v2Expand'),
+            )
+          : null,
+      );
+    }
+
+    function BubbleAgent(props) {
+      const { t, turn, view } = props;
+      const [expanded, setExpanded] = React.useState(false);
+      const full = String(view?.text || '');
+      const source = String(view?.source || 'none');
+      const running = !!view?.cursor;
+      const canExpand = full.length > BODY_LIMIT;
+      const hand = String(turn?.hand || '').toLowerCase();
+      const loadFull = source === 'excerpt' && typeof props.onNeedBody === 'function';
+      const showToggle = canExpand || loadFull;
+      const toggle = () => {
+        if (loadFull) props.onNeedBody();
+        if (canExpand) setExpanded((value) => !value);
+      };
+      return h(
+        'div',
+        {
+          className: 'dsh-hands-v2-bubble dsh-hands-v2-bubbleAgent',
+          'data-source': source,
+          style: { '--hand-color': HAND_COLOR[hand] || 'var(--dsw-alias-label-secondary)' },
+        },
+        h('div', { className: 'dsh-hands-v2-bubbleLabel' }, handLabel(hand, t)),
+        full || running
+          ? h(Stream, {
+              text: canExpand && !expanded ? full.slice(0, BODY_LIMIT) : full,
+              running,
+              t,
+            })
+          : h('div', { className: 'dsh-hands-v2-waiting' }, t('noOutput')),
+        showToggle
+          ? h(
+              'button',
+              { type: 'button', className: 'dsh-hands-v2-expand', onClick: toggle },
+              expanded ? t('v2Collapse') : loadFull ? t('v2LoadFull') : t('v2Expand'),
+            )
+          : null,
+      );
+    }
+
+    function Turn(props) {
+      const { store, t, turn, active, autoBody } = props;
+      const id = String(turn?.id || '');
+      const liveText = useTurnText(store, id);
+      // store 把 /turn 的增量按绝对偏移拼进了 liveByTurn，所以第三档留空；
+      // resolveTurnBody 仍保留 fetched 档，给单独缓存的调用方和测试用。
+      const view = resolveTurnBody(turn, liveText, '');
+      const needBody = React.useCallback(() => {
+        if (id) store.ensureTurnBody(id, true);
+      }, [store, id]);
+      React.useEffect(() => {
+        if (!id || liveText) return;
+        if (!autoBody && !active) return;
+        store.ensureTurnBody(id);
+      }, [store, id, liveText, autoBody, active]);
+      const tone = toneOf(turn);
+      const parts = formatTurnMeta(turn, t);
+      return h(
+        'div',
+        {
+          className: 'dsh-hands-v2-turn',
+          'data-active': active ? 'true' : 'false',
+          'data-source': view.source,
+          onClick: () => {
+            if (id) store.selectTurn(id);
+          },
+        },
+        h(BubbleUser, { t, prompt: turn?.prompt }),
+        h(BubbleAgent, { t, turn, view, onNeedBody: needBody }),
+        h(
+          'div',
+          { className: 'dsh-hands-v2-metaRow' },
+          h(
+            'span',
+            {
+              className: 'dsh-hands-v2-metaStatus',
+              style: { '--tone-color': TONE_COLOR[tone] || TONE_COLOR.unknown },
+            },
+            h('span', {
+              className: 'dsh-hands-v2-dot',
+              'data-tone': tone,
+              style: { '--tone-color': TONE_COLOR[tone] || TONE_COLOR.unknown },
+            }),
+            h('span', null, statusLabel(turn, t)),
+          ),
+          parts.map((part) =>
+            h('span', { key: part.key, className: 'dsh-hands-v2-metaBit' }, part.text),
+          ),
+        ),
+      );
+    }
+
+    // 轮次按 startedAt 正序渲染（服务端给的是倒序）。贴底才跟随；用户上滚后
+    // 不再抢滚动位置。滚到顶部（或点按钮）用 before 游标拉更早的一页。
+    function TurnList(props) {
+      const { store, t, sessionKey, turns, more, selectedTurnId } = props;
+      const listRef = React.useRef(null);
+      const innerRef = React.useRef(null);
+      const followRef = React.useRef(true);
+      const keyRef = React.useRef(sessionKey);
+      const anchorRef = React.useRef(null);
+      const loadingRef = React.useRef(false);
+      const [loadingOlder, setLoadingOlder] = React.useState(false);
+      const ordered = React.useMemo(
+        () => (Array.isArray(turns) ? [...turns].reverse() : []),
+        [turns],
+      );
+
+      React.useLayoutEffect(() => {
+        const element = listRef.current;
+        if (!element) return;
+        const anchor = anchorRef.current;
+        if (anchor) {
+          // 更早的一页插到顶部：保持用户原来看到的位置
+          anchorRef.current = null;
+          element.scrollTop = anchor.top + (element.scrollHeight - anchor.height);
+          return;
+        }
+        if (keyRef.current !== sessionKey) {
+          keyRef.current = sessionKey;
+          followRef.current = true;
+          element.scrollTop = element.scrollHeight;
+          return;
+        }
+        if (followRef.current) element.scrollTop = element.scrollHeight;
+      }, [ordered, sessionKey]);
+
+      // 气泡正文是异步补进来的（拉取 / live），内容变高时贴底才继续跟随。
+      React.useEffect(() => {
+        const element = listRef.current;
+        const inner = innerRef.current;
+        if (!element || !inner || typeof ResizeObserver === 'undefined') return undefined;
+        const observer = new ResizeObserver(() => {
+          if (followRef.current) element.scrollTop = element.scrollHeight;
+        });
+        observer.observe(inner);
+        return () => observer.disconnect();
+      }, [sessionKey, ordered.length > 0]);
+
+      const loadOlder = React.useCallback(async () => {
+        if (loadingRef.current || !more || !sessionKey) return;
+        const element = listRef.current;
+        anchorRef.current = element
+          ? { height: element.scrollHeight, top: element.scrollTop }
+          : null;
+        loadingRef.current = true;
+        setLoadingOlder(true);
+        try {
+          await store.loadOlderTurns(sessionKey);
+        } finally {
+          loadingRef.current = false;
+          setLoadingOlder(false);
+        }
+      }, [more, sessionKey, store]);
+
+      const onScroll = () => {
+        const element = listRef.current;
+        if (!element) return;
+        followRef.current =
+          element.scrollHeight - element.scrollTop - element.clientHeight < 48;
+        if (element.scrollTop < 40) void loadOlder();
+      };
+
+      if (!sessionKey) {
+        return h(
+          'div',
+          { className: 'dsh-hands-v2-threadBody' },
+          h('div', { className: 'dsh-hands-v2-hint' }, t('v2PickSession')),
+        );
+      }
+      if (!ordered.length) {
+        return h(
+          'div',
+          { className: 'dsh-hands-v2-threadBody' },
+          h('div', { className: 'dsh-hands-v2-hint' }, t('v2NoTurns')),
         );
       }
 
       return h(
         'div',
-        { className: 'dsh-hands-v2-thread' },
+        { className: 'dsh-hands-v2-threadBody', ref: listRef, onScroll },
         h(
           'div',
-          { className: 'dsh-hands-v2-threadHead' },
-          mode === 'drill'
+          { className: 'dsh-hands-v2-turns', ref: innerRef },
+          more
             ? h(
                 'button',
                 {
                   type: 'button',
-                  className: 'dsh-hands-v2-iconBtn',
-                  title: t('v2Back'),
-                  'aria-label': t('v2Back'),
-                  onClick: onBack,
+                  className: 'dsh-hands-v2-older',
+                  disabled: loadingOlder,
+                  onClick: loadOlder,
                 },
-                '‹',
+                loadingOlder ? t('loading') : t('v2LoadOlder'),
               )
             : null,
+          ordered.map((turn, index) =>
+            h(Turn, {
+              key: String(turn?.id || `turn-${index}`),
+              store,
+              t,
+              turn,
+              active: String(turn?.id || '') === selectedTurnId,
+              autoBody: true,
+            }),
+          ),
+        ),
+      );
+    }
+
+    function ThreadHead(props) {
+      const { t, mode, onBack, row, fallbackName, turns, activeTurn, action, onCancel, onRerun } =
+        props;
+      const tone = toneOf(activeTurn || row || {});
+      const running = turnIsRunning(activeTurn);
+      const finished = !!activeTurn && !running;
+      const busy = !!action?.pending;
+      const metaBits = [];
+      if (row?.cwd) metaBits.push(row.cwd);
+      if (row?.model) metaBits.push(row.model);
+      metaBits.push(t('v2Today', { n: Number(row?.today ?? turns.length) || 0 }));
+      const meta = metaBits.join(' · ');
+      return h(
+        'div',
+        { className: 'dsh-hands-v2-threadHead' },
+        mode === 'drill'
+          ? h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-hands-v2-iconBtn',
+                title: t('v2Back'),
+                'aria-label': t('v2Back'),
+                onClick: onBack,
+              },
+              '‹',
+            )
+          : null,
+        h('span', {
+          className: 'dsh-hands-v2-dot',
+          'data-tone': tone,
+          style: { '--tone-color': TONE_COLOR[tone] || TONE_COLOR.unknown },
+        }),
+        h(
+          'div',
+          { className: 'dsh-hands-v2-threadMain' },
           h(
             'div',
-            { className: 'dsh-hands-v2-threadMain' },
-            h(
-              'div',
-              { className: 'dsh-hands-v2-threadName' },
-              row?.name || sel.key || t('v2PickSession'),
-            ),
-            h('div', { className: 'dsh-hands-v2-threadMeta' }, metaBits.join(' · ')),
+            { className: 'dsh-hands-v2-threadName' },
+            row?.name || fallbackName || t('v2PickSession'),
           ),
-          activeTurn && activeTurn.running
-            ? h(
-                'span',
-                { className: 'dsh-hands-v2-liveTag', 'data-connected': 'true' },
-                t('statusRunning'),
-              )
-            : null,
+          h('div', { className: 'dsh-hands-v2-threadMeta', title: meta }, meta),
         ),
-        h('div', { className: 'dsh-hands-v2-threadBody' }, body),
+        h(
+          'div',
+          { className: 'dsh-hands-v2-threadActions' },
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-hands-v2-btn',
+              disabled: !running || busy,
+              title: t('v2Cancel'),
+              onClick: onCancel,
+            },
+            action?.pending === 'cancel' ? t('v2Cancelling') : t('v2Cancel'),
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-hands-v2-btn',
+              disabled: !finished || busy,
+              title: t('v2Rerun'),
+              onClick: onRerun,
+            },
+            action?.pending === 'rerun' ? t('v2Rerunning') : t('v2Rerun'),
+          ),
+        ),
+      );
+    }
+
+    function HandsThread(props) {
+      const { store, t, mode, onBack } = props;
+      const sel = useStoreSlice(store, 'selection');
+      const turnsSlice = useStoreSlice(store, 'turns');
+      const sessions = useStoreSlice(store, 'sessions');
+      const [action, setAction] = React.useState({ pending: '', error: '' });
+
+      const row = findSession(sessions.sessions, sel.key);
+      const turns = turnsSlice.turns;
+      const activeTurn =
+        turns.find((turn) => String(turn.id || '') === sel.turnId) || turns[0] || null;
+      const more = sel.key ? store.turnsMore(sel.key) : false;
+
+      // 切会话时把上一轮的按钮状态和错误清掉，别让红字跟着跑。
+      React.useEffect(() => {
+        setAction({ pending: '', error: '' });
+      }, [sel.key]);
+
+      const runAction = async (kind) => {
+        const id = String(activeTurn?.id || '');
+        if (!id || action.pending) return;
+        const label = kind === 'cancel' ? t('v2CancelFailed') : t('v2RerunFailed');
+        setAction({ pending: kind, error: '' });
+        const result =
+          kind === 'cancel' ? await store.cancelTurn(id) : await store.rerunTurn(id);
+        setAction({
+          pending: '',
+          error: result?.ok
+            ? ''
+            : `${label}${result?.error ? ` · ${result.error}` : ''}`,
+        });
+      };
+
+      return h(
+        'div',
+        { className: 'dsh-hands-v2-thread' },
+        h(ThreadHead, {
+          t,
+          mode,
+          onBack,
+          row,
+          fallbackName: sel.key,
+          turns,
+          activeTurn,
+          action,
+          onCancel: () => runAction('cancel'),
+          onRerun: () => runAction('rerun'),
+        }),
+        action.error ? h('div', { className: 'dsh-hands-v2-headError' }, action.error) : null,
+        h(TurnList, {
+          store,
+          t,
+          sessionKey: sel.key,
+          turns,
+          more,
+          selectedTurnId: sel.turnId,
+        }),
       );
     }
 
@@ -1997,6 +2591,18 @@ window.__ModuleLoader__.load({
 
     // createHandsStore 一并导出：acp/test-store.mjs 在 node 里直接实例化数据层，
     // 不渲染组件（factory 里的 hooks 只有真正挂载时才跑）。
-    return { inject: ['slots', 'locale'], apply, createHandsStore };
+    // 气泡的纯函数/纯展示组件导出给 acp/test-bubbles.mjs：用最小 React stub 就能渲染。
+    return {
+      inject: ['slots', 'locale'],
+      apply,
+      createHandsStore,
+      resolveTurnBody,
+      formatTurnMeta,
+      formatTokens,
+      formatCost,
+      BubbleUser,
+      BubbleAgent,
+      Turn,
+    };
   },
 });
