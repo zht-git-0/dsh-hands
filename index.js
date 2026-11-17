@@ -162,6 +162,28 @@ function clean(value) {
   return value
 }
 
+function localDateKey(ms = Date.now()) {
+  const date = new Date(ms)
+  const pad = (value) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
+// 会话 key：hand/名字；没名字的归到当天的「临时-日期」。
+function sessionKeyOf(hand, session, startedMs = Date.now()) {
+  const name = String(session || '').trim()
+  return `${hand}/${name || `临时-${localDateKey(startedMs)}`}`
+}
+
+// 只保留 UTF-8 文本的最后 maxBytes 字节，别把多字节字符切成两半。
+function tailUtf8(value, maxBytes) {
+  const text = String(value || '')
+  const buf = Buffer.from(text, 'utf8')
+  if (buf.length <= maxBytes) return text
+  let start = buf.length - maxBytes
+  while (start < buf.length && (buf[start] & 0xc0) === 0x80) start += 1
+  return buf.subarray(start).toString('utf8')
+}
+
 // 跑一次 agy。不经过 shell，参数数组直接交给 spawn，中文和空格都不会被拆坏。
 function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk } = {}) {
   return new Promise((resolve) => {
@@ -381,13 +403,18 @@ export function apply(ctx, config = {}) {
 
   // ── 调度日志：谁被派了什么活、跑了多久、成没成、当场说了什么 ──────────────
   //
-  // 写成一个 JSONL，右侧栏读它。只留最近 300 条，免得文件越长越大。
-  // 正在跑的活只放内存，输出也只在内存里滚；跑完再把最终输出落盘。
+  // v2 每条派发写两行：spawn 前 {phase:"start"}、收尾 {phase:"end"}。
+  // 启动时只有 start 没有 end 的活补成 INTERRUPTED（宿主重启把内存里的 RUNNING 丢了）。
+  // 日志只留元信息 + excerpt + jobFile；完整输出按 id 写进 hands-jobs/<id>.txt。
+  // 流式片段仍然只在内存里滚（createLiveView），不落盘。
   const LOG_FILE = path.join(os.homedir(), '.dsh', 'hands-log.jsonl')
-  const LOG_KEEP = 300
+  const JOBS_DIR = path.join(os.homedir(), '.dsh', 'hands-jobs')
+  const LOG_KEEP = 1000
+  const JOB_MAX_BYTES = 1024 * 1024
   const NL = String.fromCharCode(10)
   let runningRevision = 0
   let historyRevision = 0
+  let today = { date: localDateKey(), byHand: Object.create(null), byKey: Object.create(null) }
 
   function touchRunning() {
     runningRevision += 1
@@ -398,11 +425,58 @@ export function apply(ctx, config = {}) {
     runningRevision += 1
   }
 
-  function logDispatch(entry) {
+  function readRecords() {
+    try {
+      const lines = fs.readFileSync(LOG_FILE, 'utf8').split(NL).filter(Boolean)
+      return lines
+        .map((line) => {
+          try {
+            const value = JSON.parse(line)
+            return value && typeof value === 'object' ? value : null
+          } catch {
+            return null
+          }
+        })
+        .filter(Boolean)
+    } catch {
+      return []
+    }
+  }
+
+  // 把 start / end / 旧的单行记录合并成「一次派发」。旧日志没有 phase，原样兼容。
+  function mergedJobs(records = readRecords()) {
+    const starts = new Map()
+    const jobs = new Map()
+    for (const record of records) {
+      if (!record?.id) continue
+      const id = String(record.id)
+      if (record.phase === 'start') {
+        starts.set(id, record)
+        continue
+      }
+      if (record.phase === 'end') {
+        const merged = { ...(starts.get(id) || {}), ...record }
+        delete merged.phase
+        delete merged.v
+        jobs.set(id, merged)
+        continue
+      }
+      jobs.set(id, { ...record })
+    }
+    return [...jobs.values()]
+  }
+
+  function readJobs() {
+    return mergedJobs().sort((a, b) =>
+      String(b.at || b.startedAt || '').localeCompare(String(a.at || a.startedAt || '')),
+    )
+  }
+
+  // 日志按行裁，最多 LOG_KEEP 行。start 被裁掉也没关系：end 自带全部元信息。
+  function appendRecord(record) {
     try {
       fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true })
-      fs.appendFileSync(LOG_FILE, JSON.stringify(entry) + NL, 'utf8')
-      // 超了就裁一次（读全量再写回，300 行很小）
+      fs.appendFileSync(LOG_FILE, JSON.stringify(record) + NL, 'utf8')
       const lines = fs.readFileSync(LOG_FILE, 'utf8').split(NL).filter(Boolean)
       if (lines.length > LOG_KEEP) {
         fs.writeFileSync(LOG_FILE, lines.slice(-LOG_KEEP).join(NL) + NL, 'utf8')
@@ -412,19 +486,203 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  function readLog(limit = 50) {
+  function saveJobText(id, value) {
+    const text = String(value || '')
+    if (!text) return ''
     try {
-      const lines = fs.readFileSync(LOG_FILE, 'utf8').split(NL).filter(Boolean)
-      return lines.slice(-limit).map((l) => {
-        try {
-          return JSON.parse(l)
-        } catch {
-          return null
-        }
-      }).filter(Boolean).reverse()
+      fs.mkdirSync(JOBS_DIR, { recursive: true })
+      const file = path.join(JOBS_DIR, `${id}.txt`)
+      fs.writeFileSync(file, tailUtf8(text, JOB_MAX_BYTES), 'utf8')
+      return file
     } catch {
-      return []
+      return ''
     }
+  }
+
+  function readJobText(entry) {
+    if (!entry) return ''
+    if (typeof entry.output === 'string' && entry.output) return entry.output
+    const file = String(entry.jobFile || '')
+    if (!file) return ''
+    try {
+      const root = path.resolve(JOBS_DIR)
+      const resolved = path.resolve(file)
+      if (resolved !== root && !resolved.startsWith(root + path.sep)) return ''
+      return fs.readFileSync(resolved, 'utf8')
+    } catch {
+      return ''
+    }
+  }
+
+  // 宿主重启后的收尸：有 start、没 end 的记录一律补成 INTERRUPTED。
+  function reconcileLog() {
+    const records = readRecords()
+    const starts = new Map()
+    const ended = new Set()
+    for (const record of records) {
+      if (!record?.id) continue
+      if (record.phase === 'start') starts.set(String(record.id), record)
+      else if (record.phase === 'end') ended.add(String(record.id))
+    }
+    const now = Date.now()
+    for (const [id, start] of starts) {
+      if (ended.has(id)) continue
+      const startedMs = Date.parse(start.startedAt || start.at) || now
+      appendRecord(
+        clean({
+          ...start,
+          v: 2,
+          phase: 'end',
+          at: new Date(now).toISOString(),
+          status: 'INTERRUPTED',
+          ok: false,
+          ms: Math.max(0, now - startedMs),
+          excerpt: '',
+          error: 'interrupted: host restarted',
+          interrupted: true,
+        }),
+      )
+    }
+  }
+
+  function ensureToday() {
+    const date = localDateKey()
+    if (today.date !== date) today = { date, byHand: Object.create(null), byKey: Object.create(null) }
+    return today
+  }
+
+  function bumpToday(hand, key, atMs = Date.now()) {
+    const bucket = ensureToday()
+    if (localDateKey(atMs) !== bucket.date) return
+    bucket.byHand[hand] = (bucket.byHand[hand] || 0) + 1
+    bucket.byKey[key] = (bucket.byKey[key] || 0) + 1
+  }
+
+  // 今日次数只放内存：启动时从日志里重算，之后每次派发 +1。
+  function seedToday(jobs = readJobs()) {
+    const bucket = ensureToday()
+    bucket.byHand = Object.create(null)
+    bucket.byKey = Object.create(null)
+    for (const job of jobs) {
+      const startedMs = Date.parse(job.startedAt || job.at)
+      if (!Number.isFinite(startedMs) || localDateKey(startedMs) !== bucket.date) continue
+      const hand = String(job.hand || '')
+      const key = String(job.sessionKey || sessionKeyOf(hand, job.session, startedMs))
+      bucket.byHand[hand] = (bucket.byHand[hand] || 0) + 1
+      bucket.byKey[key] = (bucket.byKey[key] || 0) + 1
+    }
+  }
+
+  function todayCount(hand) {
+    ensureToday()
+    return today.byHand[String(hand || '')] || 0
+  }
+
+  // 会话列表 = 日志聚合 ∪ 四个 *-sessions.json；没派过活的也列出来，标 NOT_STARTED。
+  // 有名会话优先用 conversationId 归并，所以改 session 名字不会把历史拆成两段。
+  function sessionIndexFiles() {
+    return [
+      ['agy', INDEX_FILE],
+      ['codex', CODEX_INDEX],
+      ['claude', CLAUDE_INDEX],
+      ['opencode', OPENCODE_INDEX],
+    ]
+  }
+
+  function listSessions(handFilter = '') {
+    ensureToday()
+    const rows = new Map()
+    const ensureRow = (key, hand) => {
+      let row = rows.get(key)
+      if (!row) {
+        row = {
+          key,
+          hand,
+          name: '',
+          sessionKey: '',
+          conversationId: '',
+          turns: 0,
+          today: 0,
+          status: 'NOT_STARTED',
+          ok: false,
+          ms: 0,
+          startedAt: '',
+          lastAt: '',
+          cwd: '',
+          model: '',
+          excerpt: '',
+          running: false,
+          notStarted: false,
+        }
+        rows.set(key, row)
+      }
+      return row
+    }
+
+    const absorb = (record, running) => {
+      const hand = String(record.hand || '')
+      if (handFilter && hand !== handFilter) return
+      const startedMs = Date.parse(record.startedAt || record.at) || Date.now()
+      const sessionKey = String(record.sessionKey || sessionKeyOf(hand, record.session, startedMs))
+      const conversationId = String(record.conversationId || '')
+      const key = conversationId ? `${hand}/sid:${conversationId}` : sessionKey
+      const row = ensureRow(key, hand)
+      row.turns += 1
+      if (!row.conversationId && conversationId) row.conversationId = conversationId
+      if (!row.sessionKey) row.sessionKey = sessionKey
+      if (!row.name && record.session) row.name = String(record.session)
+      if (!row.cwd && record.cwd) row.cwd = String(record.cwd)
+      if (!row.model && record.model) row.model = String(record.model)
+      if (localDateKey(startedMs) === today.date) row.today += 1
+      if (!row.startedAt || startedMs < (Date.parse(row.startedAt) || Infinity)) {
+        row.startedAt = new Date(startedMs).toISOString()
+      }
+      const at = String(record.at || record.startedAt || '')
+      if (!row.lastAt || at > row.lastAt) {
+        row.lastAt = at
+        row.status = running ? 'RUNNING' : String(record.status || 'UNKNOWN')
+        row.ok = running ? false : record.ok === true
+        row.ms = running ? Math.max(0, Date.now() - startedMs) : Number(record.ms) || 0
+        row.excerpt = String(record.excerpt || '').slice(-600)
+        row.running = !!running
+        if (record.session) row.name = String(record.session)
+      }
+    }
+
+    for (const job of readJobs()) absorb(job, false)
+    for (const entry of RUNNING.values()) absorb(entry, true)
+
+    for (const [hand, file] of sessionIndexFiles()) {
+      if (handFilter && hand !== handFilter) continue
+      const index = readJson(file, {})
+      if (!index || typeof index !== 'object') continue
+      for (const [name, value] of Object.entries(index)) {
+        const id = value && typeof value === 'object' ? String(value.id || '') : ''
+        const key = id ? `${hand}/sid:${id}` : `${hand}/${name}`
+        const row = rows.get(key)
+        if (!row) {
+          const created = ensureRow(key, hand)
+          created.name = String(name)
+          created.sessionKey = `${hand}/${name}`
+          created.conversationId = id
+          created.status = 'NOT_STARTED'
+          created.notStarted = true
+          created.lastAt = String(value?.updated || '')
+          created.cwd = String(value?.cwd || '')
+          continue
+        }
+        // 索引比最后一条派发新（通常是刚改过名字）时，以索引里的名字为准。
+        const updated = String(value?.updated || '')
+        if (updated && (!row.lastAt || updated > row.lastAt)) {
+          row.name = String(name)
+          row.sessionKey = `${hand}/${name}`
+        }
+        if (!row.conversationId && id) row.conversationId = id
+        if (!row.cwd) row.cwd = String(value?.cwd || '')
+      }
+    }
+
+    return [...rows.values()].sort((a, b) => String(b.lastAt || '').localeCompare(String(a.lastAt || '')))
   }
 
   // 历史记录不把整段输出塞进每次快照：默认只带摘录，点开某一行时再单独取。
@@ -441,19 +699,43 @@ export function apply(ctx, config = {}) {
   function startDispatch(fields = {}) {
     const id = `${Date.now().toString(36)}-${(++runSeq).toString(36)}`
     const startedMs = Date.now()
+    const startedAt = new Date(startedMs).toISOString()
+    const session = String(fields.session || '')
+    const sessionKey = sessionKeyOf(fields.hand, session, startedMs)
     const entry = {
       id,
-      startedAt: new Date(startedMs).toISOString(),
+      startedAt,
       hand: String(fields.hand || ''),
       tool: String(fields.tool || ''),
       prompt: String(fields.prompt || '').slice(0, 4000),
       write: !!fields.write,
-      session: String(fields.session || ''),
+      session,
+      sessionKey,
+      conversationId: String(fields.conversationId || ''),
       cwd: String(fields.cwd || ''),
       model: String(fields.model || ''),
       output: '',
       outputAt: startedMs,
     }
+    appendRecord(
+      clean({
+        v: 2,
+        phase: 'start',
+        id,
+        at: startedAt,
+        startedAt,
+        hand: entry.hand,
+        tool: entry.tool,
+        prompt: entry.prompt,
+        write: entry.write,
+        session: entry.session,
+        sessionKey: entry.sessionKey,
+        conversationId: entry.conversationId,
+        cwd: entry.cwd,
+        model: entry.model,
+      }),
+    )
+    bumpToday(entry.hand, entry.sessionKey, startedMs)
     const live = createLiveView(entry.hand)
     RUNNING.set(id, entry)
     touchRunning()
@@ -474,16 +756,22 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  // 把一次派发收尾：从运行中移除，再把结果追加进日志。
+  // 把一次派发收尾：从运行中移除，元信息进日志，全文进 hands-jobs。
   function finishDispatch(run, fields = {}) {
     if (!run) return
     run.flush?.()
-    const output = String(run.entry.output || '').slice(-20000)
-    RUNNING.delete(run.id)
+    const output = String(run.entry.output || '')
     const endMs = Date.now()
+    const startedMs = Number.isFinite(run.startedMs) ? run.startedMs : endMs
     const status = String(fields.status || (fields.ok ? 'OK' : 'ERROR')).toUpperCase()
-    logDispatch(
+    const jobFile = saveJobText(run.id, output)
+    const sessionKey =
+      run.entry.sessionKey || sessionKeyOf(run.entry.hand, run.entry.session, startedMs)
+    RUNNING.delete(run.id)
+    appendRecord(
       clean({
+        v: 2,
+        phase: 'end',
         id: run.id,
         at: new Date(endMs).toISOString(),
         startedAt: run.entry.startedAt,
@@ -492,14 +780,18 @@ export function apply(ctx, config = {}) {
         prompt: run.entry.prompt,
         status,
         ok: fields.ok === true,
-        ms: Number.isFinite(fields.ms) ? fields.ms : endMs - run.startedMs,
+        ms: Number.isFinite(fields.ms) ? fields.ms : endMs - startedMs,
         write: run.entry.write,
         session: run.entry.session,
+        sessionKey,
+        conversationId: fields.conversationId || run.entry.conversationId || '',
         cwd: run.entry.cwd,
         model: run.entry.model,
         exitCode: fields.exitCode,
-        excerpt: String(fields.excerpt || '').slice(0, 1200),
-        output,
+        excerpt: String(fields.excerpt || output).slice(0, 1200),
+        jobFile: jobFile || undefined,
+        tokens: fields.tokens,
+        cost: fields.cost,
         error: fields.error ? String(fields.error).slice(0, 1200) : undefined,
       }),
     )
@@ -524,7 +816,7 @@ export function apply(ctx, config = {}) {
 
   function historyList(limit = 80) {
     const count = Math.max(1, Math.min(LOG_KEEP, Number(limit) || 80))
-    return readLog(count).map(stripOutput)
+    return readJobs().slice(0, count).map(stripOutput)
   }
 
   function snapshot(limit = 80) {
@@ -549,7 +841,8 @@ export function apply(ctx, config = {}) {
         output: String(live.output || '').slice(-20000),
       })
     }
-    return readLog(LOG_KEEP).find((entry) => entry.id === id) ?? null
+    const entry = readJobs().find((job) => job.id === id)
+    return entry ? clean({ ...entry, output: readJobText(entry) }) : null
   }
 
   // 各家 exit code / 自报状态不一致，统一折算成「成没成」。
@@ -560,6 +853,10 @@ export function apply(ctx, config = {}) {
     const failed = status === 'ERROR' || status === 'FAILED' || status === 'UNPARSED'
     return { status, ok: result.code === 0 && !failed }
   }
+
+  // 宿主重启后先把上次的孤儿 start 收尸，再算今天的次数。
+  reconcileLog()
+  seedToday(readJobs())
 
   ctx.effect(
     () =>
@@ -756,6 +1053,7 @@ export function apply(ctx, config = {}) {
         prompt,
         write: skipPermissions,
         session: label,
+        conversationId: resumeId,
         cwd: args?.cwd || '',
         model: args?.model || '',
       })
@@ -769,12 +1067,14 @@ export function apply(ctx, config = {}) {
         exitCode: result.code,
         excerpt: String(parsed?.response ?? result.stdout ?? ''),
         error: result.timedOut ? 'timeout' : result.code === 0 ? '' : String(result.stderr || ''),
+        conversationId: parsed?.conversation_id || resumeId,
+        tokens: parsed?.usage,
       })
 
       if (!parsed) {
         return {
           status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'UNPARSED' : 'ERROR',
-          response: String(result.stdout ?? '').slice(0, 20000),
+          response: String(run.entry.output || result.stdout || '').slice(0, 20000),
           stderr: String(result.stderr ?? '').slice(0, 4000),
           exitCode: result.code,
           elapsedSec: Number((result.ms / 1000).toFixed(1)),
@@ -1118,6 +1418,7 @@ export function apply(ctx, config = {}) {
         prompt,
         write: sandbox === 'workspace-write' || sandbox === 'danger-full-access',
         session: name,
+        conversationId: known || '',
         cwd: workdir,
         model: args?.model || '',
       })
@@ -1139,6 +1440,7 @@ export function apply(ctx, config = {}) {
           answer = blocks.length ? blocks[blocks.length - 1] : ''
         }
       }
+      if (!answer) answer = String(run.entry.output || '').slice(-4000)
       const tokens = collected.tokens
       const sid = collected.sessionId || pickSessionId(raw) || pickSessionId(err) || (resumed ? known : null)
 
@@ -1155,6 +1457,8 @@ export function apply(ctx, config = {}) {
         exitCode: result.code,
         excerpt: answer || err.slice(-1200) || raw.slice(-1200),
         error: result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
+        conversationId: sid,
+        tokens,
       })
 
       return clean({
@@ -1271,6 +1575,7 @@ export function apply(ctx, config = {}) {
         prompt,
         write: args?.permissionMode === 'acceptEdits' || args?.permissionMode === 'auto',
         session: name,
+        conversationId: known || '',
         cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
         model: args?.model || '',
       })
@@ -1293,7 +1598,7 @@ export function apply(ctx, config = {}) {
       const usage = parsed?.usage || {}
       const answer = parsed
         ? String(parsed.result ?? '')
-        : err.slice(-4000) || raw.slice(-4000)
+        : String(run.entry.output || '').slice(-4000) || err.slice(-4000) || raw.slice(-4000)
       const verdict = outcome(result, parsed?.is_error ? 'ERROR' : undefined)
       finishDispatch(run, {
         status: verdict.status,
@@ -1302,6 +1607,9 @@ export function apply(ctx, config = {}) {
         exitCode: result.code,
         excerpt: answer || err.slice(-1200) || raw.slice(-1200),
         error: result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
+        conversationId: sid,
+        tokens: usage,
+        cost: parsed?.total_cost_usd,
       })
       return clean({
         status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
@@ -1384,6 +1692,7 @@ export function apply(ctx, config = {}) {
         prompt,
         write: !!args?.auto,
         session: name,
+        conversationId: known || '',
         cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
         model: args?.model || '',
       })
@@ -1404,7 +1713,11 @@ export function apply(ctx, config = {}) {
         writeJson(OPENCODE_INDEX, index)
       }
 
-      const answer = collected.answer || err.slice(-3000) || raw.slice(-3000)
+      const answer =
+        collected.answer ||
+        String(run.entry.output || '').slice(-3000) ||
+        err.slice(-3000) ||
+        raw.slice(-3000)
       const verdict = outcome(result)
       finishDispatch(run, {
         status: verdict.status,
@@ -1413,6 +1726,9 @@ export function apply(ctx, config = {}) {
         exitCode: result.code,
         excerpt: answer,
         error: result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
+        conversationId: sid,
+        tokens: collected.tokens,
+        cost: collected.cost,
       })
 
       return clean({
@@ -1542,6 +1858,22 @@ export function apply(ctx, config = {}) {
     return undefined
   }
 
+  // 统一入口也把用量落进日志；这几个字段工具本来就解析过，只是以前没往外传。
+  function usageOf(to, raw) {
+    const text = String(raw || '')
+    if (to === 'agy') return { tokens: collectAgy(text)?.usage }
+    if (to === 'claude') {
+      const parsed = collectClaude(text)
+      return { tokens: parsed?.usage, cost: parsed?.total_cost_usd }
+    }
+    if (to === 'codex') return { tokens: collectCodex(text).tokens }
+    if (to === 'opencode') {
+      const parsed = collectOpencode(text)
+      return { tokens: parsed.tokens, cost: parsed.cost }
+    }
+    return {}
+  }
+
   ctx.tools.register({
     name: 'hands_run',
     description:
@@ -1597,6 +1929,7 @@ export function apply(ctx, config = {}) {
         prompt,
         write: opts.write,
         session: name,
+        conversationId: known || '',
         cwd: runCwd,
         model: opts.model,
       })
@@ -1615,8 +1948,13 @@ export function apply(ctx, config = {}) {
         writeJson(idxFile, index)
       }
 
-      const answer = extractAnswer(to, raw) || err.slice(-3000) || raw.slice(-3000)
+      const answer =
+        extractAnswer(to, raw) ||
+        String(run.entry.output || '').slice(-3000) ||
+        err.slice(-3000) ||
+        raw.slice(-3000)
       const verdict = outcome(result, reportedStatus(to, raw))
+      const usage = usageOf(to, raw)
       finishDispatch(run, {
         status: verdict.status,
         ok: verdict.ok,
@@ -1624,6 +1962,9 @@ export function apply(ctx, config = {}) {
         exitCode: result.code,
         excerpt: answer,
         error: result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
+        conversationId: sid,
+        tokens: usage.tokens,
+        cost: usage.cost,
       })
       return clean({
         status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
