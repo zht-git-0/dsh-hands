@@ -14,6 +14,8 @@ window.__ModuleLoader__.load({
 
     const en = {
       title: 'Hands',
+      navLabel: 'Xike',
+      pageSub: 'Dispatched hands and the replies they stream back.',
       subtitle: 'Your briefs and the hand’s live output.',
       guide: 'Watch dispatched hands and what they are saying right now.',
       refresh: 'Refresh',
@@ -77,6 +79,8 @@ window.__ModuleLoader__.load({
 
     const zh = {
       title: '手下任务',
+      navLabel: '希可',
+      pageSub: '派出去的活，和它们正在回的。',
       subtitle: '你派出去的活，和对面实时返回的输出。',
       guide: '看派出去的手下正在说什么。',
       refresh: '刷新',
@@ -407,6 +411,9 @@ window.__ModuleLoader__.load({
       let bodyDraining = false;
 
       let started = false;
+      // 同一个 store 可能被两处同时挂载（顶层面板 + 右侧栏 tab）：
+      // 引用计数保证只有最后一个卸载才真正断流，先卸载的那份不会把别人的流掐了。
+      let startDepth = 0;
       let mode = 'idle'; // idle | sse | poll
       let streamKey = '';
       let source = null;
@@ -1159,6 +1166,7 @@ window.__ModuleLoader__.load({
       }
 
       function start() {
+        startDepth += 1;
         if (started) return;
         started = true;
         emit({ phase: state.agents.length ? state.phase : 'loading', error: null });
@@ -1167,6 +1175,8 @@ window.__ModuleLoader__.load({
       }
 
       function stop() {
+        if (startDepth > 0) startDepth -= 1;
+        if (startDepth > 0) return;
         started = false;
         lifeToken += 1;
         closeSource();
@@ -2590,6 +2600,89 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // ── 顶层面板：和「插件」「自动化任务」「IM机器人」同级的整页窗口 ──────────
+    // 右侧栏 tab 是随手瞄一眼的窄版，这里是整页的大窗口，两处共用同一个 store
+    // （store 内部用引用计数，谁先卸载都不会把另一份的流掐掉）。
+    const PAGE_ID = 'dsh-hands';
+
+    const PAGE_CSS = `
+      .dsh-hands-page{display:flex;flex-direction:column;flex:auto;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;color:var(--dsw-alias-label-primary)}
+      .dsh-hands-pageHead{flex:none;display:flex;align-items:center;gap:8px;min-width:0;padding:16px 18px 12px}
+      .dsh-hands-pageMain{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+      .dsh-hands-pageTitle{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px;line-height:21px;font-weight:600}
+      .dsh-hands-pageSub{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:17px}
+      .dsh-hands-pageBody{flex:1;display:flex;min-width:0;min-height:0;padding:0 6px 6px;overflow:hidden}
+    `;
+
+    // 侧边栏图标：一颗四角星，跟「插件/自动化任务」那排 1px 线条同重量。
+    function HandsNavIcon(props) {
+      const size = Number(props?.size) || 16;
+      return h(
+        'svg',
+        {
+          width: size,
+          height: size,
+          viewBox: '0 0 16 16',
+          fill: 'none',
+          stroke: 'currentColor',
+          strokeWidth: 1,
+          strokeLinejoin: 'round',
+          'aria-hidden': true,
+          focusable: false,
+        },
+        h('path', { d: 'M8 1.6 9.55 6.45 14.4 8 9.55 9.55 8 14.4 6.45 9.55 1.6 8 6.45 6.45Z' }),
+      );
+    }
+
+    function HandsPage(props) {
+      const t = props.t || ((key) => key);
+      const store = props.store;
+      const meta = useStoreSlice(store, 'meta');
+      return h(
+        'div',
+        { className: 'dsh-hands-page' },
+        h('style', null, PAGE_CSS),
+        h(
+          'div',
+          { className: 'dsh-hands-pageHead' },
+          h(
+            'div',
+            { className: 'dsh-hands-pageMain' },
+            h('div', { className: 'dsh-hands-pageTitle' }, t('navLabel')),
+            h('div', { className: 'dsh-hands-pageSub' }, t('pageSub')),
+          ),
+          h('span', {
+            className: 'dsh-hands-v2-dot',
+            'data-tone': meta.connected ? 'running' : 'idle',
+            style: {
+              '--tone-color': meta.connected
+                ? 'var(--dsw-alias-state-success-primary)'
+                : 'var(--dsw-alias-label-tertiary)',
+            },
+          }),
+          h(
+            'span',
+            {
+              className: 'dsh-hands-v2-liveTag',
+              'data-connected': meta.connected ? 'true' : 'false',
+            },
+            meta.connected ? t('live') : t('reconnecting'),
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-hands-v2-iconBtn',
+              title: t('refresh'),
+              onClick: () => store.refreshAll(),
+            },
+            '↻',
+          ),
+        ),
+        h('div', { className: 'dsh-hands-pageBody' }, h(HandsPaneV2, { t, store })),
+      );
+    }
+
     // ── 接线 ────────────────────────────────────────────────────────────────
     function apply(ctx) {
       ctx.effect(() => ctx.locale.register(NS, { en, zh }), 'dsh-hands: locale');
@@ -2597,6 +2690,34 @@ window.__ModuleLoader__.load({
       const feed = createHandsFeed();
       // v2 的 store 只在 USE_V2=true 时被组件 start()；开关关掉时它什么都不做。
       const store = createHandsStore();
+
+      // 顶层面板：注册进 layout 的 main 槽 + 侧边栏导航行，
+      // 和「插件」「自动化任务」「IM机器人」并排，点一下整页打开。
+      ctx.inject(['layout'], (pageCtx) => {
+        pageCtx.slots.inject('main', () =>
+          pageCtx.slots.register(
+            {
+              name: 'main',
+              key: PAGE_ID,
+              locale: NS,
+              inject: () => ({ store, t }),
+            },
+            HandsPage,
+          ),
+        );
+        pageCtx.slots.inject('sidebar.panellist', () =>
+          pageCtx.slots.register(
+            {
+              name: 'sidebar.panellist',
+              id: PAGE_ID,
+              order: 12,
+              label: () => t('navLabel'),
+              locale: NS,
+            },
+            HandsNavIcon,
+          ),
+        );
+      });
 
       ctx.inject(['sidebarRightTabs', 'sidebarRight'], (sidebarCtx) => {
         sidebarCtx.effect(
@@ -2693,6 +2814,8 @@ window.__ModuleLoader__.load({
       BubbleUser,
       BubbleAgent,
       Turn,
+      HandsPage,
+      HandsNavIcon,
     };
   },
 });
