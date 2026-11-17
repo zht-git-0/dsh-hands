@@ -174,6 +174,69 @@ function sessionKeyOf(hand, session, startedMs = Date.now()) {
   return `${hand}/${name || `临时-${localDateKey(startedMs)}`}`
 }
 
+// 一轮 = 一次派发。把历史 job（mergedJobs 的产物）和在跑的 RUNNING entry
+// 摊平成面板要的头字段；纯函数、不碰闭包，acp/test-turns.mjs 直接 import。
+// 注意：只挑字段，output / jobFile 一律不往外带（太占带宽）。
+export function turnsFor(jobs, running, key, opts = {}) {
+  const wanted = String(key || '')
+  if (!wanted) return []
+  const before = opts.before ? String(opts.before) : ''
+  const limit = Math.min(Math.max(1, Number(opts.limit) || 50), 500)
+
+  // key 的算法和 listSessions 保持一致：有名会话走 hand/sid:<conversationId>。
+  const keyOf = (entry) => {
+    const hand = String(entry?.hand || '')
+    const startedMs = Date.parse(entry?.startedAt || entry?.at) || 0
+    const sessionKey = String(entry?.sessionKey || sessionKeyOf(hand, entry?.session, startedMs))
+    const conversationId = String(entry?.conversationId || '')
+    return conversationId ? `${hand}/sid:${conversationId}` : sessionKey
+  }
+  const matches = (entry) => {
+    const sessionKey = String(entry?.sessionKey || '')
+    const conversationId = String(entry?.conversationId || '')
+    return (
+      keyOf(entry) === wanted ||
+      (sessionKey && sessionKey === wanted) ||
+      (conversationId && wanted.endsWith(`sid:${conversationId}`))
+    )
+  }
+
+  const now = Date.now()
+  const seen = new Set()
+  const rows = []
+  const source = [
+    ...(Array.isArray(jobs) ? jobs : []).map((job) => [job, false]),
+    ...(Array.isArray(running) ? running : []).map((item) => [item, true]),
+  ]
+  for (const [entry, isRunning] of source) {
+    if (!entry || !matches(entry)) continue
+    const id = String(entry.id || '')
+    if (id && seen.has(id)) continue
+    if (id) seen.add(id)
+    const startedAt = String(entry.startedAt || entry.at || '')
+    if (before && startedAt && startedAt >= before) continue
+    rows.push({
+      id,
+      hand: String(entry.hand || ''),
+      tool: String(entry.tool || ''),
+      startedAt,
+      at: String(entry.at || entry.startedAt || ''),
+      status: isRunning ? 'RUNNING' : String(entry.status || (entry.ok === true ? 'OK' : 'UNKNOWN')),
+      ok: isRunning ? false : entry.ok === true,
+      ms: isRunning ? Math.max(0, now - (Date.parse(startedAt) || now)) : Number(entry.ms) || 0,
+      prompt: String(entry.prompt || ''),
+      excerpt: String(entry.excerpt || ''),
+      tokens: entry.tokens ?? null,
+      cost: entry.cost ?? null,
+      model: String(entry.model || ''),
+      write: !!entry.write,
+      running: !!isRunning,
+    })
+  }
+  rows.sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))
+  return rows.slice(0, limit)
+}
+
 // 只保留 UTF-8 文本的最后 maxBytes 字节，别把多字节字符切成两半。
 function tailUtf8(value, maxBytes) {
   const text = String(value || '')
@@ -953,6 +1016,89 @@ export function apply(ctx, config = {}) {
             if (u.pathname === '/dsh-hands/ping') {
               return send(200, { ok: true, plugin: 'dsh-hands' })
             }
+
+            // ── v2 只读聚合接口（第 1 步）：上面的旧 /log /job /ping /stream 一律不动 ──
+            // 新接口失败统一回 {ok:false,error} + 合适状态码，不能把宿主弄崩。
+            const fail = (status, error) =>
+              send(status, { ok: false, error: String(error?.message ?? error) })
+
+            if (u.pathname === '/dsh-hands/agents') {
+              try {
+                const checkedAt = new Date().toISOString()
+                const runningByHand = Object.create(null)
+                for (const entry of RUNNING.values()) {
+                  const h = String(entry.hand || '')
+                  runningByHand[h] = (runningByHand[h] || 0) + 1
+                }
+                const lastAtByHand = Object.create(null)
+                for (const job of mergedJobs()) {
+                  const h = String(job.hand || '')
+                  const at = String(job.at || job.startedAt || '')
+                  if (at && (!lastAtByHand[h] || at > lastAtByHand[h])) lastAtByHand[h] = at
+                }
+                const agents = Object.entries(HANDS).map(([hand, handDef]) =>
+                  clean({
+                    hand,
+                    label: handDef.label,
+                    running: runningByHand[hand] || 0,
+                    today: todayCount(hand),
+                    sessions: listSessions(hand).length,
+                    lastAt: lastAtByHand[hand] || '',
+                    // ok / version 第 3 步 health 再接；字段先留着，前端不用判空
+                    ok: false,
+                    bin: handDef.bin(),
+                    version: '',
+                  }),
+                )
+                return send(200, { checkedAt, agents })
+              } catch (e) {
+                return fail(500, e)
+              }
+            }
+
+            if (u.pathname === '/dsh-hands/sessions') {
+              try {
+                const hand = String(u.searchParams.get('hand') || '')
+                // 原样包一层 listSessions()，不动它已有的字段
+                return send(200, { hand, sessions: listSessions(hand) })
+              } catch (e) {
+                return fail(500, e)
+              }
+            }
+
+            if (u.pathname === '/dsh-hands/turns') {
+              try {
+                const key = String(u.searchParams.get('key') || '')
+                if (!key) return fail(400, 'key is required')
+                const before = String(u.searchParams.get('before') || '')
+                const limit = String(u.searchParams.get('limit') || '50')
+                const turns = turnsFor(mergedJobs(), [...RUNNING.values()], key, { before, limit })
+                return send(200, { key, turns })
+              } catch (e) {
+                return fail(500, e)
+              }
+            }
+
+            if (u.pathname === '/dsh-hands/turn') {
+              try {
+                const id = String(u.searchParams.get('id') || '')
+                const entry = id ? fullEntry(id) : null
+                if (!entry) return fail(404, 'not found')
+                // 带 from 只回正文增量；next / eof 一律服务端算好，前端别自己拼。
+                // id 校验和 jobFile 的路径穿越都沿用 fullEntry / readJobText。
+                if (u.searchParams.has('from')) {
+                  const from = Math.max(0, Number(u.searchParams.get('from')) || 0)
+                  const text = readJobText(entry)
+                  const delta = text.slice(from)
+                  const next = from + delta.length
+                  return send(200, { id, from, next, eof: next >= text.length, delta })
+                }
+                return send(200, { turn: entry })
+              } catch (e) {
+                return fail(500, e)
+              }
+            }
+
             return send(404, { error: 'unknown path' })
           } catch (e) {
             return send(500, { error: String(e?.message ?? e) })
