@@ -839,12 +839,13 @@ export function apply(ctx, config = {}) {
         return `${label}: ${line.trim().slice(0, 80)}`
       }
       const lines = [
-        await probe('agy 写作', bin, ['--version']),
-        await probe('codex 写代码', codexBin, ['--version']),
-        await probe('claude 架构规划', claudeBin, ['--version']),
-        await probe('opencode 写代码', opencodeBin, ['--version']),
+        await probe('agy      文案', bin, ['--version']),
+        await probe('codex    规划', codexBin, ['--version']),
+        await probe('claude   架构', claudeBin, ['--version']),
+        await probe('opencode 写码', opencodeBin, ['--version']),
       ]
-      return { text: lines.join('\n') }
+      lines.push('四个默认都只读；要改文件必须在调用时显式要（write: true / sandbox / auto）')
+      return { text: lines.join(String.fromCharCode(10)) }
     },
   })
 
@@ -1052,6 +1053,213 @@ export function apply(ctx, config = {}) {
         resumed: !!known,
         cost,
         tokens: tokens || null,
+        exitCode: result.code,
+        ms: result.ms,
+      })
+    },
+  })
+
+  // ── 统一调度入口：一个工具管四个手下 ─────────────────────────────────────
+  //
+  // 为什么要有它：四个手下的参数不一样（agy 用 mode、codex 用 sandbox、
+  // claude 用 permissionMode、opencode 用 auto），每次调用都要先想"这个手下
+  // 那个字段叫什么"。所以再开一个入口，只管回答两件事：派给谁、要不要让它改文件。
+  //
+  // 下面四个 hands_* 的细节参数还在，需要精调时用那些。
+
+  const HANDS = {
+    agy: {
+      label: 'agy（文案）',
+      bin: () => bin,
+      build: (prompt, opts, known) => {
+        const argv = ['-p', prompt]
+        if (known) argv.push('--conversation', known)
+        if (opts.write) argv.push('--dangerously-skip-permissions')
+        return argv
+      },
+      index: () => path.join(os.homedir(), '.dsh', 'agy-sessions.json'),
+      // agy 的 -p 只打答案，不带会话 id；它的 id 在 cache/last_conversations.json 里按 cwd 存
+      pick: (raw, cwd) => {
+        try {
+          const f = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'cache', 'last_conversations.json')
+          const map = JSON.parse(fs.readFileSync(f, 'utf8'))
+          return map[cwd] || null
+        } catch {
+          return null
+        }
+      },
+    },
+    codex: {
+      label: 'codex（规划/评审）',
+      bin: () => codexBin,
+      build: (prompt, opts, known) => {
+        const sb = opts.write ? 'workspace-write' : 'read-only'
+        if (known) {
+          const argv = ['exec', 'resume', '--skip-git-repo-check', '-c', `sandbox_mode="${sb}"`, known]
+          argv.push(prompt)
+          return argv
+        }
+        const argv = ['exec', '--skip-git-repo-check', '-s', sb]
+        argv.push(prompt)
+        return argv
+      },
+      index: () => path.join(os.homedir(), '.dsh', 'codex-sessions.json'),
+      pick: (raw) => (String(raw).match(/session id:\s*([0-9a-f-]{16,})/) || [])[1] || null,
+    },
+    claude: {
+      label: 'claude（架构规划）',
+      bin: () => claudeBin,
+      build: (prompt, opts, known) => {
+        const argv = ['-p', prompt, '--output-format', 'json',
+          '--permission-mode', opts.write ? 'acceptEdits' : 'plan']
+        if (known) argv.push('--resume', known)
+        return argv
+      },
+      index: () => path.join(os.homedir(), '.dsh', 'claude-sessions.json'),
+      pick: (raw) => {
+        try {
+          const d = JSON.parse(String(raw).trim())
+          return d.session_id || null
+        } catch {
+          return null
+        }
+      },
+    },
+    opencode: {
+      label: 'opencode（写代码）',
+      bin: () => opencodeBin,
+      build: (prompt, opts, known) => {
+        const argv = ['run', '--format', 'json']
+        if (known) argv.push('--session', known)
+        if (opts.write) argv.push('--auto')
+        argv.push(prompt)
+        return argv
+      },
+      index: () => path.join(os.homedir(), '.dsh', 'opencode-sessions.json'),
+      pick: (raw) => {
+        for (const line of String(raw).split('\n')) {
+          const s = line.trim()
+          if (!s.startsWith('{')) continue
+          try {
+            const ev = JSON.parse(s)
+            if (ev.sessionID) return ev.sessionID
+          } catch {}
+        }
+        return null
+      },
+    },
+  }
+
+  // 从各家五花八门的输出里抠出「答复正文」
+  function extractAnswer(to, raw) {
+    const text = String(raw || '')
+    if (to === 'claude') {
+      try {
+        const d = JSON.parse(text.trim())
+        return String(d.result || '')
+      } catch {
+        const a = text.indexOf('{')
+        const b = text.lastIndexOf('}')
+        if (a >= 0 && b > a) {
+          try {
+            return String(JSON.parse(text.slice(a, b + 1)).result || '')
+          } catch {}
+        }
+      }
+    }
+    if (to === 'opencode') {
+      const parts = []
+      for (const line of text.split('\n')) {
+        const s = line.trim()
+        if (!s.startsWith('{')) continue
+        try {
+          const ev = JSON.parse(s)
+          if (ev.type === 'text' && ev.part && typeof ev.part.text === 'string') parts.push(ev.part.text)
+        } catch {}
+      }
+      if (parts.length) return parts.join('\n').trim()
+    }
+    if (to === 'codex') {
+      const cut = text.lastIndexOf('tokens used')
+      if (cut >= 0) {
+        const tail = text.slice(cut).replace(/tokens used\s*\n\s*[\d,]+/i, '').trim()
+        if (tail) return tail
+      }
+    }
+    const blocks = text.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
+    return blocks.length ? blocks[blocks.length - 1] : ''
+  }
+
+  ctx.tools.register({
+    name: 'hands_run',
+    description:
+      'Dispatch one turn to any of the four hands by name. `to`: agy (copywriting) / codex (planning, review) / ' +
+      'claude (architecture planning) / opencode (writing code). The only switch you need besides `to` and `prompt`: ' +
+      '`write` — false (default) means read-only reasoning, true lets it modify files. ' +
+      'Pass `session` to keep a name → conversation, exactly like the per-hand tools.',
+    parameters: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', enum: ['agy', 'codex', 'claude', 'opencode'], description: 'Which hand.' },
+        prompt: { type: 'string', description: 'The complete brief.' },
+        cwd: { type: 'string', description: 'Working directory. Omit to inherit the current session directory.' },
+        session: { type: 'string', description: 'Stable name for this line of work; the same name resumes the same conversation.' },
+        write: { type: 'boolean', description: 'Allow file edits. Default false (read-only).' },
+        model: { type: 'string', description: 'Model override where supported (codex / claude).' },
+        timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900).' },
+      },
+      required: ['to', 'prompt'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string' },
+          hand: { type: 'string' },
+          response: { type: 'string' },
+          sessionId: { type: 'string' },
+          resumed: { type: 'boolean' },
+        },
+      },
+      render: (_args, value) => asText(value),
+    },
+    async execute(args) {
+      const to = String(args?.to || '')
+      const hand = HANDS[to]
+      if (!hand) throw new Error(`to 只能是 ${Object.keys(HANDS).join(' / ')}`)
+      const prompt = String(args?.prompt ?? '')
+      if (!prompt.trim()) throw new Error('prompt is required')
+
+      const idxFile = hand.index()
+      const index = readJson(idxFile, {}) || {}
+      const name = args?.session ? String(args.session) : ''
+      const known = name && index[name] ? index[name].id : null
+
+      const opts = { write: !!args?.write, model: args?.model || '' }
+      const argv = hand.build(prompt, opts, known)
+
+      const result = await runProcess(hand.bin(), argv, {
+        cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
+        timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
+      })
+
+      const raw = String(result.stdout ?? '')
+      const err = String(result.stderr ?? '')
+      const runCwd = args?.cwd ? path.resolve(String(args.cwd)) : process.cwd()
+      const sid = hand.pick(raw, runCwd) || hand.pick(err, runCwd) || known || ''
+      if (name && sid && sid !== known) {
+        index[name] = { id: sid, cwd: args?.cwd || '', updated: new Date().toISOString() }
+        writeJson(idxFile, index)
+      }
+
+      const answer = extractAnswer(to, raw) || raw.slice(-3000) || err.slice(-2000)
+      return clean({
+        status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
+        hand: hand.label,
+        response: answer,
+        sessionId: sid,
+        resumed: !!known,
         exitCode: result.code,
         ms: result.ms,
       })
