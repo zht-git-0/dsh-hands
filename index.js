@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 export const name = 'hands'
-export const inject = ['tools']
+export const inject = ['tools', 'webServer']
 
 // agy（Antigravity CLI）默认装在这里；config.bin 可以覆盖。
 const DEFAULT_BIN =
@@ -350,6 +350,145 @@ export function apply(ctx, config = {}) {
     return clean(report)
   }
 
+  // ── 调度日志：谁被派了什么活、跑了多久、成没成 ──────────────────────────
+  //
+  // 写成一个 JSONL，面板读它。只留最近 300 条，免得文件越长越大。
+  const LOG_FILE = path.join(os.homedir(), '.dsh', 'hands-log.jsonl')
+  const LOG_KEEP = 300
+  const NL = String.fromCharCode(10)
+
+  function logDispatch(entry) {
+    try {
+      fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true })
+      fs.appendFileSync(LOG_FILE, JSON.stringify(entry) + NL, 'utf8')
+      // 超了就裁一次（读全量再写回，300 行很小）
+      const lines = fs.readFileSync(LOG_FILE, 'utf8').split(NL).filter(Boolean)
+      if (lines.length > LOG_KEEP) {
+        fs.writeFileSync(LOG_FILE, lines.slice(-LOG_KEEP).join(NL) + NL, 'utf8')
+      }
+    } catch {
+      /* 日志写失败不影响干活 */
+    }
+  }
+
+  function readLog(limit = 50) {
+    try {
+      const lines = fs.readFileSync(LOG_FILE, 'utf8').split(NL).filter(Boolean)
+      return lines.slice(-limit).map((l) => {
+        try {
+          return JSON.parse(l)
+        } catch {
+          return null
+        }
+      }).filter(Boolean).reverse()
+    } catch {
+      return []
+    }
+  }
+
+  // 正在跑的活只放内存：跑完才落盘，日志文件保持「一次派发一行」。
+  const RUNNING = new Map()
+  let runSeq = 0
+
+  function startDispatch(fields = {}) {
+    const id = `${Date.now().toString(36)}-${(++runSeq).toString(36)}`
+    const startedMs = Date.now()
+    const entry = {
+      id,
+      startedAt: new Date(startedMs).toISOString(),
+      hand: String(fields.hand || ''),
+      tool: String(fields.tool || ''),
+      prompt: String(fields.prompt || '').slice(0, 300),
+      write: !!fields.write,
+      session: String(fields.session || ''),
+      cwd: String(fields.cwd || ''),
+      model: String(fields.model || ''),
+    }
+    RUNNING.set(id, entry)
+    return { id, startedMs, entry }
+  }
+
+  // 把一次派发收尾：从运行中移除，再把结果追加进日志。
+  function finishDispatch(run, fields = {}) {
+    if (!run) return
+    RUNNING.delete(run.id)
+    const endMs = Date.now()
+    const status = String(fields.status || (fields.ok ? 'OK' : 'ERROR')).toUpperCase()
+    logDispatch(
+      clean({
+        id: run.id,
+        at: new Date(endMs).toISOString(),
+        startedAt: run.entry.startedAt,
+        hand: run.entry.hand,
+        tool: run.entry.tool,
+        prompt: run.entry.prompt,
+        status,
+        ok: fields.ok === true,
+        ms: Number.isFinite(fields.ms) ? fields.ms : endMs - run.startedMs,
+        write: run.entry.write,
+        session: run.entry.session,
+        cwd: run.entry.cwd,
+        model: run.entry.model,
+        exitCode: fields.exitCode,
+        excerpt: String(fields.excerpt || '').slice(0, 600),
+        error: fields.error ? String(fields.error).slice(0, 600) : undefined,
+      }),
+    )
+  }
+
+  // 各家 exit code / 自报状态不一致，统一折算成「成没成」。
+  function outcome(result, reported) {
+    if (result.timedOut) return { status: 'TIMEOUT', ok: false }
+    let status = String(reported || (result.code === 0 ? 'OK' : 'ERROR')).toUpperCase()
+    if (result.code !== 0 && !['ERROR', 'FAILED', 'UNPARSED'].includes(status)) status = 'ERROR'
+    const failed = status === 'ERROR' || status === 'FAILED' || status === 'UNPARSED'
+    return { status, ok: result.code === 0 && !failed }
+  }
+
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'prefix',
+        path: '/dsh-hands',
+        handler: async (req, res) => {
+          const send = (status, body) => {
+            if (res.destroyed || res.writableEnded) return
+            res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+            res.end(JSON.stringify(body))
+          }
+          try {
+            const u = new URL(req.url, 'http://localhost')
+            if (u.pathname === '/dsh-hands/log') {
+              const n = Number(u.searchParams.get('n') || '50')
+              const now = Date.now()
+              const running = [...RUNNING.values()]
+                .map((entry) =>
+                  clean({
+                    ...entry,
+                    status: 'RUNNING',
+                    ok: false,
+                    ms: Math.max(0, now - Date.parse(entry.startedAt)),
+                  }),
+                )
+                .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))
+              return send(200, {
+                checkedAt: new Date(now).toISOString(),
+                running,
+                entries: readLog(Math.max(1, Math.min(300, n))),
+              })
+            }
+            if (u.pathname === '/dsh-hands/ping') {
+              return send(200, { ok: true, plugin: 'dsh-hands' })
+            }
+            return send(404, { error: 'unknown path' })
+          } catch (e) {
+            return send(500, { error: String(e?.message ?? e) })
+          }
+        },
+      }),
+    'dsh-hands: dispatch log api',
+  )
+
   ctx.tools.register({
     name: 'agy_run',
     description:
@@ -435,8 +574,26 @@ export function apply(ctx, config = {}) {
       if (skipPermissions) argv.push('--dangerously-skip-permissions')
 
       const timeoutSec = Number(args?.timeoutSec) || defaultTimeout
+      const run = startDispatch({
+        hand: 'agy',
+        tool: 'agy_run',
+        prompt,
+        write: skipPermissions,
+        session: label,
+        cwd: args?.cwd || '',
+        model: args?.model || '',
+      })
       const result = await runProcess(bin, argv, { cwd: args?.cwd, timeoutSec })
       const parsed = parseJsonOutput(result.stdout)
+      const verdict = outcome(result, parsed?.status ?? (result.code === 0 ? 'SUCCESS' : 'ERROR'))
+      finishDispatch(run, {
+        status: verdict.status,
+        ok: verdict.ok,
+        ms: result.ms,
+        exitCode: result.code,
+        excerpt: String(parsed?.response ?? result.stdout ?? ''),
+        error: result.timedOut ? 'timeout' : result.code === 0 ? '' : String(result.stderr || ''),
+      })
 
       if (!parsed) {
         return {
@@ -779,11 +936,19 @@ export function apply(ctx, config = {}) {
         argv.push(prompt)
       }
 
+      const run = startDispatch({
+        hand: 'codex',
+        tool: 'codex_run',
+        prompt,
+        write: sandbox === 'workspace-write' || sandbox === 'danger-full-access',
+        session: name,
+        cwd: workdir,
+        model: args?.model || '',
+      })
       const result = await runProcess(codexBin, argv, {
         cwd: workdir,
         timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
       })
-
       const raw = String(result.stdout ?? '')
       const err = String(result.stderr ?? '')
       // codex 会把最终答复在末尾再打一遍，紧跟 "tokens used" 之后。
@@ -806,6 +971,16 @@ export function apply(ctx, config = {}) {
         saveCodexIndex(index)
       }
 
+      const verdict = outcome(result)
+      finishDispatch(run, {
+        status: verdict.status,
+        ok: verdict.ok,
+        ms: result.ms,
+        exitCode: result.code,
+        excerpt: answer || raw.slice(-600),
+        error: result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
+      })
+
       return clean({
         status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
         response: answer || raw.slice(-4000) || err.slice(-2000),
@@ -821,8 +996,8 @@ export function apply(ctx, config = {}) {
   ctx.tools.register({
     name: 'hands_status',
     description:
-      'Report whether the two hands are usable right now: agy (writing) and codex (coding). ' +
-      'Returns each binary path, version line, and a quick runnability probe.',
+      'Report whether the four hands are usable right now: agy (copywriting), codex (planning), claude (architecture) ' +
+      'and opencode (coding). Returns each binary path, version line, and a quick runnability probe.',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     output: {
       schema: { type: 'object', properties: { text: { type: 'string' } } },
@@ -907,6 +1082,15 @@ export function apply(ctx, config = {}) {
       if (args?.permissionMode) argv.push('--permission-mode', String(args.permissionMode))
       if (known) argv.push('--resume', known)
 
+      const run = startDispatch({
+        hand: 'claude',
+        tool: 'claude_run',
+        prompt,
+        write: args?.permissionMode === 'acceptEdits' || args?.permissionMode === 'auto',
+        session: name,
+        cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
+        model: args?.model || '',
+      })
       const result = await runProcess(claudeBin, argv, {
         cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
         timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
@@ -935,11 +1119,21 @@ export function apply(ctx, config = {}) {
       }
 
       const usage = (parsed && parsed.usage) || {}
+      const answer = parsed
+        ? String(parsed.result ?? '')
+        : raw.slice(-4000) || err.slice(-2000)
+      const verdict = outcome(result)
+      finishDispatch(run, {
+        status: verdict.status,
+        ok: verdict.ok,
+        ms: result.ms,
+        exitCode: result.code,
+        excerpt: answer,
+        error: result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
+      })
       return clean({
         status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
-        response: parsed
-          ? String(parsed.result ?? '')
-          : raw.slice(-4000) || err.slice(-2000),
+        response: answer,
         sessionId: sid,
         resumed: !!known,
         cost: parsed ? parsed.total_cost_usd : null,
@@ -1012,6 +1206,15 @@ export function apply(ctx, config = {}) {
       if (args?.auto) argv.push('--auto')
       argv.push(prompt)
 
+      const run = startDispatch({
+        hand: 'opencode',
+        tool: 'opencode_run',
+        prompt,
+        write: !!args?.auto,
+        session: name,
+        cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
+        model: args?.model || '',
+      })
       const result = await runProcess(opencodeBin, argv, {
         cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
         timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
@@ -1046,9 +1249,20 @@ export function apply(ctx, config = {}) {
         writeJson(OPENCODE_INDEX, index)
       }
 
+      const answer = texts.join('\n').trim() || raw.slice(-3000) || err.slice(-2000)
+      const verdict = outcome(result)
+      finishDispatch(run, {
+        status: verdict.status,
+        ok: verdict.ok,
+        ms: result.ms,
+        exitCode: result.code,
+        excerpt: answer,
+        error: result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
+      })
+
       return clean({
         status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
-        response: texts.join('\n').trim() || raw.slice(-3000) || err.slice(-2000),
+        response: answer,
         sessionId: sid,
         resumed: !!known,
         cost,
@@ -1238,15 +1452,24 @@ export function apply(ctx, config = {}) {
 
       const opts = { write: !!args?.write, model: args?.model || '' }
       const argv = hand.build(prompt, opts, known)
+      const runCwd = args?.cwd ? path.resolve(String(args.cwd)) : process.cwd()
+      const run = startDispatch({
+        hand: to,
+        tool: 'hands_run',
+        prompt,
+        write: opts.write,
+        session: name,
+        cwd: runCwd,
+        model: opts.model,
+      })
 
       const result = await runProcess(hand.bin(), argv, {
-        cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
+        cwd: runCwd,
         timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
       })
 
       const raw = String(result.stdout ?? '')
       const err = String(result.stderr ?? '')
-      const runCwd = args?.cwd ? path.resolve(String(args.cwd)) : process.cwd()
       const sid = hand.pick(raw, runCwd) || hand.pick(err, runCwd) || known || ''
       if (name && sid && sid !== known) {
         index[name] = { id: sid, cwd: args?.cwd || '', updated: new Date().toISOString() }
@@ -1254,6 +1477,15 @@ export function apply(ctx, config = {}) {
       }
 
       const answer = extractAnswer(to, raw) || raw.slice(-3000) || err.slice(-2000)
+      const verdict = outcome(result)
+      finishDispatch(run, {
+        status: verdict.status,
+        ok: verdict.ok,
+        ms: result.ms,
+        exitCode: result.code,
+        excerpt: answer,
+        error: result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
+      })
       return clean({
         status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
         hand: hand.label,

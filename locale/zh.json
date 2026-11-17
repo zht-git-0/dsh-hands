@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "手下",
-    "description": "两个命令行智能体：agy 管文案写作，codex 管写代码。自用版，不带安装向导。"
+    "description": "把 agy、codex、claude、opencode 四个命令行智能体接成 DSH 工具，并在设置里提供「手下调度」面板。"
   }
 }

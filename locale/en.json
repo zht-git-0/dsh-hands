@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Hands",
-    "description": "Two CLI agents: agy writes copy, codex writes code. Self-use build, no setup wizard."
+    "description": "Four CLI agents (agy, codex, claude, opencode) as DSH tools, plus a Hands dispatch panel in Settings."
   }
 }

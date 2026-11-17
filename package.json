@@ -1,16 +1,18 @@
 {
   "name": "dsh-hands",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
-  "description": "把本机的 agy 和 codex 两个命令行智能体接成 DSH 工具：agy 管文案写作，codex 管写代码。自用版，不带安装向导。",
+  "description": "把本机的 agy、codex、claude、opencode 四个命令行智能体接成 DSH 工具，并在设置里提供「手下调度」面板。",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
   "files": [
     "index.js",
+    "client.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
@@ -20,6 +22,13 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
     }
   }
 }

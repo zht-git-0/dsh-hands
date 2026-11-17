@@ -1,6 +1,6 @@
 # dsh-hands
 
-把本机两个命令行智能体接成 DSH 工具。**自用版**，不带安装向导、不做环境检查面板。
+把本机四个命令行智能体接成 DSH 工具，并在设置里提供「手下调度」面板。**自用版**，不带安装向导、不做环境检查面板。
 
 | 手下 | 干什么 | 工具 |
 |---|---|---|
@@ -9,6 +9,7 @@
 | `claude`（Claude Code） | 架构级规划、设计评审 | `claude_run` |
 | `opencode` | **核心写代码**（用订阅，不按 token 计费） | `opencode_run` |
 | — | 探活 | `hands_status` |
+| 设置 → 手下调度 | 最近派活记录：谁、成没成、跑了多久 | 可视化面板 |
 
 分工：**claude / codex 出方案 → opencode 落地 → 希可验收**，agy 只管文案。
 
@@ -89,6 +90,20 @@ hands_run(to="opencode", prompt="…", cwd="…", session="aigame", write=true)
 
 会话续接四家都支持，agy 的 id 是跑完之后去它自己的缓存里按 cwd 查的（它的 `-p` 只打答案，不带 id）。
 
+## 设置面板：手下调度
+
+打开 **设置 → 手下调度**，可以看到最近派出去的活：
+
+- 派给了哪个手下（颜色区分 agy / codex / claude / opencode）
+- 成没成（成功 / 失败 / 超时 / 进行中）
+- 跑了多久，以及开始时间
+- 配的是哪个 `session`、用哪个入口（`hands_run` 还是单个 `*_run`）、要不要写文件
+- 点开一行能看完整的派活内容和答复摘录
+
+面板每 5 秒自动刷新；也可以按手下或结果筛选。数据写在 `~/.dsh/hands-log.jsonl`，只保留最近 300 条。正在跑的活只放在内存里，跑完后落盘。
+
+桌面端第一次加载新面板需要重启一次（link bundle 的 HMR 不生效）；之后改 `client.js` 也要重开页面或重启才能看到新代码。
+
 ## 调度上还没解决的问题（已知）
 
 - **改完插件要手动 toggle 一次**才生效：`set_bundle false` 再 `true`。HMR 对 link 类型的 bundle 不生效。
@@ -116,5 +131,6 @@ codex 交活之后**不许直接信**：
 
 ## 和旧版的关系
 
-从 `dsh-agy` 1.1.0 分出来：删掉 `client.js`（设置页）、删掉 `/dsh-agy/*` HTTP 接口、
-插件名改 `hands`，加了 codex。agy 那五个工具原样保留。
+从 `dsh-agy` 1.1.0 分出来：删掉旧的 `client.js`（设置页）和 `/dsh-agy/*` HTTP 接口，
+插件名改 `hands`，加了 codex、claude、opencode 和统一入口。2.1.0 重新加了
+`client.js`，但只做「手下调度」这一个设置页，旧的 agy 会话管理页没有搬回来。
