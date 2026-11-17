@@ -11,6 +11,9 @@ window.__ModuleLoader__.load({
     // 灰度开关：默认仍走旧扁平列表；改成 true 才挂 v2 三列。
     // 旧 createHandsFeed / HandsSidebar 一行不删，切回 false 就是完整回滚路径。
     const USE_V2 = true;
+    // 会话右侧栏那个窄版 tab：2026-11-18 爸爸说「还是去掉吧」，主入口只留顶层面板。
+    // 代码一行没删，把这里改回 true 就整套回来（tab + 窄版 + 派活自动掀开）。
+    const SHOW_SIDEBAR_TAB = false;
 
     const en = {
       title: 'Hands',
@@ -2719,85 +2722,87 @@ window.__ModuleLoader__.load({
         );
       });
 
-      ctx.inject(['sidebarRightTabs', 'sidebarRight'], (sidebarCtx) => {
-        sidebarCtx.effect(
-          () =>
-            sidebarCtx.sidebarRightTabs.register({
-              id: TAB_ID,
-              kind: TAB_KIND,
-              priority: 'extension',
-              title: () => t('title'),
-              guide: [
-                {
-                  id: 'hands',
-                  order: 30,
-                  title: () => t('title'),
-                  description: () => t('guide'),
-                  icon: HandsIcon,
-                },
-              ],
-            }),
-          'dsh-hands: right sidebar tab',
-        );
+      if (SHOW_SIDEBAR_TAB) {
+        ctx.inject(['sidebarRightTabs', 'sidebarRight'], (sidebarCtx) => {
+          sidebarCtx.effect(
+            () =>
+              sidebarCtx.sidebarRightTabs.register({
+                id: TAB_ID,
+                kind: TAB_KIND,
+                priority: 'extension',
+                title: () => t('title'),
+                guide: [
+                  {
+                    id: 'hands',
+                    order: 30,
+                    title: () => t('title'),
+                    description: () => t('guide'),
+                    icon: HandsIcon,
+                  },
+                ],
+              }),
+            'dsh-hands: right sidebar tab',
+          );
 
-        sidebarCtx.effect(
-          () =>
-            sidebarCtx.slots.inject('sidebar.right.pane.tab', () =>
-              sidebarCtx.slots.register(
-                {
-                  name: 'sidebar.right.pane.tab',
-                  key: TAB_ID,
-                  locale: NS,
-                  // 灰度开关的唯一分叉点：true 挂 v2 三列 + store，false 完全走旧 feed/扁平列表。
-                  inject: () => (USE_V2 ? { store } : { feed }),
-                },
-                USE_V2 ? HandsPaneV2 : HandsSidebar,
+          sidebarCtx.effect(
+            () =>
+              sidebarCtx.slots.inject('sidebar.right.pane.tab', () =>
+                sidebarCtx.slots.register(
+                  {
+                    name: 'sidebar.right.pane.tab',
+                    key: TAB_ID,
+                    locale: NS,
+                    // 灰度开关的唯一分叉点：true 挂 v2 三列 + store，false 完全走旧 feed/扁平列表。
+                    inject: () => (USE_V2 ? { store } : { feed }),
+                  },
+                  USE_V2 ? HandsPaneV2 : HandsSidebar,
+                ),
               ),
-            ),
-          'dsh-hands: right sidebar body',
-        );
+            'dsh-hands: right sidebar body',
+          );
 
-        // 一有新派发就把右侧栏掀开并切到本面板，别让输出藏起来。
-        // 面板已经开着时 openTab 只会聚焦，不会重置布局。
-        // 按会话记「已经替哪票活开过」，切会话后也能把正在跑的活接上。
-        sidebarCtx.effect(() => {
-          const opened = new Map();
-          let lastTry = 0;
-          const check = () => {
-            const sessionId = sidebarCtx.sidebarRight.mounted?.getSnapshot?.();
-            if (!sessionId) return;
-            const running = feed.getSnapshot().running || [];
-            const seen = opened.get(sessionId);
-            const pending = running.find((job) => job?.id && !seen?.has(job.id));
-            if (!pending) return;
-            const now = Date.now();
-            if (now - lastTry < 1500) return;
-            lastTry = now;
-            try {
-              sidebarCtx.sidebarRight.openTab(TAB_KIND);
-              const next = seen || new Set();
-              next.add(pending.id);
-              opened.set(sessionId, next);
-            } catch {
-              // 还没打开会话（或会话的 store 还没挂上）：下一轮再试。
-            }
-            if (opened.size > 50) {
-              const keep = new Set(running.map((job) => job.id));
-              for (const [id, jobs] of opened) {
-                for (const jobId of [...jobs]) if (!keep.has(jobId)) jobs.delete(jobId);
-                if (!jobs.size) opened.delete(id);
+          // 一有新派发就把右侧栏掀开并切到本面板，别让输出藏起来。
+          // 面板已经开着时 openTab 只会聚焦，不会重置布局。
+          // 按会话记「已经替哪票活开过」，切会话后也能把正在跑的活接上。
+          sidebarCtx.effect(() => {
+            const opened = new Map();
+            let lastTry = 0;
+            const check = () => {
+              const sessionId = sidebarCtx.sidebarRight.mounted?.getSnapshot?.();
+              if (!sessionId) return;
+              const running = feed.getSnapshot().running || [];
+              const seen = opened.get(sessionId);
+              const pending = running.find((job) => job?.id && !seen?.has(job.id));
+              if (!pending) return;
+              const now = Date.now();
+              if (now - lastTry < 1500) return;
+              lastTry = now;
+              try {
+                sidebarCtx.sidebarRight.openTab(TAB_KIND);
+                const next = seen || new Set();
+                next.add(pending.id);
+                opened.set(sessionId, next);
+              } catch {
+                // 还没打开会话（或会话的 store 还没挂上）：下一轮再试。
               }
-            }
-          };
-          const unsubscribe = feed.subscribe(check);
-          const timer = setInterval(check, 2000);
-          check();
-          return () => {
-            clearInterval(timer);
-            unsubscribe();
-          };
-        }, 'dsh-hands: auto open live panel');
-      });
+              if (opened.size > 50) {
+                const keep = new Set(running.map((job) => job.id));
+                for (const [id, jobs] of opened) {
+                  for (const jobId of [...jobs]) if (!keep.has(jobId)) jobs.delete(jobId);
+                  if (!jobs.size) opened.delete(id);
+                }
+              }
+            };
+            const unsubscribe = feed.subscribe(check);
+            const timer = setInterval(check, 2000);
+            check();
+            return () => {
+              clearInterval(timer);
+              unsubscribe();
+            };
+          }, 'dsh-hands: auto open live panel');
+        });
+      }
     }
 
     // createHandsStore 一并导出：acp/test-store.mjs 在 node 里直接实例化数据层，

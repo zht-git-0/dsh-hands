@@ -126,7 +126,9 @@ hands_run(to="opencode", prompt="…", cwd="…", session="aigame", write=true)
 ```
 
 - 开关：`client.js` 顶部 `const USE_V2 = true`；关掉就退回旧扁平列表（一行没删）。
-- 两处入口共用一个 store：**顶层面板**（`layout` 的 `main` 槽 + `sidebar.panellist` 导航行，和「插件」「自动化任务」「IM机器人」同级）和**会话右侧栏 tab**。store 内部是引用计数，先卸载的一方不会把另一方的 SSE 掐掉。
+- 入口：**只留顶层面板**（`layout` 的 `main` 槽 + `sidebar.panellist` 导航行，和「插件」「自动化任务」「IM机器人」同级）。
+  会话右侧栏那个窄版 tab 由 `const SHOW_SIDEBAR_TAB = false` 关着，代码一行没删，改回 `true` 就整套回来（tab + 窄版 + 派活自动掀开）。
+  两处入口共用一个 store（内部引用计数），谁先卸载都不会把另一方的 SSE 掐掉。
 - 数据层：`createHandsStore()`（SSE v2 + 轮询回退 + 选中持久化 `localStorage['dsh.hands.sel']` + 正文增量）。
 - 宽度自适应：`>=560` 三列；`420–560` 两列收窄；`<420` 钻取（agents → sessions → thread）。
 - 正文回落：`liveByTurn` → `/turn?id=&from=` 增量 → `excerpt`；增量由服务端算 `next`，前端只拼。
