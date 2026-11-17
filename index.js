@@ -174,6 +174,34 @@ function sessionKeyOf(hand, session, startedMs = Date.now()) {
   return `${hand}/${name || `临时-${localDateKey(startedMs)}`}`
 }
 
+// 一条记录属于哪个会话 key。算法和 listSessions 保持一致：
+// 有名会话走 hand/sid:<conversationId>，没 conversationId 的才退回 sessionKey。
+export function turnKeyOf(entry) {
+  const hand = String(entry?.hand || '')
+  const startedMs = Date.parse(entry?.startedAt || entry?.at) || 0
+  const sessionKey = String(entry?.sessionKey || sessionKeyOf(hand, entry?.session, startedMs))
+  const conversationId = String(entry?.conversationId || '')
+  return conversationId ? `${hand}/sid:${conversationId}` : sessionKey
+}
+
+// 查询 key 能命中一条记录的所有写法：正规 key、sessionKey、sid 后缀。
+// 抽成纯函数给 /turns 和 /stream?key= 的 live 分支共用，避免两套 key 逻辑漂移。
+export function turnMatches(entry, key) {
+  const wanted = String(key || '')
+  if (!wanted) return false
+  // key 的第一段就是 hand；不同 hand 永远不互相命中（否则 sid:xxx 后缀会串味）
+  const cut = wanted.indexOf('/')
+  const wantedHand = cut > 0 ? wanted.slice(0, cut) : ''
+  if (wantedHand && String(entry?.hand || '') !== wantedHand) return false
+  const sessionKey = String(entry?.sessionKey || '')
+  const conversationId = String(entry?.conversationId || '')
+  return (
+    turnKeyOf(entry) === wanted ||
+    (sessionKey && sessionKey === wanted) ||
+    (conversationId && wanted.endsWith(`sid:${conversationId}`))
+  )
+}
+
 // 一轮 = 一次派发。把历史 job（mergedJobs 的产物）和在跑的 RUNNING entry
 // 摊平成面板要的头字段；纯函数、不碰闭包，acp/test-turns.mjs 直接 import。
 // 注意：只挑字段，output / jobFile 一律不往外带（太占带宽）。
@@ -183,23 +211,7 @@ export function turnsFor(jobs, running, key, opts = {}) {
   const before = opts.before ? String(opts.before) : ''
   const limit = Math.min(Math.max(1, Number(opts.limit) || 50), 500)
 
-  // key 的算法和 listSessions 保持一致：有名会话走 hand/sid:<conversationId>。
-  const keyOf = (entry) => {
-    const hand = String(entry?.hand || '')
-    const startedMs = Date.parse(entry?.startedAt || entry?.at) || 0
-    const sessionKey = String(entry?.sessionKey || sessionKeyOf(hand, entry?.session, startedMs))
-    const conversationId = String(entry?.conversationId || '')
-    return conversationId ? `${hand}/sid:${conversationId}` : sessionKey
-  }
-  const matches = (entry) => {
-    const sessionKey = String(entry?.sessionKey || '')
-    const conversationId = String(entry?.conversationId || '')
-    return (
-      keyOf(entry) === wanted ||
-      (sessionKey && sessionKey === wanted) ||
-      (conversationId && wanted.endsWith(`sid:${conversationId}`))
-    )
-  }
+  const matches = (entry) => turnMatches(entry, wanted)
 
   const now = Date.now()
   const seen = new Set()
@@ -235,6 +247,58 @@ export function turnsFor(jobs, running, key, opts = {}) {
   }
   rows.sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))
   return rows.slice(0, limit)
+}
+
+// live 增量记账：只发 text 从 sentLength 起新增的那一段。
+// sentLength 可能来自上一帧的 next，理论上不会越界，但磁盘上的全文会变（截尾 / 重写），
+// 越界时夹到 [0, text.length]，保证 next 永远不往回退。
+// 纯函数，acp/test-live-delta.mjs 直接 import。
+export function computeLiveDelta(text, sentLength) {
+  const full = String(text ?? '')
+  let sent = Number(sentLength)
+  if (Number.isNaN(sent)) sent = 0
+  // ±Infinity 也算越界：正的夹到末尾，负的夹到开头
+  if (!Number.isFinite(sent)) sent = sent > 0 ? full.length : 0
+  sent = Math.trunc(sent)
+  if (sent < 0) sent = 0
+  if (sent > full.length) sent = full.length
+  const delta = full.slice(sent)
+  return { delta, next: sent + delta.length, changed: delta.length > 0 }
+}
+
+// /health 的 30s 缓存 + in-flight 合并：并发请求共享同一次探测，别同时起四份。
+// now 可注入，acp/test-health.mjs 不需要真等 30 秒。探测抛错时不缓存，下次重试。
+export function withHealthCache(fn, { ttlMs = 30000, now = Date.now } = {}) {
+  let at = 0
+  let value
+  let inflight = null
+
+  const cached = async () => {
+    if (at && now() - at < ttlMs) return value
+    if (inflight) return inflight
+    const job = (async () => {
+      try {
+        const fresh = await fn()
+        value = fresh
+        at = now()
+        return fresh
+      } finally {
+        // 不管成没成都要把闸放开，否则一次失败会永久卡住后续请求
+        if (inflight === job) inflight = null
+      }
+    })()
+    inflight = job
+    return job
+  }
+
+  // 只读缓存，不触发探测；调试和测试用
+  cached.peek = () => (at ? { at, value } : null)
+  cached.reset = () => {
+    at = 0
+    value = undefined
+    inflight = null
+  }
+  return cached
 }
 
 // 只保留 UTF-8 文本的最后 maxBytes 字节，别把多字节字符切成两半。
@@ -299,6 +363,101 @@ export function killProcessTree(pid) {
   } catch {
     return Promise.resolve(false)
   }
+}
+
+// ── /health 探测 ──────────────────────────────────────────────────────────
+// 每家只看两件事：bin 在不在、能不能跑起来（--version，失败再退 --help）。
+// 单次 spawn 5 秒超时，整家 20 秒封顶；任何失败都折算成字段，不抛给 HTTP。
+const HEALTH_TTL_MS = 30000
+const HEALTH_PROBE_TIMEOUT_SEC = 5
+const HEALTH_AGENT_TIMEOUT_MS = 20000
+
+function firstLine(value, max = 80) {
+  const line = String(value || '')
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .find(Boolean)
+  return line ? line.slice(0, max) : ''
+}
+
+function withTimeout(promise, ms, fallback) {
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(value)
+    }
+    const timer = setTimeout(() => finish(fallback), ms)
+    Promise.resolve(promise).then(finish, () => finish(fallback))
+  })
+}
+
+async function probeAgent(exe) {
+  const binPath = String(exe || '')
+  const exists = !!binPath && fs.existsSync(binPath)
+  // 绝对路径 / 带目录的写法找不到就是找不到，不用再去起进程
+  if (!exists && (path.isAbsolute(binPath) || binPath.includes(path.sep))) {
+    return clean({ bin: binPath, exists: false, runnable: false, version: '', error: 'not found' })
+  }
+
+  let firstError = ''
+  let version = ''
+  for (const args of [['--version'], ['--help']]) {
+    const result = await runProcess(binPath, args, { timeoutSec: HEALTH_PROBE_TIMEOUT_SEC })
+    const line = firstLine(result.stdout) || firstLine(result.stderr)
+    if (!version) version = line
+    if (result.code === 0) {
+      return clean({ bin: binPath, exists, runnable: true, version: line || version, exitCode: 0 })
+    }
+    if (!firstError) {
+      firstError = result.timedOut
+        ? 'timeout'
+        : firstLine(result.stderr) || line || `exit ${result.code}`
+    }
+  }
+  return clean({ bin: binPath, exists, runnable: false, version, error: firstError || 'not runnable' })
+}
+
+async function healthPayload(bins) {
+  const entries = Object.entries(bins)
+  const settled = await Promise.allSettled(
+    entries.map(([, exe]) =>
+      withTimeout(
+        probeAgent(exe).catch((error) => ({
+          bin: String(exe || ''),
+          exists: false,
+          runnable: false,
+          version: '',
+          error: String(error?.message ?? error),
+        })),
+        HEALTH_AGENT_TIMEOUT_MS,
+        {
+          bin: String(exe || ''),
+          exists: !!exe && fs.existsSync(String(exe)),
+          runnable: false,
+          version: '',
+          error: 'timeout',
+        },
+      ),
+    ),
+  )
+  const agents = {}
+  settled.forEach((result, index) => {
+    const [hand, exe] = entries[index]
+    agents[hand] =
+      result.status === 'fulfilled'
+        ? result.value
+        : clean({
+            bin: String(exe || ''),
+            exists: false,
+            runnable: false,
+            version: '',
+            error: String(result.reason?.message ?? result.reason),
+          })
+  })
+  return { checkedAt: new Date().toISOString(), agents }
 }
 
 // 跑一次 agy。不经过 shell，参数数组直接交给 spawn，中文和空格都不会被拆坏。
@@ -429,6 +588,11 @@ export function apply(ctx, config = {}) {
   const opencodeBin = config.opencodeBin || DEFAULT_OPENCODE_BIN
   const defaultTimeout = Number(config.timeoutSec) || 900
   const skipPermissions = config.skipPermissions !== false
+  // /health 的四家探测：30s 缓存 + in-flight 合并，别让并发请求同时起四份进程。
+  const healthCache = withHealthCache(
+    () => healthPayload({ agy: bin, codex: codexBin, claude: claudeBin, opencode: opencodeBin }),
+    { ttlMs: HEALTH_TTL_MS },
+  )
 
   // ── 设置页用的 HTTP 接口 ────────────────────────────────────────────────
   function readBody(req) {
@@ -537,6 +701,12 @@ export function apply(ctx, config = {}) {
   const NL = String.fromCharCode(10)
   let runningRevision = 0
   let historyRevision = 0
+  // v2 /stream?key= 的三份 revision：agents 维度、每个 hand 的 sessions、每个 key 的 turns。
+  // 旧的 runningRevision / historyRevision 原样留给无 key 分支，两边互不干扰。
+  let agentsRevision = 0
+  let revisionSeq = 0
+  const handRevisions = new Map()
+  const keyRevisions = new Map()
   let today = { date: localDateKey(), byHand: Object.create(null), byKey: Object.create(null) }
 
   function touchRunning() {
@@ -546,6 +716,26 @@ export function apply(ctx, config = {}) {
   function touchHistory() {
     historyRevision += 1
     runningRevision += 1
+  }
+
+  function nextRevision() {
+    revisionSeq += 1
+    return revisionSeq
+  }
+
+  // 一条记录同时属于 sessionKey 和 hand/sid:<conversationId> 两个 key（有 conversationId 时）。
+  // 两个都 bump，前端拿哪种写法查都能收到更新。
+  function touchAgentDimensions(entry) {
+    if (!entry) return
+    agentsRevision = nextRevision()
+    const hand = String(entry.hand || '')
+    if (hand) handRevisions.set(hand, nextRevision())
+    const keys = new Set()
+    const sessionKey = String(entry.sessionKey || '')
+    if (sessionKey) keys.add(sessionKey)
+    const conversationId = String(entry.conversationId || '')
+    if (conversationId) keys.add(`${hand}/sid:${conversationId}`)
+    for (const key of keys) keyRevisions.set(key, nextRevision())
   }
 
   function readRecords() {
@@ -870,6 +1060,7 @@ export function apply(ctx, config = {}) {
     const live = createLiveView(entry.hand)
     RUNNING.set(id, entry)
     touchRunning()
+    touchAgentDimensions(entry)
     return {
       id,
       startedMs,
@@ -932,6 +1123,7 @@ export function apply(ctx, config = {}) {
       }),
     )
     touchHistory()
+    touchAgentDimensions({ ...run.entry, sessionKey, conversationId: fields.conversationId || run.entry.conversationId || '' })
     return true
   }
 
@@ -980,6 +1172,51 @@ export function apply(ctx, config = {}) {
     }
     const entry = readJobs().find((job) => job.id === id)
     return entry ? clean({ ...entry, output: readJobText(entry) }) : null
+  }
+
+  // ── v2 面板的组装函数（不碰 req/res，/agents、/sessions、/stream 共用）────────
+  function agentsPayload() {
+    const checkedAt = new Date().toISOString()
+    const runningByHand = Object.create(null)
+    for (const entry of RUNNING.values()) {
+      const hand = String(entry.hand || '')
+      runningByHand[hand] = (runningByHand[hand] || 0) + 1
+    }
+    const lastAtByHand = Object.create(null)
+    for (const job of mergedJobs()) {
+      const hand = String(job.hand || '')
+      const at = String(job.at || job.startedAt || '')
+      if (at && (!lastAtByHand[hand] || at > lastAtByHand[hand])) lastAtByHand[hand] = at
+    }
+    const agents = Object.entries(HANDS).map(([hand, handDef]) =>
+      clean({
+        hand,
+        label: handDef.label,
+        running: runningByHand[hand] || 0,
+        today: todayCount(hand),
+        sessions: listSessions(hand).length,
+        lastAt: lastAtByHand[hand] || '',
+        // ok / version 走 /health；这里保持旧 /agents 的字段形态，前端不用判空
+        ok: false,
+        bin: handDef.bin(),
+        version: '',
+      }),
+    )
+    return { checkedAt, revision: agentsRevision, agents }
+  }
+
+  function sessionsForHand(hand) {
+    const wanted = String(hand || '')
+    // 原样包一层 listSessions()，不动它已有的字段
+    return { hand: wanted, sessions: listSessions(wanted) }
+  }
+
+  function sessionsRevisionOf(hand) {
+    return handRevisions.get(String(hand || '')) || 0
+  }
+
+  function turnsRevisionOf(key) {
+    return keyRevisions.get(String(key || '')) || 0
   }
 
   // 各家 exit code / 自报状态不一致，统一折算成「成没成」。
@@ -1031,43 +1268,28 @@ export function apply(ctx, config = {}) {
               })
               res.write('retry: 1000' + NL + NL)
               let closed = false
-              let lastRunning = -1
-              let lastHistory = -1
-              const writeEvent = (name, data) => {
+              const timers = []
+              const cleanup = () => {
+                closed = true
+                for (const timer of timers) clearInterval(timer)
+                try {
+                  res.end()
+                } catch {
+                  /* 已经断了 */
+                }
+              }
+              req.on('close', cleanup)
+              res.on('close', cleanup)
+
+              const writeRaw = (chunk) => {
                 if (closed || res.destroyed || res.writableEnded) return
                 try {
-                  res.write(
-                    `id: ${data.revision ?? 0}-${data.historyRevision ?? 0}${NL}` +
-                      `event: ${name}${NL}` +
-                      `data: ${JSON.stringify(data)}${NL}${NL}`,
-                  )
+                  res.write(chunk)
                 } catch {
                   closed = true
                 }
               }
-              const initial = snapshot(80)
-              lastRunning = initial.revision
-              lastHistory = initial.historyRevision
-              writeEvent('snapshot', initial)
-              const timer = setInterval(() => {
-                if (closed || res.destroyed || res.writableEnded) return
-                // 历史只在真的新增/收尾时重发；输出更新只发正在跑的那几条。
-                if (historyRevision !== lastHistory) {
-                  const data = snapshot(80)
-                  lastRunning = data.revision
-                  lastHistory = data.historyRevision
-                  writeEvent('snapshot', data)
-                  return
-                }
-                if (runningRevision !== lastRunning) {
-                  lastRunning = runningRevision
-                  writeEvent('running', {
-                    checkedAt: new Date().toISOString(),
-                    revision: runningRevision,
-                    running: runningList(),
-                  })
-                }
-              }, 250)
+
               const ping = setInterval(() => {
                 if (!closed && !res.destroyed && !res.writableEnded) {
                   try {
@@ -1077,18 +1299,176 @@ export function apply(ctx, config = {}) {
                   }
                 }
               }, 15000)
-              const cleanup = () => {
-                closed = true
-                clearInterval(timer)
-                clearInterval(ping)
-                try {
-                  res.end()
-                } catch {
-                  /* 已经断了 */
+              timers.push(ping)
+
+              // ── 旧版：没带 key 时事件名、id 格式、250ms/15s 节拍一律照旧 ──
+              if (!u.searchParams.has('key')) {
+                let lastRunning = -1
+                let lastHistory = -1
+                const writeEvent = (name, data) => {
+                  writeRaw(
+                    `id: ${data.revision ?? 0}-${data.historyRevision ?? 0}${NL}` +
+                      `event: ${name}${NL}` +
+                      `data: ${JSON.stringify(data)}${NL}${NL}`,
+                  )
                 }
+                const initial = snapshot(80)
+                lastRunning = initial.revision
+                lastHistory = initial.historyRevision
+                writeEvent('snapshot', initial)
+                const timer = setInterval(() => {
+                  if (closed || res.destroyed || res.writableEnded) return
+                  // 历史只在真的新增/收尾时重发；输出更新只发正在跑的那几条。
+                  if (historyRevision !== lastHistory) {
+                    const data = snapshot(80)
+                    lastRunning = data.revision
+                    lastHistory = data.historyRevision
+                    writeEvent('snapshot', data)
+                    return
+                  }
+                  if (runningRevision !== lastRunning) {
+                    lastRunning = runningRevision
+                    writeEvent('running', {
+                      checkedAt: new Date().toISOString(),
+                      revision: runningRevision,
+                      running: runningList(),
+                    })
+                  }
+                }, 250)
+                timers.push(timer)
+                return
               }
-              req.on('close', cleanup)
-              res.on('close', cleanup)
+
+              // ── v2：带 key 时只订阅这一条会话，事件拆成 agents / sessions / turns / live ──
+              const key = String(u.searchParams.get('key') || '')
+              const hand = key.includes('/') ? key.slice(0, key.indexOf('/')) : ''
+              // key 不认识也照常建连：先发一帧 agents，之后只跟 agents 的变化。
+              const known =
+                !!key &&
+                !!hand &&
+                sessionsForHand(hand).sessions.some((row) => row.key === key || row.sessionKey === key)
+
+              // id: 只在有 revision 的事件上写；live 没有 revision，沿用上一个 id。
+              const writeV2 = (event, data, revision) => {
+                const idLine = Number.isFinite(revision) ? `id: ${revision}${NL}` : ''
+                writeRaw(idLine + `event: ${event}${NL}` + `data: ${JSON.stringify(data)}${NL}${NL}`)
+              }
+
+              let lastAgentsRev = -1
+              let lastSessionsRev = -1
+              let lastTurnsRev = -1
+              let agentsFingerprint = ''
+              let sessionsFingerprint = ''
+              let turnsFingerprint = ''
+              const sentLengths = new Map()
+              const settled = new Set()
+              let historyTargetId = ''
+
+              const sendAgents = (force = false) => {
+                const revision = agentsRevision
+                lastAgentsRev = revision
+                const payload = agentsPayload()
+                const fingerprint = JSON.stringify(payload.agents)
+                if (!force && fingerprint === agentsFingerprint) return
+                agentsFingerprint = fingerprint
+                writeV2('agents', { revision, agents: payload.agents }, revision)
+              }
+
+              const sendSessions = (force = false) => {
+                if (!known) return
+                const revision = sessionsRevisionOf(hand)
+                lastSessionsRev = revision
+                const payload = sessionsForHand(hand)
+                const fingerprint = JSON.stringify(payload.sessions)
+                if (!force && fingerprint === sessionsFingerprint) return
+                sessionsFingerprint = fingerprint
+                writeV2('sessions', { revision, hand, sessions: payload.sessions }, revision)
+              }
+
+              const sendTurns = (force = false) => {
+                if (!known) return
+                const revision = turnsRevisionOf(key)
+                lastTurnsRev = revision
+                const turns = turnsFor(mergedJobs(), [...RUNNING.values()], key, { limit: 50 })
+                const fingerprint = JSON.stringify(turns)
+                if (!force && fingerprint === turnsFingerprint) return
+                turnsFingerprint = fingerprint
+                // 有新轮次/收尾了，live 要重新挑一次目标
+                historyTargetId = ''
+                writeV2('turns', { revision, key, turns }, revision)
+              }
+
+              // live 只跟这一条 key：在跑的那一轮优先，没有就最近一轮。
+              // 历史轮读一次全文发完就 settle，别每 250ms 重复读盘。
+              const liveTarget = () => {
+                let best = null
+                for (const entry of RUNNING.values()) {
+                  if (!turnMatches(entry, key)) continue
+                  if (!best || String(entry.startedAt || '') > String(best.startedAt || '')) best = entry
+                }
+                if (best) {
+                  historyTargetId = ''
+                  return { id: String(best.id || ''), running: true, entry: best }
+                }
+                const job = readJobs().find((item) => turnMatches(item, key))
+                if (!job) return null
+                historyTargetId = String(job.id || '')
+                return { id: historyTargetId, running: false, entry: job }
+              }
+
+              const sendLive = () => {
+                // 已经发完的历史轮不用再读盘；除非又有新的一轮在跑
+                if (historyTargetId && settled.has(historyTargetId)) {
+                  let anyRunning = false
+                  for (const entry of RUNNING.values()) {
+                    if (turnMatches(entry, key)) {
+                      anyRunning = true
+                      break
+                    }
+                  }
+                  if (!anyRunning) return
+                }
+                const target = liveTarget()
+                if (!target || !target.id) return
+                const id = target.id
+                if (!target.running && settled.has(id)) return
+                const text = target.running ? String(target.entry.output || '') : readJobText(target.entry)
+                const delta = computeLiveDelta(text, sentLengths.get(id) || 0)
+                if (!delta.changed) {
+                  if (!target.running) settled.add(id)
+                  return
+                }
+                sentLengths.set(id, delta.next)
+                const outputAt = target.running
+                  ? Number(target.entry.outputAt) || Date.now()
+                  : Date.parse(target.entry.at || target.entry.startedAt) || Date.now()
+                writeV2('live', {
+                  key,
+                  id,
+                  delta: delta.delta,
+                  next: delta.next,
+                  outputAt,
+                  idleMs: Math.max(0, Date.now() - outputAt),
+                })
+                if (!target.running && delta.next >= text.length) settled.add(id)
+              }
+
+              sendAgents(true)
+              if (known) {
+                sendSessions(true)
+                sendTurns(true)
+                sendLive()
+              }
+
+              const timer = setInterval(() => {
+                if (closed || res.destroyed || res.writableEnded) return
+                if (agentsRevision !== lastAgentsRev) sendAgents()
+                if (!known) return
+                if (sessionsRevisionOf(hand) !== lastSessionsRev) sendSessions()
+                if (turnsRevisionOf(key) !== lastTurnsRev) sendTurns()
+                sendLive()
+              }, 250)
+              timers.push(timer)
               return
             }
             if (u.pathname === '/dsh-hands/ping') {
@@ -1102,43 +1482,29 @@ export function apply(ctx, config = {}) {
 
             if (u.pathname === '/dsh-hands/agents') {
               try {
-                const checkedAt = new Date().toISOString()
-                const runningByHand = Object.create(null)
-                for (const entry of RUNNING.values()) {
-                  const h = String(entry.hand || '')
-                  runningByHand[h] = (runningByHand[h] || 0) + 1
-                }
-                const lastAtByHand = Object.create(null)
-                for (const job of mergedJobs()) {
-                  const h = String(job.hand || '')
-                  const at = String(job.at || job.startedAt || '')
-                  if (at && (!lastAtByHand[h] || at > lastAtByHand[h])) lastAtByHand[h] = at
-                }
-                const agents = Object.entries(HANDS).map(([hand, handDef]) =>
-                  clean({
-                    hand,
-                    label: handDef.label,
-                    running: runningByHand[hand] || 0,
-                    today: todayCount(hand),
-                    sessions: listSessions(hand).length,
-                    lastAt: lastAtByHand[hand] || '',
-                    // ok / version 第 3 步 health 再接；字段先留着，前端不用判空
-                    ok: false,
-                    bin: handDef.bin(),
-                    version: '',
-                  }),
-                )
+                const { checkedAt, agents } = agentsPayload()
                 return send(200, { checkedAt, agents })
               } catch (e) {
                 return fail(500, e)
               }
             }
 
+            // /health：四家并行探，30s 缓存，并发共享同一次探测；失败也回 200。
+            if (u.pathname === '/dsh-hands/health') {
+              try {
+                return send(200, await healthCache())
+              } catch (e) {
+                return send(200, {
+                  checkedAt: new Date().toISOString(),
+                  agents: {},
+                  error: String(e?.message ?? e),
+                })
+              }
+            }
+
             if (u.pathname === '/dsh-hands/sessions') {
               try {
-                const hand = String(u.searchParams.get('hand') || '')
-                // 原样包一层 listSessions()，不动它已有的字段
-                return send(200, { hand, sessions: listSessions(hand) })
+                return send(200, sessionsForHand(String(u.searchParams.get('hand') || '')))
               } catch (e) {
                 return fail(500, e)
               }
