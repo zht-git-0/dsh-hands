@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Hands",
-    "description": "Four CLI agents (agy, codex, claude, opencode) as DSH tools, plus a Hands dispatch panel in Settings."
+    "description": "Four CLI agents (agy, codex, claude, opencode) as DSH tools, with a live Hands task panel in the conversation's right sidebar."
   }
 }

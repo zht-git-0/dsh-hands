@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "手下",
-    "description": "把 agy、codex、claude、opencode 四个命令行智能体接成 DSH 工具，并在设置里提供「手下调度」面板。"
+    "description": "把 agy、codex、claude、opencode 四个命令行智能体接成 DSH 工具，并在对话右侧边栏提供「手下任务」实时流式看板。"
   }
 }

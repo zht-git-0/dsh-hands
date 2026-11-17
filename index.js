@@ -2,6 +2,14 @@ import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
+import {
+  collectAgy,
+  collectClaude,
+  collectCodex,
+  collectOpencode,
+  createLiveView,
+} from './stream.js'
 
 export const name = 'hands'
 export const inject = ['tools', 'webServer']
@@ -155,7 +163,7 @@ function clean(value) {
 }
 
 // 跑一次 agy。不经过 shell，参数数组直接交给 spawn，中文和空格都不会被拆坏。
-function runProcess(bin, args, { cwd, timeoutSec = 900, input } = {}) {
+function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk } = {}) {
   return new Promise((resolve) => {
     const started = Date.now()
     let child
@@ -184,6 +192,32 @@ function runProcess(bin, args, { cwd, timeoutSec = 900, input } = {}) {
     let stdout = ''
     let stderr = ''
     let timedOut = false
+    // 子进程的 chunk 可能从多字节字符中间切开；直接 toString('utf8') 会把中文变成 �??
+    const outDecoder = new StringDecoder('utf8')
+    const errDecoder = new StringDecoder('utf8')
+    let decodersFlushed = false
+    const flushDecoders = () => {
+      if (decodersFlushed) return
+      decodersFlushed = true
+      const outTail = outDecoder.end()
+      const errTail = errDecoder.end()
+      if (outTail) {
+        stdout += outTail
+        try {
+          onChunk?.(outTail, 'stdout')
+        } catch {
+          /* 实时视图失败不能影响手下干活 */
+        }
+      }
+      if (errTail) {
+        stderr += errTail
+        try {
+          onChunk?.(errTail, 'stderr')
+        } catch {
+          /* 同上 */
+        }
+      }
+    }
     const timer = setTimeout(() => {
       timedOut = true
       try {
@@ -198,44 +232,39 @@ function runProcess(bin, args, { cwd, timeoutSec = 900, input } = {}) {
     }, Math.max(5, timeoutSec) * 1000)
 
     child.stdout?.on('data', (chunk) => {
-      stdout += chunk.toString('utf8')
+      const text = outDecoder.write(chunk)
+      stdout += text
+      try {
+        onChunk?.(text, 'stdout')
+      } catch {
+        /* 实时视图失败不能影响手下干活 */
+      }
     })
     child.stderr?.on('data', (chunk) => {
-      stderr += chunk.toString('utf8')
+      const text = errDecoder.write(chunk)
+      stderr += text
+      try {
+        onChunk?.(text, 'stderr')
+      } catch {
+        /* 同上 */
+      }
     })
     child.on('error', (error) => {
       clearTimeout(timer)
+      flushDecoders()
       resolve({ code: -1, stdout, stderr: `${stderr}${error?.message ?? error}`, ms: Date.now() - started, timedOut })
     })
     child.on('close', (code) => {
       clearTimeout(timer)
+      flushDecoders()
       resolve({ code, stdout, stderr, ms: Date.now() - started, timedOut })
     })
   })
 }
 
-function parseJsonOutput(stdout) {
-  const text = String(stdout ?? '').trim()
-  if (!text) return null
-  try {
-    return JSON.parse(text)
-  } catch {
-    // agy 有时会在前面打日志行，从最后一个 '{' 起再试一次
-    const at = text.lastIndexOf('{')
-    if (at >= 0) {
-      try {
-        return JSON.parse(text.slice(at))
-      } catch {
-        return null
-      }
-    }
-    return null
-  }
-}
-
 const DEFAULT_OPENCODE_BIN =
   process.platform === 'win32'
-    ? path.join(process.env.ProgramFiles || 'C:\Program Files', 'nodejs', 'opencode.cmd')
+    ? path.join(process.env.ProgramFiles || 'C:\\Program Files', 'nodejs', 'opencode.cmd')
     : 'opencode'
 
 const DEFAULT_CLAUDE_BIN =
@@ -350,12 +379,24 @@ export function apply(ctx, config = {}) {
     return clean(report)
   }
 
-  // ── 调度日志：谁被派了什么活、跑了多久、成没成 ──────────────────────────
+  // ── 调度日志：谁被派了什么活、跑了多久、成没成、当场说了什么 ──────────────
   //
-  // 写成一个 JSONL，面板读它。只留最近 300 条，免得文件越长越大。
+  // 写成一个 JSONL，右侧栏读它。只留最近 300 条，免得文件越长越大。
+  // 正在跑的活只放内存，输出也只在内存里滚；跑完再把最终输出落盘。
   const LOG_FILE = path.join(os.homedir(), '.dsh', 'hands-log.jsonl')
   const LOG_KEEP = 300
   const NL = String.fromCharCode(10)
+  let runningRevision = 0
+  let historyRevision = 0
+
+  function touchRunning() {
+    runningRevision += 1
+  }
+
+  function touchHistory() {
+    historyRevision += 1
+    runningRevision += 1
+  }
 
   function logDispatch(entry) {
     try {
@@ -386,7 +427,14 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  // 正在跑的活只放内存：跑完才落盘，日志文件保持「一次派发一行」。
+  // 历史记录不把整段输出塞进每次快照：默认只带摘录，点开某一行时再单独取。
+  function stripOutput(entry) {
+    if (!entry || typeof entry !== 'object') return entry
+    const { output, ...rest } = entry
+    if (!rest.excerpt && output) rest.excerpt = String(output).slice(-600)
+    return rest
+  }
+
   const RUNNING = new Map()
   let runSeq = 0
 
@@ -398,19 +446,39 @@ export function apply(ctx, config = {}) {
       startedAt: new Date(startedMs).toISOString(),
       hand: String(fields.hand || ''),
       tool: String(fields.tool || ''),
-      prompt: String(fields.prompt || '').slice(0, 300),
+      prompt: String(fields.prompt || '').slice(0, 4000),
       write: !!fields.write,
       session: String(fields.session || ''),
       cwd: String(fields.cwd || ''),
       model: String(fields.model || ''),
+      output: '',
+      outputAt: startedMs,
     }
+    const live = createLiveView(entry.hand)
     RUNNING.set(id, entry)
-    return { id, startedMs, entry }
+    touchRunning()
+    return {
+      id,
+      startedMs,
+      entry,
+      push(chunk, source) {
+        live.feed(chunk, source)
+        entry.output = live.render()
+        entry.outputAt = Date.now()
+        touchRunning()
+      },
+      flush() {
+        live.flush()
+        entry.output = live.render()
+      },
+    }
   }
 
   // 把一次派发收尾：从运行中移除，再把结果追加进日志。
   function finishDispatch(run, fields = {}) {
     if (!run) return
+    run.flush?.()
+    const output = String(run.entry.output || '').slice(-20000)
     RUNNING.delete(run.id)
     const endMs = Date.now()
     const status = String(fields.status || (fields.ok ? 'OK' : 'ERROR')).toUpperCase()
@@ -430,10 +498,58 @@ export function apply(ctx, config = {}) {
         cwd: run.entry.cwd,
         model: run.entry.model,
         exitCode: fields.exitCode,
-        excerpt: String(fields.excerpt || '').slice(0, 600),
-        error: fields.error ? String(fields.error).slice(0, 600) : undefined,
+        excerpt: String(fields.excerpt || '').slice(0, 1200),
+        output,
+        error: fields.error ? String(fields.error).slice(0, 1200) : undefined,
       }),
     )
+    touchHistory()
+  }
+
+  function runningList() {
+    const now = Date.now()
+    return [...RUNNING.values()]
+      .map((entry) =>
+        clean({
+          ...entry,
+          status: 'RUNNING',
+          ok: false,
+          ms: Math.max(0, now - Date.parse(entry.startedAt)),
+          output: String(entry.output || '').slice(-20000),
+          outputAt: entry.outputAt,
+        }),
+      )
+      .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))
+  }
+
+  function historyList(limit = 80) {
+    const count = Math.max(1, Math.min(LOG_KEEP, Number(limit) || 80))
+    return readLog(count).map(stripOutput)
+  }
+
+  function snapshot(limit = 80) {
+    const now = Date.now()
+    return {
+      checkedAt: new Date(now).toISOString(),
+      revision: runningRevision,
+      historyRevision,
+      running: runningList(),
+      entries: historyList(limit),
+    }
+  }
+
+  function fullEntry(id) {
+    const live = RUNNING.get(id)
+    if (live) {
+      return clean({
+        ...live,
+        status: 'RUNNING',
+        ok: false,
+        ms: Math.max(0, Date.now() - Date.parse(live.startedAt)),
+        output: String(live.output || '').slice(-20000),
+      })
+    }
+    return readLog(LOG_KEEP).find((entry) => entry.id === id) ?? null
   }
 
   // 各家 exit code / 自报状态不一致，统一折算成「成没成」。
@@ -452,30 +568,90 @@ export function apply(ctx, config = {}) {
         path: '/dsh-hands',
         handler: async (req, res) => {
           const send = (status, body) => {
-            if (res.destroyed || res.writableEnded) return
+            if (res.destroyed || res.writableEnded || res.headersSent) return
             res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
             res.end(JSON.stringify(body))
           }
           try {
             const u = new URL(req.url, 'http://localhost')
             if (u.pathname === '/dsh-hands/log') {
-              const n = Number(u.searchParams.get('n') || '50')
-              const now = Date.now()
-              const running = [...RUNNING.values()]
-                .map((entry) =>
-                  clean({
-                    ...entry,
-                    status: 'RUNNING',
-                    ok: false,
-                    ms: Math.max(0, now - Date.parse(entry.startedAt)),
-                  }),
-                )
-                .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))
-              return send(200, {
-                checkedAt: new Date(now).toISOString(),
-                running,
-                entries: readLog(Math.max(1, Math.min(300, n))),
+              const n = Number(u.searchParams.get('n') || '80')
+              return send(200, snapshot(n))
+            }
+            if (u.pathname === '/dsh-hands/job') {
+              const id = String(u.searchParams.get('id') || '')
+              const entry = id ? fullEntry(id) : null
+              return send(entry ? 200 : 404, entry ? { entry } : { error: 'not found' })
+            }
+            if (u.pathname === '/dsh-hands/stream') {
+              if (res.destroyed || res.writableEnded) return
+              res.writeHead(200, {
+                'content-type': 'text/event-stream; charset=utf-8',
+                'cache-control': 'no-cache, no-transform',
+                connection: 'keep-alive',
+                'x-accel-buffering': 'no',
               })
+              res.write('retry: 1000' + NL + NL)
+              let closed = false
+              let lastRunning = -1
+              let lastHistory = -1
+              const writeEvent = (name, data) => {
+                if (closed || res.destroyed || res.writableEnded) return
+                try {
+                  res.write(
+                    `id: ${data.revision ?? 0}-${data.historyRevision ?? 0}${NL}` +
+                      `event: ${name}${NL}` +
+                      `data: ${JSON.stringify(data)}${NL}${NL}`,
+                  )
+                } catch {
+                  closed = true
+                }
+              }
+              const initial = snapshot(80)
+              lastRunning = initial.revision
+              lastHistory = initial.historyRevision
+              writeEvent('snapshot', initial)
+              const timer = setInterval(() => {
+                if (closed || res.destroyed || res.writableEnded) return
+                // 历史只在真的新增/收尾时重发；输出更新只发正在跑的那几条。
+                if (historyRevision !== lastHistory) {
+                  const data = snapshot(80)
+                  lastRunning = data.revision
+                  lastHistory = data.historyRevision
+                  writeEvent('snapshot', data)
+                  return
+                }
+                if (runningRevision !== lastRunning) {
+                  lastRunning = runningRevision
+                  writeEvent('running', {
+                    checkedAt: new Date().toISOString(),
+                    revision: runningRevision,
+                    running: runningList(),
+                  })
+                }
+              }, 250)
+              const ping = setInterval(() => {
+                if (!closed && !res.destroyed && !res.writableEnded) {
+                  try {
+                    res.write(': ping' + NL + NL)
+                  } catch {
+                    closed = true
+                  }
+                }
+              }, 15000)
+              const cleanup = () => {
+                closed = true
+                clearInterval(timer)
+                clearInterval(ping)
+                try {
+                  res.end()
+                } catch {
+                  /* 已经断了 */
+                }
+              }
+              req.on('close', cleanup)
+              res.on('close', cleanup)
+              return
             }
             if (u.pathname === '/dsh-hands/ping') {
               return send(200, { ok: true, plugin: 'dsh-hands' })
@@ -555,7 +731,7 @@ export function apply(ctx, config = {}) {
       const prompt = String(args?.prompt ?? '')
       if (!prompt.trim()) throw new Error('prompt is required')
 
-      const argv = ['-p', prompt, '--output-format', 'json']
+      const argv = ['-p', prompt, '--output-format', 'stream-json']
 
       // 三种定位会话的方式，优先级：conversationId > session 名字 > continueLast
       const index = loadIndex()
@@ -583,8 +759,8 @@ export function apply(ctx, config = {}) {
         cwd: args?.cwd || '',
         model: args?.model || '',
       })
-      const result = await runProcess(bin, argv, { cwd: args?.cwd, timeoutSec })
-      const parsed = parseJsonOutput(result.stdout)
+      const result = await runProcess(bin, argv, { cwd: args?.cwd, timeoutSec, onChunk: run.push })
+      const parsed = collectAgy(result.stdout)
       const verdict = outcome(result, parsed?.status ?? (result.code === 0 ? 'SUCCESS' : 'ERROR'))
       finishDispatch(run, {
         status: verdict.status,
@@ -921,17 +1097,17 @@ export function apply(ctx, config = {}) {
       const sandboxArg = `sandbox_mode="${sandbox}"`
       if (known) {
         // 续同一个会话：codex exec resume <id> <prompt>
-        argv = ['exec', 'resume', '--skip-git-repo-check', '-c', sandboxArg, known]
+        argv = ['exec', 'resume', '--json', '--skip-git-repo-check', '-c', sandboxArg, known]
         if (args?.model) argv.push('-m', String(args.model))
         argv.push(prompt)
         resumed = true
       } else if (args?.resumeLast) {
-        argv = ['exec', 'resume', '--skip-git-repo-check', '-c', sandboxArg, '--last']
+        argv = ['exec', 'resume', '--json', '--skip-git-repo-check', '-c', sandboxArg, '--last']
         if (args?.model) argv.push('-m', String(args.model))
         argv.push(prompt)
         resumed = true
       } else {
-        argv = ['exec', '--skip-git-repo-check', '-s', sandbox]
+        argv = ['exec', '--json', '--skip-git-repo-check', '-s', sandbox]
         if (args?.model) argv.push('-m', String(args.model))
         argv.push(prompt)
       }
@@ -948,46 +1124,46 @@ export function apply(ctx, config = {}) {
       const result = await runProcess(codexBin, argv, {
         cwd: workdir,
         timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
+        onChunk: run.push,
       })
       const raw = String(result.stdout ?? '')
       const err = String(result.stderr ?? '')
-      // codex 会把最终答复在末尾再打一遍，紧跟 "tokens used" 之后。
-      // 只取最后一块会把长答复截断（踩过：要 12 条清单只回来第 12 条），
-      // 所以从最后一个 "tokens used" 之后整段取，取不到再退回最后一块。
-      const cut = raw.lastIndexOf('tokens used')
-      let answer = ''
-      if (cut >= 0) {
-        answer = raw.slice(cut).replace(/tokens used\s*\n\s*[\d,]+/i, '').trim()
+      const collected = collectCodex(raw)
+      let answer = collected.answer
+      // 极端情况下它没按 --json 输出（例如启动失败），退回旧的纯文本抠法。
+      if (!collected.sawJson) {
+        const cut = raw.lastIndexOf('tokens used')
+        if (cut >= 0) answer = raw.slice(cut).replace(/tokens used\s*\n\s*[\d,]+/i, '').trim()
+        if (!answer) {
+          const blocks = raw.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
+          answer = blocks.length ? blocks[blocks.length - 1] : ''
+        }
       }
-      if (!answer) {
-        const blocks = raw.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
-        answer = blocks.length ? blocks[blocks.length - 1] : ''
-      }
-      const tokens = (raw.match(/tokens used\s*\n\s*([\d,]+)/i) || [])[1] || null
-      const sid = pickSessionId(raw) || pickSessionId(err) || (resumed ? known : null)
+      const tokens = collected.tokens
+      const sid = collected.sessionId || pickSessionId(raw) || pickSessionId(err) || (resumed ? known : null)
 
       if (name && sid) {
         index[name] = { id: sid, cwd: workdir, updated: new Date().toISOString() }
         saveCodexIndex(index)
       }
 
-      const verdict = outcome(result)
+      const verdict = outcome(result, collected.failed ? 'ERROR' : undefined)
       finishDispatch(run, {
         status: verdict.status,
         ok: verdict.ok,
         ms: result.ms,
         exitCode: result.code,
-        excerpt: answer || raw.slice(-600),
+        excerpt: answer || err.slice(-1200) || raw.slice(-1200),
         error: result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
       })
 
       return clean({
-        status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
-        response: answer || raw.slice(-4000) || err.slice(-2000),
+        status: result.timedOut ? 'TIMEOUT' : collected.failed || result.code !== 0 ? 'ERROR' : 'OK',
+        response: answer || err.slice(-4000) || raw.slice(-4000),
         sessionId: sid || '',
         resumed,
         exitCode: result.code,
-        tokens: tokens ? Number(String(tokens).replace(/,/g, '')) : null,
+        tokens: tokens ?? null,
         ms: result.ms,
       })
     },
@@ -1077,7 +1253,14 @@ export function apply(ctx, config = {}) {
       const name = args?.session ? String(args.session) : ''
       const known = name && index[name] ? index[name].id : null
 
-      const argv = ['-p', prompt, '--output-format', 'json']
+      const argv = [
+        '-p',
+        prompt,
+        '--output-format',
+        'stream-json',
+        '--verbose',
+        '--include-partial-messages',
+      ]
       if (args?.model) argv.push('--model', String(args.model))
       if (args?.permissionMode) argv.push('--permission-mode', String(args.permissionMode))
       if (known) argv.push('--resume', known)
@@ -1094,41 +1277,30 @@ export function apply(ctx, config = {}) {
       const result = await runProcess(claudeBin, argv, {
         cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
         timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
+        onChunk: run.push,
       })
 
       const raw = String(result.stdout ?? '')
       const err = String(result.stderr ?? '')
-      let parsed = null
-      try {
-        parsed = JSON.parse(raw.trim())
-      } catch {
-        // 有时前面会有杂行，取第一个 { 到最后一个 } 再试一次
-        const a = raw.indexOf('{')
-        const b = raw.lastIndexOf('}')
-        if (a >= 0 && b > a) {
-          try {
-            parsed = JSON.parse(raw.slice(a, b + 1))
-          } catch {}
-        }
-      }
+      const parsed = collectClaude(raw)
 
-      const sid = (parsed && parsed.session_id) || known || ''
+      const sid = parsed?.session_id || known || ''
       if (name && sid) {
         index[name] = { id: sid, cwd: args?.cwd || '', updated: new Date().toISOString() }
         writeJson(CLAUDE_INDEX, index)
       }
 
-      const usage = (parsed && parsed.usage) || {}
+      const usage = parsed?.usage || {}
       const answer = parsed
         ? String(parsed.result ?? '')
-        : raw.slice(-4000) || err.slice(-2000)
-      const verdict = outcome(result)
+        : err.slice(-4000) || raw.slice(-4000)
+      const verdict = outcome(result, parsed?.is_error ? 'ERROR' : undefined)
       finishDispatch(run, {
         status: verdict.status,
         ok: verdict.ok,
         ms: result.ms,
         exitCode: result.code,
-        excerpt: answer,
+        excerpt: answer || err.slice(-1200) || raw.slice(-1200),
         error: result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
       })
       return clean({
@@ -1136,7 +1308,7 @@ export function apply(ctx, config = {}) {
         response: answer,
         sessionId: sid,
         resumed: !!known,
-        cost: parsed ? parsed.total_cost_usd : null,
+        cost: parsed?.total_cost_usd ?? null,
         cacheRead: usage.cache_read_input_tokens ?? null,
         exitCode: result.code,
         ms: result.ms,
@@ -1218,38 +1390,21 @@ export function apply(ctx, config = {}) {
       const result = await runProcess(opencodeBin, argv, {
         cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
         timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
+        onChunk: run.push,
       })
 
-      // opencode 出的是 JSONL 事件流，逐行解析
+      // opencode 出的是 JSONL 事件流
       const raw = String(result.stdout ?? '')
       const err = String(result.stderr ?? '')
-      let sid = known || ''
-      const texts = []
-      let cost = null
-      let tokens = null
-      for (const line of raw.split('\n')) {
-        const s = line.trim()
-        if (!s.startsWith('{')) continue
-        let ev = null
-        try {
-          ev = JSON.parse(s)
-        } catch {
-          continue
-        }
-        if (ev.sessionID) sid = ev.sessionID
-        if (ev.type === 'text' && ev.part && typeof ev.part.text === 'string') texts.push(ev.part.text)
-        if (ev.part && ev.part.type === 'step-finish') {
-          if (typeof ev.part.cost === 'number') cost = (cost || 0) + ev.part.cost
-          tokens = ev.part.tokens || tokens
-        }
-      }
+      const collected = collectOpencode(raw)
+      const sid = collected.sessionId || known || ''
 
       if (name && sid) {
         index[name] = { id: sid, cwd: args?.cwd || '', updated: new Date().toISOString() }
         writeJson(OPENCODE_INDEX, index)
       }
 
-      const answer = texts.join('\n').trim() || raw.slice(-3000) || err.slice(-2000)
+      const answer = collected.answer || err.slice(-3000) || raw.slice(-3000)
       const verdict = outcome(result)
       finishDispatch(run, {
         status: verdict.status,
@@ -1265,8 +1420,8 @@ export function apply(ctx, config = {}) {
         response: answer,
         sessionId: sid,
         resumed: !!known,
-        cost,
-        tokens: tokens || null,
+        cost: collected.cost,
+        tokens: collected.tokens || null,
         exitCode: result.code,
         ms: result.ms,
       })
@@ -1286,14 +1441,16 @@ export function apply(ctx, config = {}) {
       label: 'agy（文案）',
       bin: () => bin,
       build: (prompt, opts, known) => {
-        const argv = ['-p', prompt]
+        const argv = ['-p', prompt, '--output-format', 'stream-json']
         if (known) argv.push('--conversation', known)
         if (opts.write) argv.push('--dangerously-skip-permissions')
         return argv
       },
       index: () => path.join(os.homedir(), '.dsh', 'agy-sessions.json'),
-      // agy 的 -p 只打答案，不带会话 id；它的 id 在 cache/last_conversations.json 里按 cwd 存
+      // stream-json 的 result/init 里带 conversation_id；老版本的缓存按 cwd 兜底
       pick: (raw, cwd) => {
+        const collected = collectAgy(raw)
+        if (collected?.conversation_id) return collected.conversation_id
         try {
           const f = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'cache', 'last_conversations.json')
           const map = JSON.parse(fs.readFileSync(f, 'utf8'))
@@ -1309,35 +1466,31 @@ export function apply(ctx, config = {}) {
       build: (prompt, opts, known) => {
         const sb = opts.write ? 'workspace-write' : 'read-only'
         if (known) {
-          const argv = ['exec', 'resume', '--skip-git-repo-check', '-c', `sandbox_mode="${sb}"`, known]
+          const argv = ['exec', 'resume', '--json', '--skip-git-repo-check', '-c', `sandbox_mode="${sb}"`, known]
           argv.push(prompt)
           return argv
         }
-        const argv = ['exec', '--skip-git-repo-check', '-s', sb]
+        const argv = ['exec', '--json', '--skip-git-repo-check', '-s', sb]
         argv.push(prompt)
         return argv
       },
       index: () => path.join(os.homedir(), '.dsh', 'codex-sessions.json'),
-      pick: (raw) => (String(raw).match(/session id:\s*([0-9a-f-]{16,})/) || [])[1] || null,
+      pick: (raw) =>
+        collectCodex(raw).sessionId ||
+        (String(raw).match(/session id:\s*([0-9a-f-]{16,})/) || [])[1] ||
+        null,
     },
     claude: {
       label: 'claude（架构规划）',
       bin: () => claudeBin,
       build: (prompt, opts, known) => {
-        const argv = ['-p', prompt, '--output-format', 'json',
-          '--permission-mode', opts.write ? 'acceptEdits' : 'plan']
+        const argv = ['-p', prompt, '--output-format', 'stream-json', '--verbose',
+          '--include-partial-messages', '--permission-mode', opts.write ? 'acceptEdits' : 'plan']
         if (known) argv.push('--resume', known)
         return argv
       },
       index: () => path.join(os.homedir(), '.dsh', 'claude-sessions.json'),
-      pick: (raw) => {
-        try {
-          const d = JSON.parse(String(raw).trim())
-          return d.session_id || null
-        } catch {
-          return null
-        }
-      },
+      pick: (raw) => collectClaude(raw)?.session_id || null,
     },
     opencode: {
       label: 'opencode（写代码）',
@@ -1350,50 +1503,28 @@ export function apply(ctx, config = {}) {
         return argv
       },
       index: () => path.join(os.homedir(), '.dsh', 'opencode-sessions.json'),
-      pick: (raw) => {
-        for (const line of String(raw).split('\n')) {
-          const s = line.trim()
-          if (!s.startsWith('{')) continue
-          try {
-            const ev = JSON.parse(s)
-            if (ev.sessionID) return ev.sessionID
-          } catch {}
-        }
-        return null
-      },
+      pick: (raw) => collectOpencode(raw).sessionId || null,
     },
   }
 
   // 从各家五花八门的输出里抠出「答复正文」
   function extractAnswer(to, raw) {
     const text = String(raw || '')
+    if (to === 'agy') {
+      const answer = collectAgy(text)?.response
+      if (answer) return String(answer)
+    }
     if (to === 'claude') {
-      try {
-        const d = JSON.parse(text.trim())
-        return String(d.result || '')
-      } catch {
-        const a = text.indexOf('{')
-        const b = text.lastIndexOf('}')
-        if (a >= 0 && b > a) {
-          try {
-            return String(JSON.parse(text.slice(a, b + 1)).result || '')
-          } catch {}
-        }
-      }
+      const answer = collectClaude(text)?.result
+      if (answer) return String(answer)
     }
     if (to === 'opencode') {
-      const parts = []
-      for (const line of text.split('\n')) {
-        const s = line.trim()
-        if (!s.startsWith('{')) continue
-        try {
-          const ev = JSON.parse(s)
-          if (ev.type === 'text' && ev.part && typeof ev.part.text === 'string') parts.push(ev.part.text)
-        } catch {}
-      }
-      if (parts.length) return parts.join('\n').trim()
+      const answer = collectOpencode(text).answer
+      if (answer) return answer
     }
     if (to === 'codex') {
+      const collected = collectCodex(text)
+      if (collected.answer) return collected.answer
       const cut = text.lastIndexOf('tokens used')
       if (cut >= 0) {
         const tail = text.slice(cut).replace(/tokens used\s*\n\s*[\d,]+/i, '').trim()
@@ -1402,6 +1533,13 @@ export function apply(ctx, config = {}) {
     }
     const blocks = text.split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean)
     return blocks.length ? blocks[blocks.length - 1] : ''
+  }
+
+  function reportedStatus(to, raw) {
+    if (to === 'agy') return collectAgy(String(raw || ''))?.status
+    if (to === 'claude') return collectClaude(String(raw || ''))?.is_error ? 'ERROR' : undefined
+    if (to === 'codex') return collectCodex(String(raw || '')).failed ? 'ERROR' : undefined
+    return undefined
   }
 
   ctx.tools.register({
@@ -1466,6 +1604,7 @@ export function apply(ctx, config = {}) {
       const result = await runProcess(hand.bin(), argv, {
         cwd: runCwd,
         timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
+        onChunk: run.push,
       })
 
       const raw = String(result.stdout ?? '')
@@ -1476,8 +1615,8 @@ export function apply(ctx, config = {}) {
         writeJson(idxFile, index)
       }
 
-      const answer = extractAnswer(to, raw) || raw.slice(-3000) || err.slice(-2000)
-      const verdict = outcome(result)
+      const answer = extractAnswer(to, raw) || err.slice(-3000) || raw.slice(-3000)
+      const verdict = outcome(result, reportedStatus(to, raw))
       finishDispatch(run, {
         status: verdict.status,
         ok: verdict.ok,

@@ -1,18 +1,20 @@
 {
   "name": "dsh-hands",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "type": "module",
-  "description": "把本机的 agy、codex、claude、opencode 四个命令行智能体接成 DSH 工具，并在设置里提供「手下调度」面板。",
+  "description": "把本机的 agy、codex、claude、opencode 四个命令行智能体接成 DSH 工具，并在对话右侧边栏提供实时「手下任务」流式看板。",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
+    "./stream": "./stream.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
   "files": [
     "index.js",
     "client.js",
+    "stream.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
@@ -27,7 +29,7 @@
       "platform": "web",
       "immediately": true,
       "inject": [
-        "@deepseek-ai/dsh-client-ui-settings"
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
       ]
     }
   }
