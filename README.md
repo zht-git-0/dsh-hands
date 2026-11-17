@@ -113,22 +113,24 @@ hands_run(to="opencode", prompt="…", cwd="…", session="aigame", write=true)
 
 桌面端第一次加载新面板需要重启一次（link bundle 的 HMR 不生效）；之后改 `client.js` 也要重开页面或重启才能看到新代码。设置里的旧「手下调度」页已经删掉。
 
-## 三层面板 v2（默认关，`USE_V2 = false`）
+## 三层面板 v2（默认开，`USE_V2 = true`）
 
 目标形态：**agent 名字条 → 会话列表 → 对话气泡**，越往左越细。
 
 ```
 ┌──────────┬──────────────┬─────────────────────────────┐
 │ 对话     │ 会话列表      │  交互详情                    │
-│ （已有）  │ 某 agent 下   │  左我说 / 右它说，流式 + 元信息 │
+│ （已有）  │ 某 agent 下   │  左它说 / 右我说，流式 + 元信息 │
 └──────────┴──────────────┴─────────────────────────────┘
-     最右窄条：agent 名字 + 状态点 + 今日次数
+     最左列：agent 大卡片（字母色块 + 名字 + 今日/在跑 + 状态点）
 ```
 
-- 开关：`client.js` 顶部 `const USE_V2 = false`；打开前旧扁平列表原样保留，出问题改回 false 即可。
+- 开关：`client.js` 顶部 `const USE_V2 = true`；关掉就退回旧扁平列表（一行没删）。
+- 两处入口共用一个 store：**顶层面板**（`layout` 的 `main` 槽 + `sidebar.panellist` 导航行，和「插件」「自动化任务」「IM机器人」同级）和**会话右侧栏 tab**。store 内部是引用计数，先卸载的一方不会把另一方的 SSE 掐掉。
 - 数据层：`createHandsStore()`（SSE v2 + 轮询回退 + 选中持久化 `localStorage['dsh.hands.sel']` + 正文增量）。
-- 宽度自适应：`>=520` 三列；`360–520` 窄三列；`<360` 钻取（agents → sessions → thread）。
+- 宽度自适应：`>=560` 三列；`420–560` 两列收窄；`<420` 钻取（agents → sessions → thread）。
 - 正文回落：`liveByTurn` → `/turn?id=&from=` 增量 → `excerpt`；增量由服务端算 `next`，前端只拼。
+
 
 ### v2 HTTP 接口（前缀 `/dsh-hands`）
 
@@ -167,6 +169,7 @@ node acp/test-live-delta.mjs    # live 增量
 node acp/test-health.mjs        # health 缓存/并发
 node acp/test-store.mjs         # 前端 store（SSE/轮询/选中）
 node acp/test-bubbles.mjs       # 气泡回落/元信息
+node acp/test-page.mjs          # 顶层面板结构 + store 引用计数
 node acp/test-acp-map.mjs       # ACP update → 文本映射（含 replay 丢弃）
 node acp/test-cancel.mjs        # 进程树击杀
 ```
