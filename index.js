@@ -828,6 +828,7 @@ export function apply(ctx, config = {}) {
       const lines = [
         await probe('agy 写作', bin, ['--version']),
         await probe('codex 写代码', codexBin, ['--version']),
+        await probe('claude 架构规划', claudeBin, ['--version']),
       ]
       return { text: lines.join('\n') }
     },
