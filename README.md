@@ -21,6 +21,9 @@ plugin_manager install_bundle  target=D:\Program\projects\dsh-hands
 
 装之前先把旧的 `dsh-agy` 停掉，否则 `agy_run` 会注册两遍。
 
+> **开发版和上线版是分开的**：这个目录只当开发版用；DSH 里跑的应该是 `D:\Program\tools\dsh-hands-release` 的上线版。
+> 更新上线版必须**爸爸点头 + 先备份**（脚本没有 `-Approved` 会直接拒绝），流程见 [RELEASE.md](./RELEASE.md)。
+
 ## 配置
 
 `cordis.patch.yml`：

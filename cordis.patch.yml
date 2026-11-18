@@ -4,7 +4,7 @@
       config:
         agyBin: 'C:/Users/Administrator/AppData/Local/agy/bin/agy.exe'
         codexBin: 'D:/Program/environment/nodejs/codex.cmd'
-        claudeBin: 'D:/Program/environment/nodejs/claude.exe'
+        claudeBin: 'C:/Users/Administrator/.local/bin/claude.exe'
         opencodeBin: 'D:/Program/environment/nodejs/opencode.cmd'
         timeoutSec: 900
         skipPermissions: true
