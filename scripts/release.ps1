@@ -82,7 +82,7 @@ foreach ($d in $Dirs) {
 $manifest = [ordered]@{
   publishedAt = (Get-Date).ToString('o')
   gitCommit   = $commit
-  version     = (Get-Content (Join-Path $DevDir 'package.json') -Raw | ConvertFrom-Json).version
+  version     = ([System.IO.File]::ReadAllText((Join-Path $DevDir 'package.json'), [System.Text.Encoding]::UTF8) | ConvertFrom-Json).version
   source      = $DevDir
   files       = @{}
 }
@@ -90,7 +90,8 @@ foreach ($f in $Files) {
   $p = Join-Path $ReleaseDir $f
   if (Test-Path -LiteralPath $p) { $manifest.files[$f] = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash }
 }
-$manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $ReleaseDir 'manifest.json') -Encoding UTF8
+$jsonText = $manifest | ConvertTo-Json -Depth 4
+[System.IO.File]::WriteAllText((Join-Path $ReleaseDir 'manifest.json'), $jsonText, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "已发布到：$ReleaseDir（commit $commit，version $($manifest.version)）"
 
 # 4. 只保留最近 10 份备份
