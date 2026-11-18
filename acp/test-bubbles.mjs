@@ -42,7 +42,7 @@ const mod = def.factory((name) => {
   if (name === 'react') return ReactStub
   throw new Error(`unexpected require: ${name}`)
 })
-const { resolveTurnBody, formatTurnMeta, formatTokens, formatCost, BubbleUser, BubbleAgent } = mod
+const { resolveTurnBody, formatTurnMeta, formatTokens, formatCost, BubbleUser, BubbleAgent, MarkdownLite } = mod
 
 assert.equal(typeof resolveTurnBody, 'function', '导出了 resolveTurnBody')
 assert.equal(typeof formatTurnMeta, 'function', '导出了 formatTurnMeta')
@@ -217,6 +217,56 @@ const t = (key, vars) => {
   assert.ok(hasClass(agentTree, 'dsh-hands-v2-bubbleIcon'), 'agent 气泡上方带身份图标')
   assert.match(allText(agentTree), /handOpencode/, 'agent 小字用手下名字')
   console.log('5) 气泡左右对调 ok')
+}
+
+// ── 6) 自带的极简 markdown：原生组件拿不到时兜底 ────────────────────────────
+{
+  const render = (node) => {
+    if (node === null || node === undefined || typeof node === 'boolean') return null
+    if (typeof node === 'string' || typeof node === 'number') return { text: String(node) }
+    if (Array.isArray(node)) return node.map(render)
+    if (typeof node === 'function') return render(node({}))
+    if (typeof node !== 'object') return null
+    if (typeof node.type === 'function') {
+      const props = { ...(node.props || {}) }
+      if (node.children?.length) props.children = node.children
+      return render(node.type(props))
+    }
+    return { type: node.type, props: node.props || {}, children: (node.children || []).map(render) }
+  }
+  const collect = (tree, out = []) => {
+    if (!tree) return out
+    if (Array.isArray(tree)) { for (const t of tree) collect(t, out); return out }
+    if (tree.type) out.push(tree)
+    for (const c of tree.children || []) collect(c, out)
+    return out
+  }
+  const texts = (tree) => collect(tree).map((n) => (n.children || []).map((c) => c.text || '').join('')).join(' | ')
+
+  // 围栏代码块 → pre.dsh-hands-mdCode
+  const fence = render(h(MarkdownLite, { text: '说明\n```js\nconst a = 1\n```\n结尾' }))
+  const pres = collect(fence).filter((n) => n.type === 'pre')
+  assert.equal(pres.length, 1, '一个围栏块')
+  assert.ok(pres[0].props.className.includes('dsh-hands-mdCode'), '代码块类名')
+  assert.equal(pres[0].props['data-lang'], 'js', '记住语言')
+  assert.ok(texts(fence).includes('const a = 1'), '代码正文在')
+
+  // 标题 / 列表 / 引用
+  const rich = render(h(MarkdownLite, { text: '# 标题\n- 第一\n- 第二\n> 引用' }))
+  assert.ok(collect(rich).some((n) => n.props?.className === 'dsh-hands-mdHeading'), '标题')
+  assert.ok(collect(rich).some((n) => n.type === 'ul'), '列表')
+  assert.ok(collect(rich).some((n) => n.type === 'blockquote'), '引用')
+
+  // 行内三种标记
+  const inline = render(h(MarkdownLite, { text: 'a `code` **粗** *斜*' }))
+  const kinds = collect(inline).map((n) => n.type)
+  assert.ok(kinds.includes('code'), '行内代码')
+  assert.ok(kinds.includes('strong'), '加粗')
+  assert.ok(kinds.includes('em'), '斜体')
+
+  // 空文本不炸
+  assert.ok(render(h(MarkdownLite, { text: '' })), '空文本也有容器')
+  console.log('6) 极简 markdown 兜底 ok')
 }
 
 console.log('ok')

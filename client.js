@@ -1587,6 +1587,14 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-bubbleIcon{display:inline-flex;align-items:center;flex:none}
       .dsh-hands-v2-bubbleName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       .dsh-hands-v2-bubbleText{margin:0;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:12px;line-height:19px;color:var(--dsw-alias-label-primary)}
+      .dsh-hands-md{display:flex;flex-direction:column;gap:4px;min-width:0}
+      .dsh-hands-mdLine{white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
+      .dsh-hands-mdHeading{font-weight:600;font-size:12.5px;line-height:18px}
+      .dsh-hands-mdList{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:2px}
+      .dsh-hands-mdQuote{margin:0;padding-left:8px;border-left:2px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary)}
+      .dsh-hands-mdCode{margin:4px 0;padding:8px 10px;border-radius:8px;background:color-mix(in srgb,var(--dsw-alias-label-primary) 8%,transparent);overflow:auto;max-height:40vh}
+      .dsh-hands-mdCode code{font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:11.5px;line-height:17px;white-space:pre}
+      .dsh-hands-md code,.dsh-hands-v2-bubbleText code{font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:11.5px;background:color-mix(in srgb,var(--dsw-alias-label-primary) 10%,transparent);padding:1px 4px;border-radius:4px}
       .dsh-hands-v2-bubbleAgent .dsh-hands-stream{max-height:46vh;min-height:20px;overflow:auto;overscroll-behavior:contain}
       .dsh-hands-v2-bubbleAgent .dsh-hands-streamText{display:block;margin:0;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font:inherit;font-size:12px;line-height:19px;color:var(--dsw-alias-label-primary)}
       .dsh-hands-v2-waiting{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:19px}
@@ -1605,6 +1613,112 @@ window.__ModuleLoader__.load({
       @keyframes dsh-hands-blink{0%,49%{opacity:1}50%,100%{opacity:0}}
       @media (prefers-reduced-motion:reduce){.dsh-hands-v2-dot[data-tone=running],.dsh-hands-v2-agentDot[data-tone=running]{animation:none}.dsh-hands-v2 .dsh-hands-cursor{animation:none}}
     `;
+
+    // ── markdown：优先用 DSH 原生组件，拿不到就用自带的极简渲染 ─────────────
+    // 原生那个（MarkdownText）在 staticModules 里，和聊天面板是同一个组件；
+    // 万一某个版本没导出它，也不能让手下的话退化成纯文本。
+    function renderInline(text, keyPrefix) {
+      const nodes = [];
+      const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|\[[^\]\n]+\]\([^)\s]+\))/g;
+      let last = 0;
+      let match;
+      let seq = 0;
+      while ((match = pattern.exec(text)) !== null) {
+        if (match.index > last) nodes.push(text.slice(last, match.index));
+        const token = match[0];
+        const key = `${keyPrefix}i${seq++}`;
+        if (token.startsWith('`')) {
+          nodes.push(h('code', { key }, token.slice(1, -1)));
+        } else if (token.startsWith('**')) {
+          nodes.push(h('strong', { key }, token.slice(2, -2)));
+        } else if (token.startsWith('*')) {
+          nodes.push(h('em', { key }, token.slice(1, -1)));
+        } else {
+          const link = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(token);
+          nodes.push(
+            link
+              ? h('a', { key, href: link[2], target: '_blank', rel: 'noreferrer' }, link[1])
+              : token,
+          );
+        }
+        last = match.index + token.length;
+      }
+      if (last < text.length) nodes.push(text.slice(last));
+      return nodes;
+    }
+
+    // 只覆盖聊天里真会出现的语法：围栏代码、标题、列表、引用、行内三种标记。
+    function MarkdownLite({ text, streaming }) {
+      const source = String(text || '');
+      const chunks = source.split('```');
+      const out = [];
+      chunks.forEach((chunk, index) => {
+        if (index % 2 === 1) {
+          // 围栏块：第一行可能是语言标记
+          const breakAt = chunk.indexOf('\n');
+          const lang = breakAt >= 0 ? chunk.slice(0, breakAt).trim() : '';
+          const code = breakAt >= 0 ? chunk.slice(breakAt + 1) : chunk;
+          out.push(
+            h(
+              'pre',
+              { key: `fence${index}`, className: 'dsh-hands-mdCode', 'data-lang': lang || undefined },
+              h('code', null, code.replace(/\n$/, '')),
+            ),
+          );
+          return;
+        }
+        const lines = chunk.split('\n');
+        let list = null;
+        const flushList = () => {
+          if (!list) return;
+          out.push(h('ul', { key: `ul${out.length}`, className: 'dsh-hands-mdList' }, list));
+          list = null;
+        };
+        lines.forEach((line, lineIndex) => {
+          const key = `l${index}-${lineIndex}`;
+          const trimmed = line.trim();
+          if (!trimmed) {
+            flushList();
+            return;
+          }
+          const heading = /^(#{1,4})\s+(.*)$/.exec(trimmed);
+          if (heading) {
+            flushList();
+            out.push(h('div', { key, className: 'dsh-hands-mdHeading', 'data-level': heading[1].length }, renderInline(heading[2], key)));
+            return;
+          }
+          const bullet = /^[-*+]\s+(.*)$/.exec(trimmed);
+          if (bullet) {
+            if (!list) list = [];
+            list.push(h('li', { key }, renderInline(bullet[1], key)));
+            return;
+          }
+          const quote = /^>\s?(.*)$/.exec(trimmed);
+          if (quote) {
+            flushList();
+            out.push(h('blockquote', { key, className: 'dsh-hands-mdQuote' }, renderInline(quote[1], key)));
+            return;
+          }
+          flushList();
+          out.push(h('div', { key, className: 'dsh-hands-mdLine' }, renderInline(line, key)));
+        });
+        flushList();
+      });
+      return h(
+        'div',
+        { className: 'dsh-hands-md', 'data-streaming': streaming ? 'true' : 'false' },
+        out.length ? out : source,
+      );
+    }
+
+    function MarkdownBlock(props) {
+      const text = String(props?.text || '');
+      const streaming = !!props?.streaming;
+      if (MarkdownText) {
+        return h(MarkdownText, { text, streaming, variant: 'body' });
+      }
+      return h(MarkdownLite, { text, streaming });
+    }
 
     // ── 单条输出：自己管滚动，贴底时自动跟随 ──────────────────────────────
     function Stream({ text, running, t }) {
@@ -1628,13 +1742,7 @@ window.__ModuleLoader__.load({
           ? h(
               React.Fragment,
               null,
-              MarkdownText
-                ? h(MarkdownText, {
-                    text,
-                    streaming: !!running,
-                    variant: 'body',
-                  })
-                : h('pre', { className: 'dsh-hands-streamText' }, text),
+              MarkdownBlock ? h(MarkdownBlock, { text, streaming: !!running }) : h('pre', { className: 'dsh-hands-streamText' }, text),
               running ? h('span', { className: 'dsh-hands-cursor', 'aria-hidden': true }) : null,
             )
           : h('div', { className: 'dsh-hands-waiting' }, running ? t('waiting') : t('noOutput')),
@@ -2206,7 +2314,9 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { className: 'dsh-hands-v2-bubbleText' },
-            canExpand && !expanded ? `${full.slice(0, PROMPT_LIMIT)}…` : full,
+            h(MarkdownBlock, {
+              text: canExpand && !expanded ? `${full.slice(0, PROMPT_LIMIT)}…` : full,
+            }),
           ),
           canExpand
             ? h(
@@ -2893,6 +3003,8 @@ window.__ModuleLoader__.load({
       HandsNavIcon,
       HandIcon,
       HAND_ICON_PATHS,
+      MarkdownLite,
+      MarkdownBlock,
     };
   },
 });
