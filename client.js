@@ -4,6 +4,18 @@ window.__ModuleLoader__.load({
     const React = require('react');
     const h = React.createElement;
 
+    // DSH 自带的 markdown 渲染器（和原生聊天用的是同一个组件）。
+    // 拿不到就退回纯文本，不让插件因为一个 require 挂掉。
+    let MarkdownText = null;
+    try {
+      const primitives = require('@deepseek-ai/dsh-client-ui-primitives');
+      if (primitives && typeof primitives.MarkdownText === 'function') {
+        MarkdownText = primitives.MarkdownText;
+      }
+    } catch {
+      MarkdownText = null;
+    }
+
     // ── 文案 ────────────────────────────────────────────────────────────────
     const NS = 'sidebar.hands';
     const TAB_ID = 'dsh-hands';
@@ -1520,7 +1532,8 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-agent{position:relative;flex:none;display:flex;align-items:center;gap:10px;width:100%;min-height:56px;padding:8px 10px;border:0;border-radius:10px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
       .dsh-hands-v2-agent:hover{background:var(--dsw-alias-interactive-bg-hover)}
       .dsh-hands-v2-agent[data-active=true]{background:var(--dsw-alias-interactive-bg-hover);box-shadow:inset 0 0 0 1px var(--dsw-alias-brand-primary)}
-      .dsh-hands-v2-agentIcon{flex:none;display:flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:10px;color:#fff;font-size:11.5px;font-weight:600;letter-spacing:.02em}
+      .dsh-hands-v2-agentIcon{flex:none;display:flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:10px;background:color-mix(in srgb,var(--hand-color,var(--dsw-alias-label-tertiary)) 14%,transparent);color:var(--hand-color,var(--dsw-alias-label-secondary))}
+      .dsh-hands-v2-agentIconText{font-size:11.5px;font-weight:600;letter-spacing:.02em}
       .dsh-hands-v2-agentText{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
       .dsh-hands-v2-agentName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:14px;color:var(--dsw-alias-label-primary);font-size:12.5px;line-height:17px;font-weight:500}
       .dsh-hands-v2-agentMeta{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:15px}
@@ -1571,6 +1584,8 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-bubbleUser{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 16%,transparent);border-radius:14px 14px 4px 14px}
       .dsh-hands-v2-bubbleAgent{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:14px 14px 14px 4px}
       .dsh-hands-v2-bubbleLabel{display:inline-flex;align-items:center;gap:4px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:10.5px;line-height:14px}
+      .dsh-hands-v2-bubbleIcon{display:inline-flex;align-items:center;flex:none}
+      .dsh-hands-v2-bubbleName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       .dsh-hands-v2-bubbleText{margin:0;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:12px;line-height:19px;color:var(--dsw-alias-label-primary)}
       .dsh-hands-v2-bubbleAgent .dsh-hands-stream{max-height:46vh;min-height:20px;overflow:auto;overscroll-behavior:contain}
       .dsh-hands-v2-bubbleAgent .dsh-hands-streamText{display:block;margin:0;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font:inherit;font-size:12px;line-height:19px;color:var(--dsw-alias-label-primary)}
@@ -1611,9 +1626,15 @@ window.__ModuleLoader__.load({
         { className: 'dsh-hands-stream', ref, onScroll },
         text
           ? h(
-              'pre',
-              { className: 'dsh-hands-streamText' },
-              text,
+              React.Fragment,
+              null,
+              MarkdownText
+                ? h(MarkdownText, {
+                    text,
+                    streaming: !!running,
+                    variant: 'body',
+                  })
+                : h('pre', { className: 'dsh-hands-streamText' }, text),
               running ? h('span', { className: 'dsh-hands-cursor', 'aria-hidden': true }) : null,
             )
           : h('div', { className: 'dsh-hands-waiting' }, running ? t('waiting') : t('noOutput')),
@@ -1928,6 +1949,59 @@ window.__ModuleLoader__.load({
       return key.slice(0, 2).toUpperCase() || '—';
     }
 
+    // 各家的图形标：统一 24 视框、1.6 描边、圆头圆角，颜色走 currentColor，
+    // 外层给什么色就是什么色（主题换了也跟着换）。
+    const HAND_ICON_PATHS = {
+      // Anthropic 的星芒：六条线穿心，十二个尖
+      claude: [
+        'M12 2.4V21.6',
+        'M2 12h20',
+        'M3.5 6.2l17 11.6',
+        'M20.5 6.2l-17 11.6',
+        'M7.1 3.6l9.8 16.8',
+        'M16.9 3.6L7.1 20.4',
+      ],
+      // OpenAI 的花结：两层六边形错开
+      codex: [
+        'M12 2.8l7.8 4.6v9.2L12 21.2 4.2 16.6V7.4z',
+        'M12 6.6l4.6 2.7v5.4L12 17.4 7.4 14.7V9.3z',
+      ],
+      // Antigravity：一枚起飞的箭头 + 尾焰
+      agy: ['M12 2.6c2.6 3 3.9 6.6 3.9 9.6H8.1c0-3 1.3-6.6 3.9-9.6z', 'M8.1 12.2L5.2 16l2.9-.6', 'M15.9 12.2L18.8 16l-2.9-.6', 'M12 14.6v6.8'],
+      // opencode：终端提示符
+      opencode: ['M3.2 5.2h17.6v13.6H3.2z', 'M7.2 10l2.8 2.4-2.8 2.4', 'M12.4 14.8h4.4'],
+    };
+
+    function HandIcon(props) {
+      const hand = String(props?.hand || '').toLowerCase();
+      const size = Number(props?.size) || 20;
+      const paths = HAND_ICON_PATHS[hand] || null;
+      if (!paths) {
+        // 不认识的手：退回字母，至少不空着
+        return h(
+          'span',
+          { className: 'dsh-hands-v2-agentIconText', 'aria-hidden': true },
+          handShort(hand),
+        );
+      }
+      return h(
+        'svg',
+        {
+          width: size,
+          height: size,
+          viewBox: '0 0 24 24',
+          fill: 'none',
+          stroke: 'currentColor',
+          strokeWidth: 1.6,
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+          'aria-hidden': true,
+          focusable: false,
+        },
+        paths.map((d, index) => h('path', { key: index, d })),
+      );
+    }
+
     // agent 卡片主标题：服务端 label 形如「agy（文案）」，去掉括号里的注解只留名字。
     function handTitle(agent) {
       const label = String(agent?.label || '').trim();
@@ -1979,10 +2053,10 @@ window.__ModuleLoader__.load({
                 'span',
                 {
                   className: 'dsh-hands-v2-agentIcon',
-                  style: { background: HAND_COLOR[hand] || 'var(--dsw-alias-label-tertiary)' },
+                  style: { '--hand-color': HAND_COLOR[hand] || 'var(--dsw-alias-label-tertiary)' },
                   'aria-hidden': true,
                 },
-                handShort(hand),
+                h(HandIcon, { hand, size: 20 }),
               ),
               h(
                 'span',
@@ -2170,12 +2244,8 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'dsh-hands-v2-bubbleLabel' },
-          h('span', {
-            className: 'dsh-hands-v2-dot',
-            'data-tone': running ? 'running' : 'idle',
-            style: { '--tone-color': handColor },
-          }),
-          handLabel(hand, t),
+          h('span', { className: 'dsh-hands-v2-bubbleIcon', style: { color: handColor } }, h(HandIcon, { hand, size: 13 })),
+          h('span', { className: 'dsh-hands-v2-bubbleName' }, handLabel(hand, t)),
         ),
         h(
           'div',
@@ -2821,6 +2891,8 @@ window.__ModuleLoader__.load({
       Turn,
       HandsPage,
       HandsNavIcon,
+      HandIcon,
+      HAND_ICON_PATHS,
     };
   },
 });

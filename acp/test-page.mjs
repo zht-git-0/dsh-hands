@@ -93,6 +93,20 @@ const t = (key) => key
   console.log('1) 侧边栏图标 ok')
 }
 
+// 1.5) 各家的图形标：四个手都有，未知的手退回字母
+{
+  for (const hand of ['claude', 'codex', 'agy', 'opencode']) {
+    const icon = mod.HandIcon({ hand, size: 18 })
+    assert.equal(icon.type, 'svg', `${hand} 是 svg`)
+    assert.equal(icon.props.width, 18, `${hand} 跟着 size 走`)
+    assert.equal(icon.props.stroke, 'currentColor', `${hand} 颜色跟外层`)
+    assert.ok(icon.children.length >= 1, `${hand} 至少一条 path`)
+  }
+  assert.equal(mod.HandIcon({ hand: 'mystery' }).type, 'span', '不认识的手退回字母')
+  assert.ok(mod.HAND_ICON_PATHS.claude.length >= 4, 'claude 是星芒（多条线）')
+  console.log('1.5) 各家图标 ok')
+}
+
 // 2) 整页结构：头（标题/副标题/连接状态/刷新）+ 三列面板
 {
   const store = mod.createHandsStore()

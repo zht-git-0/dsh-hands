@@ -214,7 +214,7 @@ const t = (key, vars) => {
   assert.ok(hasClass(agentTree, 'dsh-hands-v2-msgAgent'), 'agent 气泡靠左（msgAgent）')
   assert.equal(hasClass(agentTree, 'dsh-hands-v2-msgUser'), false, 'agent 气泡不混用 user 容器')
   assert.ok(hasClass(agentTree, 'dsh-hands-v2-bubbleAgent'), '保留 bubbleAgent 描边类')
-  assert.ok(hasClass(agentTree, 'dsh-hands-v2-dot'), 'agent 气泡上方带身份色点')
+  assert.ok(hasClass(agentTree, 'dsh-hands-v2-bubbleIcon'), 'agent 气泡上方带身份图标')
   assert.match(allText(agentTree), /handOpencode/, 'agent 小字用手下名字')
   console.log('5) 气泡左右对调 ok')
 }
