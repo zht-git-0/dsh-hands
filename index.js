@@ -675,6 +675,52 @@ export function asyncReportText(job, summary) {
   return lines.join('\n')
 }
 
+// ── 异步任务的落盘状态：重启不丢、同一份回传不重复投 ────────────────────
+// 内存里的 ASYNC_JOBS 只服务「正在跑」的那几秒；真正要活过重启的是这个文件。
+// 每个 job 记到 delivery=sent 才算完，重启后只补投没投出去的那些。
+export const ASYNC_STATE_FILE = path.join(os.homedir(), '.dsh', 'hands-async.json')
+
+export function readAsyncState(file = ASYNC_STATE_FILE) {
+  try {
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (data && typeof data === 'object' && data.jobs && typeof data.jobs === 'object') return data
+  } catch {
+    // 没有文件 / 文件坏了：当成空状态，不影响插件启动
+  }
+  return { v: 1, jobs: {} }
+}
+
+export function writeAsyncState(state, file = ASYNC_STATE_FILE) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    const entries = Object.entries(state?.jobs || {})
+      .sort((a, b) => Number(b[1]?.startedAt || 0) - Number(a[1]?.startedAt || 0))
+      .slice(0, 200)
+    fs.writeFileSync(file, JSON.stringify({ v: 1, jobs: Object.fromEntries(entries) }, null, 1), 'utf8')
+    return true
+  } catch {
+    return false
+  }
+}
+
+// 重启后该做什么：没跑完的标 ORPHAN（进程已经没了），跑完但没投的补投一次。
+// 纯函数，只决定「要不要投 / 标什么」，真投递在外面做 —— 这样能单测。
+export function planAsyncRecovery(state) {
+  const jobs = Object.values(state?.jobs || {})
+  const deliver = []
+  const orphan = []
+  for (const record of jobs) {
+    if (!record || !record.id) continue
+    if (record.delivery === 'sent') continue
+    if (!record.endedAt) {
+      orphan.push(record.id)
+      continue
+    }
+    if (record.report) deliver.push(record.id)
+  }
+  return { deliver, orphan }
+}
+
 export function apply(ctx, config = {}) {
   // 四家的二进制：配置 > 本机常用安装位置 > 默认值，取第一个真实存在的。
   // 这样重装 / 目录被清之后不用改配置也能自己找回来。
@@ -1266,7 +1312,17 @@ export function apply(ctx, config = {}) {
   //   **必须 await**，漏接 reject 会让整个 DSH 宿主退出。
   // 会话句柄的取法见 host.js:939-952：id 有带/不带 `session-` 前缀两种写法，双向试。
 
-  const ASYNC_JOBS = new Map() // jobId -> 内存状态（切片 A：重启即丢，落盘的记录在 hands-log 里）
+  const ASYNC_JOBS = new Map() // jobId -> 内存状态（正在跑的那几秒用）
+  // 落盘状态：谁跑完了、谁还没投、谁投过。重启后靠它补投 / 收尸。
+  const asyncState = readAsyncState()
+  const saveAsyncState = () => writeAsyncState(asyncState)
+
+  function beginAsyncJob(job) {
+    ASYNC_JOBS.set(job.id, job)
+    asyncState.jobs[job.id] = { ...job }
+    saveAsyncState()
+    return job
+  }
 
   async function deliverAsyncReport(ctx, job, text) {
     const agent = findAgentFor(ctx, job.sessionId)
@@ -1298,16 +1354,83 @@ export function apply(ctx, config = {}) {
     job.status = summary.status
     job.ms = summary.ms
     job.endedAt = new Date().toISOString()
+    const text = asyncReportText(job, summary)
+    const record = asyncState.jobs[job.id] || (asyncState.jobs[job.id] = { ...job })
+    Object.assign(record, {
+      status: job.status,
+      ms: job.ms,
+      endedAt: job.endedAt,
+      report: String(text).slice(0, 2000), // 存正文：重启后能原样补投，不用重算
+    })
+    // 已经投过就别再投一次（同一次派活只该有一条回传）
+    if (record.delivery === 'sent') {
+      saveAsyncState()
+      return job
+    }
     try {
-      await deliverAsyncReport(ctx, job, asyncReportText(job, summary))
+      await deliverAsyncReport(ctx, job, text)
     } catch (error) {
       job.delivery = 'failed'
       job.deliveryError = String(error?.message ?? error).slice(0, 400)
     }
+    record.delivery = job.delivery || 'failed'
+    record.deliveryError = job.deliveryError || ''
+    record.deliveredAt = job.deliveredAt || ''
+    saveAsyncState()
     return job
   }
 
-  function runningList() {    const now = Date.now()
+  // 启动时对账：上次没跑完的标 ORPHAN，跑完但没投出去的补投一次
+  async function recoverAsyncJobs() {
+    const plan = planAsyncRecovery(asyncState)
+    for (const id of plan.orphan) {
+      const record = asyncState.jobs[id]
+      if (!record) continue
+      record.status = 'ORPHAN'
+      record.endedAt = record.endedAt || new Date().toISOString()
+      record.delivery = record.delivery === 'sent' ? 'sent' : 'skipped'
+      record.deliveryError = 'DSH 重启时这个任务还在跑，进程已经没了'
+    }
+    let delivered = 0
+    for (const id of plan.deliver) {
+      const record = asyncState.jobs[id]
+      if (!record || !record.report) continue
+      const job = {
+        id: record.id,
+        hand: record.hand,
+        tool: record.tool,
+        sessionId: record.sessionId,
+        prompt: record.prompt,
+        delivery: 'pending',
+      }
+      try {
+        const ok = await deliverAsyncReport(ctx, job, record.report)
+        record.delivery = ok ? 'sent' : 'failed'
+        record.deliveryError = job.deliveryError || ''
+        record.deliveredAt = job.deliveredAt || ''
+        if (ok) delivered += 1
+      } catch (error) {
+        record.delivery = 'failed'
+        record.deliveryError = String(error?.message ?? error).slice(0, 400)
+      }
+    }
+    saveAsyncState()
+    return { delivered, orphans: plan.orphan.length }
+  }
+
+  // 启动后等 agents 服务就绪，再补投上一次没投出去的回传。
+  // 只投「已经跑完、有正文、没投过」的，绝不重投已经投过的。
+  ctx.effect(() => {
+    const timer = setTimeout(() => {
+      recoverAsyncJobs().catch(() => {
+        // 补投失败不影响插件本体
+      })
+    }, 4000)
+    return () => clearTimeout(timer)
+  }, 'dsh-hands: async recovery')
+
+  function runningList() {
+    const now = Date.now()
     return [...RUNNING.values()]
       .map((entry) =>
         clean({
@@ -2031,7 +2154,7 @@ export function apply(ctx, config = {}) {
           status: 'RUNNING',
           delivery: 'pending',
         }
-        ASYNC_JOBS.set(job.id, job)
+        beginAsyncJob(job)
         perform()
           .then((value) =>
             settleAsyncJob(ctx, job, {
@@ -2440,7 +2563,7 @@ export function apply(ctx, config = {}) {
           status: 'RUNNING',
           delivery: 'pending',
         }
-        ASYNC_JOBS.set(job.id, job)
+        beginAsyncJob(job)
         perform()
           .then((value) =>
             settleAsyncJob(ctx, job, {
@@ -2646,7 +2769,7 @@ export function apply(ctx, config = {}) {
           status: 'RUNNING',
           delivery: 'pending',
         }
-        ASYNC_JOBS.set(job.id, job)
+        beginAsyncJob(job)
         proc
           .then((result) => {
             const value = settle(result)
@@ -2866,7 +2989,7 @@ export function apply(ctx, config = {}) {
           status: 'RUNNING',
           delivery: 'pending',
         }
-        ASYNC_JOBS.set(job.id, job)
+        beginAsyncJob(job)
         perform()
           .then((value) =>
             settleAsyncJob(ctx, job, {

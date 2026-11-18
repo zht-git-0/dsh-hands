@@ -2,7 +2,7 @@
 // 只测「会话 id 怎么取 / 回传正文长什么样 / 时长怎么算」，
 // 真跑一个手下要走模型，不放在这里。
 import assert from 'node:assert/strict'
-import { asyncReportText, findAgentFor, formatDuration, pickBin, sessionIdFromExec } from '../index.js'
+import { asyncReportText, findAgentFor, formatDuration, pickBin, planAsyncRecovery, readAsyncState, sessionIdFromExec, writeAsyncState } from '../index.js'
 
 // ── 0) 二进制路径：按顺序找第一个真实存在的 ──────────────────────────────────
 {
@@ -114,6 +114,54 @@ import { asyncReportText, findAgentFor, formatDuration, pickBin, sessionIdFromEx
   assert.ok(bad.includes('错误：boom'), '错误行')
   assert.ok(bad.includes('退出码 1'), '非零退出码')
   console.log('4) asyncReportText ok')
+}
+
+// ── 5) 落盘状态：读回、写回、重启后该补投谁 ─────────────────────────────────
+{
+  const os = await import('node:os')
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hands-async-'))
+  const file = path.join(dir, 'state.json')
+
+  // 文件不存在 = 空状态，不炸
+  assert.deepEqual(readAsyncState(file).jobs, {}, '没有文件是空状态')
+
+  const state = {
+    v: 1,
+    jobs: {
+      'a-sent': { id: 'a-sent', hand: 'claude', startedAt: 1, endedAt: 'x', delivery: 'sent', report: 'r' },
+      'b-done': { id: 'b-done', hand: 'opencode', startedAt: 2, endedAt: 'x', delivery: 'pending', report: '报告正文' },
+      'c-running': { id: 'c-running', hand: 'codex', startedAt: 3, delivery: 'pending' },
+      'd-done-no-report': { id: 'd-done-no-report', hand: 'agy', startedAt: 4, endedAt: 'x', delivery: 'pending' },
+    },
+  }
+  assert.equal(writeAsyncState(state, file), true, '写成功')
+  const back = readAsyncState(file)
+  assert.equal(Object.keys(back.jobs).length, 4, '四条都读回来了')
+
+  // 重启后：只补投 b-done（跑完 + 有正文 + 没投过）
+  const plan = planAsyncRecovery(back)
+  assert.deepEqual(plan.deliver, ['b-done'], `该补投的只有 b-done，实际 ${JSON.stringify(plan.deliver)}`)
+  assert.deepEqual(plan.orphan, ['c-running'], `没跑完的是 c-running，实际 ${JSON.stringify(plan.orphan)}`)
+  assert.ok(!plan.deliver.includes('a-sent'), '投过的不再投')
+  assert.ok(!plan.deliver.includes('d-done-no-report'), '没正文的没法补投，不硬投')
+
+  // 坏文件当空状态
+  fs.writeFileSync(file, '{ not json', 'utf8')
+  assert.deepEqual(readAsyncState(file).jobs, {}, '坏文件回空状态')
+
+  // 只留最近 200 条
+  const many = { v: 1, jobs: {} }
+  for (let i = 0; i < 260; i += 1) many.jobs[`j${i}`] = { id: `j${i}`, startedAt: i }
+  writeAsyncState(many, file)
+  const capped = readAsyncState(file)
+  assert.equal(Object.keys(capped.jobs).length, 200, '最多留 200 条')
+  assert.ok(capped.jobs.j259, '留的是最新的')
+  assert.ok(!capped.jobs.j0, '最老的被裁掉')
+
+  fs.rmSync(dir, { recursive: true, force: true })
+  console.log('5) 落盘状态 + 重启补投计划 ok')
 }
 
 console.log('ok')
