@@ -204,6 +204,11 @@ node acp/test-cancel.mjs        # 进程树击杀
 - **不丢**：DSH 重启后 4 秒对账一次：没跑完的标 `ORPHAN`（进程已经没了），
   跑完但没投出去的**补投一次**。
 - **拿不到会话就拒绝**：`exec.agent` 里取不到 session id 时，回传会标 `no-agent` 而不是猜一个会话投进去。
+- **并发闸门**：同时最多跑 3 个（`config.maxAsync` 可调，1–16），多的先进先出排队。
+  进程是**排队之后才起**的，不是起了再挂起。同步调用不受限（调用方自己愿意等）。
+  派活返回值里带 `queue: {limit, active, waiting}`。
+- **观测口**：`GET /dsh-hands/async?n=50` 一次看到在跑的（`live`）和落盘的（`persisted`），
+  每条带 `delivery` / `deliveryError` / `deliveredAt`。
 - 已知代价：正在跑的任务随进程一起没，只能标孤儿，不能续跑（ACP/CLI 都是子进程，没有断点）。
 
 
