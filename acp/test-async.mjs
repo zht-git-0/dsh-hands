@@ -2,7 +2,7 @@
 // 只测「会话 id 怎么取 / 回传正文长什么样 / 时长怎么算」，
 // 真跑一个手下要走模型，不放在这里。
 import assert from 'node:assert/strict'
-import { asyncReportText, findAgentFor, formatDuration, pickBin, planAsyncRecovery, readAsyncState, sessionIdFromExec, writeAsyncState } from '../index.js'
+import { asyncReportText, createAsyncQueue, findAgentFor, formatDuration, pickBin, planAsyncRecovery, readAsyncState, sessionIdFromExec, writeAsyncState } from '../index.js'
 
 // ── 0) 二进制路径：按顺序找第一个真实存在的 ──────────────────────────────────
 {
@@ -162,6 +162,55 @@ import { asyncReportText, findAgentFor, formatDuration, pickBin, planAsyncRecove
 
   fs.rmSync(dir, { recursive: true, force: true })
   console.log('5) 落盘状态 + 重启补投计划 ok')
+}
+
+// ── 6) 并发闸门：上限、排队顺序、失败不卡队列 ───────────────────────────────
+{
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+  // 上限 2：同时最多两个在跑，顺序先进先出
+  const q = createAsyncQueue(2)
+  let peak = 0
+  let now = 0
+  const order = []
+  const done = []
+  for (let i = 0; i < 5; i += 1) {
+    done.push(
+      q.run(async () => {
+        now += 1
+        peak = Math.max(peak, now)
+        order.push(i)
+        await sleep(10)
+        now -= 1
+        return i
+      }),
+    )
+  }
+  assert.equal(q.stats().active, 2, '一开始就占满两个槽')
+  assert.equal(q.stats().waiting, 3, '另外三个在排队')
+  const results = await Promise.all(done)
+  assert.deepEqual(results, [0, 1, 2, 3, 4], '结果按提交顺序返回')
+  assert.equal(peak, 2, `峰值并发应该是 2，实际 ${peak}`)
+  assert.deepEqual(order, [0, 1, 2, 3, 4], '先进先出，没插队')
+  await sleep(0) // 让 finally 里的减计数先跑完
+  assert.deepEqual(q.stats(), { limit: 2, active: 0, waiting: 0 }, '跑完归零')
+
+  // 一个任务抛错，不能把队列卡死
+  const q2 = createAsyncQueue(1)
+  const bad = q2.run(async () => {
+    throw new Error('boom')
+  })
+  const good = q2.run(async () => 'ok')
+  await assert.rejects(bad, /boom/)
+  assert.equal(await good, 'ok', '前面的失败不影响后面的')
+  await sleep(0)
+  assert.deepEqual(q2.stats(), { limit: 1, active: 0, waiting: 0 })
+
+  // 非法上限会被夹到合法区间
+  assert.equal(createAsyncQueue(0).stats().limit, 1, '0 夹到 1')
+  assert.equal(createAsyncQueue(999).stats().limit, 16, '太大夹到 16')
+  assert.equal(createAsyncQueue(undefined).stats().limit, 3, '默认 3')
+  console.log('6) 并发闸门 ok')
 }
 
 console.log('ok')

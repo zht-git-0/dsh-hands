@@ -721,6 +721,42 @@ export function planAsyncRecovery(state) {
   return { deliver, orphan }
 }
 
+// 并发闸门：同时最多跑 limit 个，多的排队（先进先出）。
+// 提成模块级是为了能单测：并发上限、排队顺序、失败不卡队列。
+export function createAsyncQueue(limit = 3) {
+  // 0 要夹到 1（不能退化成默认值），没传/非数字才用默认 3
+  const raw = limit === undefined || limit === null || limit === '' ? NaN : Math.trunc(Number(limit))
+  const max = Number.isFinite(raw) ? Math.max(1, Math.min(16, raw)) : 3
+  let active = 0
+  const waiting = []
+
+  function pump() {
+    while (active < max && waiting.length) {
+      const task = waiting.shift()
+      active += 1
+      Promise.resolve()
+        .then(task.start)
+        .then(task.resolve, task.reject)
+        .finally(() => {
+          active -= 1
+          pump()
+        })
+    }
+  }
+
+  return {
+    run(start) {
+      return new Promise((resolve, reject) => {
+        waiting.push({ start, resolve, reject })
+        pump()
+      })
+    },
+    stats() {
+      return { limit: max, active, waiting: waiting.length }
+    },
+  }
+}
+
 export function apply(ctx, config = {}) {
   // 四家的二进制：配置 > 本机常用安装位置 > 默认值，取第一个真实存在的。
   // 这样重装 / 目录被清之后不用改配置也能自己找回来。
@@ -1323,6 +1359,13 @@ export function apply(ctx, config = {}) {
     saveAsyncState()
     return job
   }
+
+  // ── 并发闸门：同时最多跑 N 个异步活，多的排队（先进先出） ──────────────
+  // 四个手下同时起进程会把机器压死（每个都是独立 CLI，还带自己的模型会话）。
+  // 同步调用不受限：那是调用方自己愿意等的。
+  const asyncQueue = createAsyncQueue(config.maxAsync)
+  const runQueued = (start) => asyncQueue.run(start)
+  const asyncQueueStats = () => asyncQueue.stats()
 
   async function deliverAsyncReport(ctx, job, text) {
     const agent = findAgentFor(ctx, job.sessionId)
@@ -2193,7 +2236,7 @@ export function apply(ctx, config = {}) {
           delivery: 'pending',
         }
         beginAsyncJob(job)
-        perform()
+        runQueued(() => perform())
           .then((value) =>
             settleAsyncJob(ctx, job, {
               status: value.status,
@@ -2220,6 +2263,7 @@ export function apply(ctx, config = {}) {
           hand: 'agy',
           sessionId: job.sessionId,
           note: '跑完会把结果投回这个会话，期间你可以接着干别的',
+          queue: asyncQueueStats(),
         })
       }
 
@@ -2602,7 +2646,7 @@ export function apply(ctx, config = {}) {
           delivery: 'pending',
         }
         beginAsyncJob(job)
-        perform()
+        runQueued(() => perform())
           .then((value) =>
             settleAsyncJob(ctx, job, {
               status: value.status,
@@ -2629,6 +2673,7 @@ export function apply(ctx, config = {}) {
           hand: 'codex',
           sessionId: job.sessionId,
           note: '跑完会把结果投回这个会话，期间你可以接着干别的',
+          queue: asyncQueueStats(),
         })
       }
 
@@ -2788,12 +2833,13 @@ export function apply(ctx, config = {}) {
         })
       }
 
-      const proc = runProcess(claudeBin, argv, {
-        cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
-        timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
-        onChunk: run.push,
-        onSpawn: (child) => trackProc(run.id, child, run),
-      })
+      const spawn = () =>
+        runProcess(claudeBin, argv, {
+          cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
+          timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
+          onChunk: run.push,
+          onSpawn: (child) => trackProc(run.id, child, run),
+        })
 
       // 异步：立刻返回 jobId，跑完把结果投回调用方会话
       if (args?.async === true) {
@@ -2808,8 +2854,9 @@ export function apply(ctx, config = {}) {
           delivery: 'pending',
         }
         beginAsyncJob(job)
-        proc
-          .then((result) => {
+        runQueued(async () => {
+          const result = await spawn()
+          {
             const value = settle(result)
             return settleAsyncJob(ctx, job, {
               status: value.status,
@@ -2820,26 +2867,27 @@ export function apply(ctx, config = {}) {
               error: value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
               jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
             })
-          })
-          .catch((error) =>
-            settleAsyncJob(ctx, job, {
-              status: 'ERROR',
-              ms: Date.now() - job.startedAt,
-              exitCode: null,
-              excerpt: '',
-              error: String(error?.message ?? error),
-            }),
-          )
+          }
+        }).catch((error) =>
+          settleAsyncJob(ctx, job, {
+            status: 'ERROR',
+            ms: Date.now() - job.startedAt,
+            exitCode: null,
+            excerpt: '',
+            error: String(error?.message ?? error),
+          }),
+        )
         return clean({
           status: 'RUNNING',
           jobId: job.id,
           hand: 'claude',
           sessionId: job.sessionId,
           note: '跑完会把结果投回这个会话，期间你可以接着干别的',
+          queue: asyncQueueStats(),
         })
       }
 
-      return settle(await proc)
+      return settle(await spawn())
     },
   })
 
@@ -3028,7 +3076,7 @@ export function apply(ctx, config = {}) {
           delivery: 'pending',
         }
         beginAsyncJob(job)
-        perform()
+        runQueued(() => perform())
           .then((value) =>
             settleAsyncJob(ctx, job, {
               status: value.status,
@@ -3055,6 +3103,7 @@ export function apply(ctx, config = {}) {
           hand: 'opencode',
           sessionId: job.sessionId,
           note: '跑完会把结果投回这个会话，期间你可以接着干别的',
+          queue: asyncQueueStats(),
         })
       }
 
