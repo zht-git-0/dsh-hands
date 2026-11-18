@@ -2,7 +2,18 @@
 // 只测「会话 id 怎么取 / 回传正文长什么样 / 时长怎么算」，
 // 真跑一个手下要走模型，不放在这里。
 import assert from 'node:assert/strict'
-import { asyncReportText, findAgentFor, formatDuration, sessionIdFromExec } from '../index.js'
+import { asyncReportText, findAgentFor, formatDuration, pickBin, sessionIdFromExec } from '../index.js'
+
+// ── 0) 二进制路径：按顺序找第一个真实存在的 ──────────────────────────────────
+{
+  const real = process.execPath // 一定存在
+  assert.equal(pickBin(['/definitely/not/here', real, '/also/not']), real, '跳过不存在的，用存在的')
+  assert.equal(pickBin([real]), real, '单个也能用')
+  assert.equal(pickBin(['/nope/a', '/nope/b']), '/nope/b', '都不存在就返回最后一个（报错信息里有个像样路径）')
+  assert.equal(pickBin([]), '', '空数组不炸')
+  assert.equal(pickBin([undefined, '', '  ', real]), real, '空值会被跳过')
+  console.log('0) pickBin ok')
+}
 
 // ── 1) 从工具的第二个参数里拿会话 id ────────────────────────────────────────
 {

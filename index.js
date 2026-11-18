@@ -583,6 +583,23 @@ const DEFAULT_CODEX_BIN =
 
 // ── 异步回传：纯函数，单独导出给 acp/test-async.mjs 测 ──────────────────
 
+// 二进制会搬家：重装、升级、开机后目录没了（2026-11-18 实测：~/.local/bin 整个不见了）。
+// 按顺序试，第一个真实存在的就用；一个都不在就返回最后一个，
+// 至少报错信息里那个路径是「本来该在的位置」，不是瞎编的。
+export function pickBin(candidates) {
+  const list = (Array.isArray(candidates) ? candidates : [candidates])
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+  for (const candidate of list) {
+    try {
+      if (fs.existsSync(candidate)) return candidate
+    } catch {
+      // 权限问题就当它不存在，继续试下一个
+    }
+  }
+  return list[list.length - 1] || ''
+}
+
 export function sessionIdFromExec(exec) {
   try {
     const agent = exec && (exec.agent || exec.caller || exec.agentRef)
@@ -659,10 +676,31 @@ export function asyncReportText(job, summary) {
 }
 
 export function apply(ctx, config = {}) {
-  const bin = config.agyBin || config.bin || DEFAULT_BIN
-  const codexBin = config.codexBin || DEFAULT_CODEX_BIN
-  const claudeBin = config.claudeBin || DEFAULT_CLAUDE_BIN
-  const opencodeBin = config.opencodeBin || DEFAULT_OPENCODE_BIN
+  // 四家的二进制：配置 > 本机常用安装位置 > 默认值，取第一个真实存在的。
+  // 这样重装 / 目录被清之后不用改配置也能自己找回来。
+  const NODE_DIR = process.env.DSH_NODE_DIR || 'D:\\Program\\environment\\nodejs'
+  const bin = pickBin([
+    config.agyBin,
+    config.bin,
+    path.join(NODE_DIR, 'agy.exe'),
+    DEFAULT_BIN,
+  ])
+  const codexBin = pickBin([
+    config.codexBin,
+    path.join(NODE_DIR, 'codex.cmd'),
+    DEFAULT_CODEX_BIN,
+  ])
+  const claudeBin = pickBin([
+    config.claudeBin,
+    path.join(NODE_DIR, 'claude.exe'),
+    path.join(os.homedir(), '.local', 'bin', 'claude.exe'),
+    DEFAULT_CLAUDE_BIN,
+  ])
+  const opencodeBin = pickBin([
+    config.opencodeBin,
+    path.join(NODE_DIR, 'opencode.cmd'),
+    DEFAULT_OPENCODE_BIN,
+  ])
   const defaultTimeout = Number(config.timeoutSec) || 900
   const skipPermissions = config.skipPermissions !== false
   // ACP 开关（第 6 步）：默认空 = 四家全走 CLI，和以前完全一样。
