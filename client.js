@@ -2143,10 +2143,8 @@ window.__ModuleLoader__.load({
             const hand = String(agent.hand || '');
             const running = Number(agent.running) || 0;
             const tone = running > 0 ? 'running' : toneOf(agent);
-            const sub = [
-              t('v2TodayTimes', { n: Number(agent.today) || 0 }),
-              running > 0 ? t('v2RunningN', { n: running }) : t('v2Idle'),
-            ].join(' · ');
+            // 今日次数不再显示（爸爸 2026-11-18 23:52 说去掉），只留在跑/空闲
+            const sub = running > 0 ? t('v2RunningN', { n: running }) : t('v2Idle');
             return h(
               'button',
               {
@@ -2563,10 +2561,6 @@ window.__ModuleLoader__.load({
         chips.push({ key: 'cwd', text: lastPathPart(row.cwd), title: String(row.cwd) });
       }
       if (row?.model) chips.push({ key: 'model', text: String(row.model), title: String(row.model) });
-      chips.push({
-        key: 'today',
-        text: t('v2Today', { n: Number(row?.today ?? turns.length) || 0 }),
-      });
       return h(
         'div',
         { className: 'dsh-hands-v2-threadHead' },
@@ -2598,32 +2592,6 @@ window.__ModuleLoader__.load({
               'div',
               { className: 'dsh-hands-v2-threadName' },
               row?.name || fallbackName || t('v2PickSession'),
-            ),
-          ),
-          h(
-            'div',
-            { className: 'dsh-hands-v2-threadActions' },
-            h(
-              'button',
-              {
-                type: 'button',
-                className: 'dsh-hands-v2-btn',
-                disabled: !running || busy,
-                title: t('v2Cancel'),
-                onClick: onCancel,
-              },
-              action?.pending === 'cancel' ? t('v2Cancelling') : t('v2Cancel'),
-            ),
-            h(
-              'button',
-              {
-                type: 'button',
-                className: 'dsh-hands-v2-btn',
-                disabled: !finished || busy,
-                title: t('v2Rerun'),
-                onClick: onRerun,
-              },
-              action?.pending === 'rerun' ? t('v2Rerunning') : t('v2Rerun'),
             ),
           ),
         ),
