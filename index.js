@@ -581,6 +581,83 @@ const DEFAULT_CODEX_BIN =
     ? path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'OpenAI', 'Codex', 'bin', 'codex.exe')
     : 'codex'
 
+// ── 异步回传：纯函数，单独导出给 acp/test-async.mjs 测 ──────────────────
+
+export function sessionIdFromExec(exec) {
+  try {
+    const agent = exec && (exec.agent || exec.caller || exec.agentRef)
+    if (agent && agent.session) {
+      const sid = agent.session.id || agent.session.sessionId
+      if (typeof sid === 'string' && sid) return sid
+    }
+    if (agent && typeof agent === 'object') {
+      for (const key of ['sessionId', 'id']) {
+        if (typeof agent[key] === 'string' && agent[key]) return agent[key]
+      }
+    }
+  } catch {
+    // 拿不到就返回空串，调用方按「不能回传」处理，绝不猜一个会话投进去
+  }
+  return ''
+}
+
+export function findAgentFor(ctx, sessionId) {
+  const raw = String(sessionId || '').trim()
+  if (!raw) return undefined
+  let agents
+  try {
+    agents = (ctx && typeof ctx.get === 'function' ? ctx.get('agents') : undefined) || ctx?.agents
+  } catch {
+    return undefined
+  }
+  if (!agents || typeof agents.get !== 'function') return undefined
+  const candidates = [raw]
+  if (raw.startsWith('session-')) candidates.push(raw.slice('session-'.length))
+  else candidates.push(`session-${raw}`)
+  for (const candidate of candidates) {
+    try {
+      const agent = agents.get(candidate)
+      if (agent) return agent
+    } catch {
+      // 试下一个写法
+    }
+  }
+  return undefined
+}
+
+export function formatDuration(ms) {
+  const total = Math.max(0, Number(ms) || 0)
+  const minutes = Math.floor(total / 60000)
+  const seconds = Math.round((total % 60000) / 1000)
+  if (minutes >= 60) return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`
+  return minutes ? `${minutes} 分 ${seconds} 秒` : `${seconds} 秒`
+}
+
+// 回传正文：状态行 + 派活原文 + 结果摘要 + 完整日志位置，一段纯文本
+export function asyncReportText(job, summary) {
+  const lines = []
+  lines.push(`【手下回传】${job.hand} · ${job.tool}`)
+  lines.push(
+    `状态 ${summary.status} · 用时 ${formatDuration(summary.ms)} · 退出码 ${
+      summary.exitCode === undefined || summary.exitCode === null ? '—' : summary.exitCode
+    }${summary.cost ? ` · 花费 $${Number(summary.cost).toFixed(4)}` : ''}`,
+  )
+  const prompt = String(job.prompt || '').trim()
+  if (prompt) lines.push(`派活：${prompt.length > 160 ? `${prompt.slice(0, 160)}…` : prompt}`)
+  const body = String(summary.excerpt || '').trim()
+  lines.push('')
+  lines.push(body ? (body.length > 1800 ? `${body.slice(0, 1800)}…` : body) : '（没有输出）')
+  if (summary.jobFile) {
+    lines.push('')
+    lines.push(`完整日志：${summary.jobFile}`)
+  }
+  if (summary.error) {
+    lines.push('')
+    lines.push(`错误：${String(summary.error).slice(0, 400)}`)
+  }
+  return lines.join('\n')
+}
+
 export function apply(ctx, config = {}) {
   const bin = config.agyBin || config.bin || DEFAULT_BIN
   const codexBin = config.codexBin || DEFAULT_CODEX_BIN
@@ -1144,8 +1221,55 @@ export function apply(ctx, config = {}) {
     return true
   }
 
-  function runningList() {
-    const now = Date.now()
+  // ── 异步派活：先返回 jobId，跑完把结果投回调用方会话 ──────────────────────
+  // 依据（2026-11-18 核实）：dsh-qq-bridge/lib/host.js:1505
+  //   await agent.followup({ id, role:'user', content:[{type:'text',text}], source:{kind} })
+  // 能把消息投进会话并把它唤醒；同文件 :1502 的注释说得很清楚：
+  //   **必须 await**，漏接 reject 会让整个 DSH 宿主退出。
+  // 会话句柄的取法见 host.js:939-952：id 有带/不带 `session-` 前缀两种写法，双向试。
+
+  const ASYNC_JOBS = new Map() // jobId -> 内存状态（切片 A：重启即丢，落盘的记录在 hands-log 里）
+
+  async function deliverAsyncReport(ctx, job, text) {
+    const agent = findAgentFor(ctx, job.sessionId)
+    if (!agent || typeof agent.followup !== 'function') {
+      job.delivery = 'no-agent'
+      job.deliveryError = job.sessionId ? '会话已经不在（agent 找不到）' : '派活时没拿到会话 id'
+      return false
+    }
+    try {
+      // ⚠️ 必须 await：reject 不接住会让整个 DSH 宿主退出
+      await agent.followup({
+        id: `${job.id}-report`,
+        role: 'user',
+        content: [{ type: 'text', text }],
+        source: { kind: 'plugin:hands' },
+      })
+      job.delivery = 'sent'
+      job.deliveredAt = new Date().toISOString()
+      return true
+    } catch (error) {
+      job.delivery = 'failed'
+      job.deliveryError = String(error?.message ?? error).slice(0, 400)
+      return false
+    }
+  }
+
+  // 收尾：写 end 记录 + 把回传投回会话。两条路都走这里，行为一致。
+  async function settleAsyncJob(ctx, job, summary) {
+    job.status = summary.status
+    job.ms = summary.ms
+    job.endedAt = new Date().toISOString()
+    try {
+      await deliverAsyncReport(ctx, job, asyncReportText(job, summary))
+    } catch (error) {
+      job.delivery = 'failed'
+      job.deliveryError = String(error?.message ?? error).slice(0, 400)
+    }
+    return job
+  }
+
+  function runningList() {    const now = Date.now()
     return [...RUNNING.values()]
       .map((entry) =>
         clean({
@@ -1759,10 +1883,11 @@ export function apply(ctx, config = {}) {
       schema: { type: 'object', properties: { status: { type: 'string' }, response: { type: 'string' } } },
       render: (_args, value) => asText(value),
     },
-    async execute(args) {
+    async execute(args, exec) {
       const prompt = String(args?.prompt ?? '')
       if (!prompt.trim()) throw new Error('prompt is required')
 
+      const perform = async () => {
       const argv = ['-p', prompt, '--output-format', 'stream-json']
 
       // 三种定位会话的方式，优先级：conversationId > session 名字 > continueLast
@@ -1854,6 +1979,52 @@ export function apply(ctx, config = {}) {
         out.session = label
       }
       return out
+      }
+
+      // 异步：立刻返回 jobId，跑完把结果投回调用方会话
+      if (args?.async === true) {
+        const job = {
+          id: run.id,
+          hand: 'agy',
+          tool: 'agy_run',
+          sessionId: sessionIdFromExec(exec),
+          prompt,
+          startedAt: Date.now(),
+          status: 'RUNNING',
+          delivery: 'pending',
+        }
+        ASYNC_JOBS.set(job.id, job)
+        perform()
+          .then((value) =>
+            settleAsyncJob(ctx, job, {
+              status: value.status,
+              ms: (Number(value.durationSec) || 0) * 1000,
+              exitCode: value.exitCode,
+              excerpt: value.response,
+              cost: null,
+              error: value.status === 'SUCCESS' || value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
+              jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
+            }),
+          )
+          .catch((error) =>
+            settleAsyncJob(ctx, job, {
+              status: 'ERROR',
+              ms: Date.now() - job.startedAt,
+              exitCode: null,
+              excerpt: '',
+              error: String(error?.message ?? error),
+            }),
+          )
+        return clean({
+          status: 'RUNNING',
+          jobId: job.id,
+          hand: 'agy',
+          sessionId: job.sessionId,
+          note: '跑完会把结果投回这个会话，期间你可以接着干别的',
+        })
+      }
+
+      return perform()
     },
   })
 
@@ -2102,6 +2273,11 @@ export function apply(ctx, config = {}) {
           description: 'Permission level. Default read-only; use workspace-write for implementation work.',
         },
         model: { type: 'string', description: 'Model id override, e.g. "gpt-6.1-sol". Omit to use ~/.codex/config.toml.' },
+        async: {
+          type: 'boolean',
+          description:
+            'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
+        },
         timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900).' },
       },
       required: ['prompt'],
@@ -2119,10 +2295,11 @@ export function apply(ctx, config = {}) {
       },
       render: (_args, value) => asText(value),
     },
-    async execute(args) {
+    async execute(args, exec) {
       const prompt = String(args?.prompt ?? '')
       if (!prompt.trim()) throw new Error('prompt is required')
 
+      const perform = async () => {
       const index = loadCodexIndex()
       const name = args?.session ? String(args.session) : ''
       const known = name && index[name] ? index[name].id : null
@@ -2211,6 +2388,52 @@ export function apply(ctx, config = {}) {
         tokens: tokens ?? null,
         ms: result.ms,
       })
+      }
+
+      // 异步：立刻返回 jobId，跑完把结果投回调用方会话
+      if (args?.async === true) {
+        const job = {
+          id: run.id,
+          hand: 'codex',
+          tool: 'codex_run',
+          sessionId: sessionIdFromExec(exec),
+          prompt,
+          startedAt: Date.now(),
+          status: 'RUNNING',
+          delivery: 'pending',
+        }
+        ASYNC_JOBS.set(job.id, job)
+        perform()
+          .then((value) =>
+            settleAsyncJob(ctx, job, {
+              status: value.status,
+              ms: value.ms,
+              exitCode: value.exitCode,
+              excerpt: value.response,
+              cost: null,
+              error: value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
+              jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
+            }),
+          )
+          .catch((error) =>
+            settleAsyncJob(ctx, job, {
+              status: 'ERROR',
+              ms: Date.now() - job.startedAt,
+              exitCode: null,
+              excerpt: '',
+              error: String(error?.message ?? error),
+            }),
+          )
+        return clean({
+          status: 'RUNNING',
+          jobId: job.id,
+          hand: 'codex',
+          sessionId: job.sessionId,
+          note: '跑完会把结果投回这个会话，期间你可以接着干别的',
+        })
+      }
+
+      return perform()
     },
   })
 
@@ -2273,6 +2496,11 @@ export function apply(ctx, config = {}) {
           enum: ['plan', 'acceptEdits', 'auto'],
           description: 'plan = read-only reasoning (default); acceptEdits lets it edit files; auto also runs commands.',
         },
+        async: {
+          type: 'boolean',
+          description:
+            'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
+        },
         timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900).' },
       },
       required: ['prompt'],
@@ -2290,7 +2518,7 @@ export function apply(ctx, config = {}) {
       },
       render: (_args, value) => asText(value),
     },
-    async execute(args) {
+    async execute(args, exec) {
       const prompt = String(args?.prompt ?? '')
       if (!prompt.trim()) throw new Error('prompt is required')
 
@@ -2320,49 +2548,99 @@ export function apply(ctx, config = {}) {
         cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
         model: args?.model || '',
       })
-      const result = await runProcess(claudeBin, argv, {
+
+      // 收尾：解析 + 落记录。同步和异步两条路共用，行为必须一致。
+      const settle = (result) => {
+        const raw = String(result.stdout ?? '')
+        const err = String(result.stderr ?? '')
+        const parsed = collectClaude(raw)
+
+        const sid = parsed?.session_id || known || ''
+        if (name && sid) {
+          index[name] = { id: sid, cwd: args?.cwd || '', updated: new Date().toISOString() }
+          writeJson(CLAUDE_INDEX, index)
+        }
+
+        const usage = parsed?.usage || {}
+        const answer = parsed
+          ? String(parsed.result ?? '')
+          : String(run.entry.output || '').slice(-4000) || err.slice(-4000) || raw.slice(-4000)
+        const verdict = outcome(result, parsed?.is_error ? 'ERROR' : undefined)
+        finishDispatch(run, {
+          status: verdict.status,
+          ok: verdict.ok,
+          ms: result.ms,
+          exitCode: result.code,
+          excerpt: answer || err.slice(-1200) || raw.slice(-1200),
+          error: result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
+          conversationId: sid,
+          tokens: usage,
+          cost: parsed?.total_cost_usd,
+        })
+        return clean({
+          status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
+          response: answer,
+          sessionId: sid,
+          resumed: !!known,
+          cost: parsed?.total_cost_usd ?? null,
+          cacheRead: usage.cache_read_input_tokens ?? null,
+          exitCode: result.code,
+          ms: result.ms,
+        })
+      }
+
+      const proc = runProcess(claudeBin, argv, {
         cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
         timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
         onChunk: run.push,
         onSpawn: (child) => trackProc(run.id, child, run),
       })
 
-      const raw = String(result.stdout ?? '')
-      const err = String(result.stderr ?? '')
-      const parsed = collectClaude(raw)
-
-      const sid = parsed?.session_id || known || ''
-      if (name && sid) {
-        index[name] = { id: sid, cwd: args?.cwd || '', updated: new Date().toISOString() }
-        writeJson(CLAUDE_INDEX, index)
+      // 异步：立刻返回 jobId，跑完把结果投回调用方会话
+      if (args?.async === true) {
+        const job = {
+          id: run.id,
+          hand: 'claude',
+          tool: 'claude_run',
+          sessionId: sessionIdFromExec(exec),
+          prompt,
+          startedAt: Date.now(),
+          status: 'RUNNING',
+          delivery: 'pending',
+        }
+        ASYNC_JOBS.set(job.id, job)
+        proc
+          .then((result) => {
+            const value = settle(result)
+            return settleAsyncJob(ctx, job, {
+              status: value.status,
+              ms: value.ms,
+              exitCode: value.exitCode,
+              excerpt: value.response,
+              cost: value.cost,
+              error: value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
+              jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
+            })
+          })
+          .catch((error) =>
+            settleAsyncJob(ctx, job, {
+              status: 'ERROR',
+              ms: Date.now() - job.startedAt,
+              exitCode: null,
+              excerpt: '',
+              error: String(error?.message ?? error),
+            }),
+          )
+        return clean({
+          status: 'RUNNING',
+          jobId: job.id,
+          hand: 'claude',
+          sessionId: job.sessionId,
+          note: '跑完会把结果投回这个会话，期间你可以接着干别的',
+        })
       }
 
-      const usage = parsed?.usage || {}
-      const answer = parsed
-        ? String(parsed.result ?? '')
-        : String(run.entry.output || '').slice(-4000) || err.slice(-4000) || raw.slice(-4000)
-      const verdict = outcome(result, parsed?.is_error ? 'ERROR' : undefined)
-      finishDispatch(run, {
-        status: verdict.status,
-        ok: verdict.ok,
-        ms: result.ms,
-        exitCode: result.code,
-        excerpt: answer || err.slice(-1200) || raw.slice(-1200),
-        error: result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
-        conversationId: sid,
-        tokens: usage,
-        cost: parsed?.total_cost_usd,
-      })
-      return clean({
-        status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
-        response: answer,
-        sessionId: sid,
-        resumed: !!known,
-        cost: parsed?.total_cost_usd ?? null,
-        cacheRead: usage.cache_read_input_tokens ?? null,
-        exitCode: result.code,
-        ms: result.ms,
-      })
+      return settle(await proc)
     },
   })
 
@@ -2397,6 +2675,11 @@ export function apply(ctx, config = {}) {
           type: 'boolean',
           description: 'Auto-approve permissions that are not explicitly denied. Required for it to actually write files.',
         },
+        async: {
+          type: 'boolean',
+          description:
+            'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
+        },
         timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900).' },
       },
       required: ['prompt'],
@@ -2414,7 +2697,7 @@ export function apply(ctx, config = {}) {
       },
       render: (_args, value) => asText(value),
     },
-    async execute(args) {
+    async execute(args, exec) {
       const prompt = String(args?.prompt ?? '')
       if (!prompt.trim()) throw new Error('prompt is required')
 
@@ -2436,6 +2719,7 @@ export function apply(ctx, config = {}) {
         model,
       })
 
+      const perform = async () => {
       // 开关命中就先走 ACP；拿不到结果（异常 / ok=false）runAcpTurn 已记日志并返回 null，
       // 下面的 CLI 分支就是那次回退，行为与以前完全一致。
       const acp = useAcp('opencode')
@@ -2530,6 +2814,52 @@ export function apply(ctx, config = {}) {
         exitCode: acp ? undefined : result.code,
         ms: acp ? acp.ms : result.ms,
       })
+      }
+
+      // 异步：立刻返回 jobId，跑完把结果投回调用方会话
+      if (args?.async === true) {
+        const job = {
+          id: run.id,
+          hand: 'opencode',
+          tool: 'opencode_run',
+          sessionId: sessionIdFromExec(exec),
+          prompt,
+          startedAt: Date.now(),
+          status: 'RUNNING',
+          delivery: 'pending',
+        }
+        ASYNC_JOBS.set(job.id, job)
+        perform()
+          .then((value) =>
+            settleAsyncJob(ctx, job, {
+              status: value.status,
+              ms: value.ms,
+              exitCode: value.exitCode,
+              excerpt: value.response,
+              cost: value.cost,
+              error: value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
+              jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
+            }),
+          )
+          .catch((error) =>
+            settleAsyncJob(ctx, job, {
+              status: 'ERROR',
+              ms: Date.now() - job.startedAt,
+              exitCode: null,
+              excerpt: '',
+              error: String(error?.message ?? error),
+            }),
+          )
+        return clean({
+          status: 'RUNNING',
+          jobId: job.id,
+          hand: 'opencode',
+          sessionId: job.sessionId,
+          note: '跑完会把结果投回这个会话，期间你可以接着干别的',
+        })
+      }
+
+      return perform()
     },
   })
 
@@ -2771,6 +3101,11 @@ export function apply(ctx, config = {}) {
         session: { type: 'string', description: 'Stable name for this line of work; the same name resumes the same conversation.' },
         write: { type: 'boolean', description: 'Allow file edits. Default false (read-only).' },
         model: { type: 'string', description: 'Model override where supported (codex / claude).' },
+        async: {
+          type: 'boolean',
+          description:
+            'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
+        },
         timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900).' },
       },
       required: ['to', 'prompt'],
