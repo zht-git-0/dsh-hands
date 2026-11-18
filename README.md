@@ -176,12 +176,42 @@ node acp/test-acp-map.mjs       # ACP update → 文本映射（含 replay 丢�
 node acp/test-cancel.mjs        # 进程树击杀
 ```
 
-## 调度上还没解决的问题（已知）
+## 异步派活（`async: true`）
+
+四个手下工具都能异步：传 `async: true` 就**立刻**返回 `{status:'RUNNING', jobId, sessionId}`，
+这一轮不用等；它跑完由插件把结果投回调用方会话（`agent.followup`，`source.kind = 'plugin:hands'`）。
+
+```
+我派活 ──▶ 立刻拿到 jobId ──▶ 我继续干别的
+                                  │
+                       子进程跑完 ──▶ 写 hands-log ──▶ 回传投回会话（新的一轮）
+```
+
+**回传正文是契约，不是散文**（`asyncReportText()`）：
+
+```
+【手下回传】claude · claude_run
+状态 OK · 用时 6 分 29 秒 · 退出码 0 · 花费 $0.0492
+派活：只回复两个字：收到
+
+收到
+
+完整日志：C:\Users\...\hands-jobs\<jobId>.txt
+```
+
+- **落盘**：`~/.dsh/hands-async.json` 记每个 job 的状态和正文。
+- **不重投**：`delivery === 'sent'` 的直接跳过 —— 一次派活只有一条回传。
+- **不丢**：DSH 重启后 4 秒对账一次：没跑完的标 `ORPHAN`（进程已经没了），
+  跑完但没投出去的**补投一次**。
+- **拿不到会话就拒绝**：`exec.agent` 里取不到 session id 时，回传会标 `no-agent` 而不是猜一个会话投进去。
+- 已知代价：正在跑的任务随进程一起没，只能标孤儿，不能续跑（ACP/CLI 都是子进程，没有断点）。
+
+
 
 - **改完插件要手动 toggle 一次**才生效：`set_bundle false` 再 `true`。HMR 对 link 类型的 bundle 不生效。
 - **超时时只能拿到部分输出**，没有"卡在哪一步"的信息。要靠 `timeoutSec` 给足；右侧栏会保留超时前收到的最后一段。
 - **实时输出有上限**：内存里每次派发最多留 20 万字符，落盘只留最后 2 万字符，供右侧栏历史详情使用。
-- **右侧栏面板依赖 DSH 自带的右侧栏服务**（`sidebarRightTabs` / `sidebarRight`）。太旧的 DSH 没有这两个服务时面板不会注册，也不会报错。
+- **顶层面板依赖 `layout` 服务**（`main` 槽 + `sidebar.panellist`）；太旧的 DSH 没有它时面板不注册，也不报错。
 - 四个工具的 schema 都常驻在上下文里，每个 description 都在吃 token。细节该往 README 挪。
 
 ## 两个坑（踩过）
