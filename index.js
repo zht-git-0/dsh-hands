@@ -1624,6 +1624,44 @@ export function apply(ctx, config = {}) {
               const entry = id ? fullEntry(id) : null
               return send(entry ? 200 : 404, entry ? { entry } : { error: 'not found' })
             }
+            // 异步派活的观测口：内存里正在跑的 + 落盘状态里最近的。
+            // 排查「投没投出去 / 是不是孤儿」就看这里，不用去翻日志。
+            if (u.pathname === '/dsh-hands/async') {
+              const limit = Math.max(1, Math.min(200, Number(u.searchParams.get('n') || '50')))
+              const live = [...ASYNC_JOBS.values()].map((job) =>
+                clean({
+                  id: job.id,
+                  hand: job.hand,
+                  tool: job.tool,
+                  status: job.status,
+                  sessionId: job.sessionId,
+                  startedAt: job.startedAt,
+                  ms: job.ms,
+                  delivery: job.delivery,
+                  deliveryError: job.deliveryError,
+                }),
+              )
+              const persisted = Object.values(asyncState.jobs || {})
+                .sort((a, b) => Number(b.startedAt || 0) - Number(a.startedAt || 0))
+                .slice(0, limit)
+                .map((record) =>
+                  clean({
+                    id: record.id,
+                    hand: record.hand,
+                    tool: record.tool,
+                    status: record.status,
+                    sessionId: record.sessionId,
+                    startedAt: record.startedAt,
+                    endedAt: record.endedAt,
+                    ms: record.ms,
+                    delivery: record.delivery,
+                    deliveryError: record.deliveryError,
+                    deliveredAt: record.deliveredAt,
+                    hasReport: !!record.report,
+                  }),
+                )
+              return send(200, { live, persisted, counts: { live: live.length, persisted: persisted.length } })
+            }
             if (u.pathname === '/dsh-hands/stream') {
               if (res.destroyed || res.writableEnded) return
               res.writeHead(200, {
