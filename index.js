@@ -10,6 +10,7 @@ import {
   collectOpencode,
   createLiveView,
 } from './stream.js'
+import { createAcpSessionPool } from './acp/session-pool.mjs'
 
 export const name = 'hands'
 export const inject = ['tools', 'webServer']
@@ -1804,7 +1805,69 @@ export function apply(ctx, config = {}) {
     })
   }
 
+  // ── ACP 常驻会话（可选，config.acpPersist）──────────────────────────────
+  // 同一个 hand + cwd + 会话 id 复用同一个子进程；关掉时仍走一次一进程。
+  const acpPool = config.acpPersist
+    ? createAcpSessionPool({ idleMs: Math.max(60_000, Number(config.acpIdleMs) || 600_000) })
+    : null
+
+  ctx.effect(() => {
+    if (!acpPool) return () => {}
+    const timer = setInterval(() => {
+      try {
+        acpPool.sweep()
+      } catch {
+        // 清理失败不影响插件
+      }
+    }, 60_000)
+    timer.unref?.()
+    return () => {
+      clearInterval(timer)
+      acpPool.closeAll()
+    }
+  }, 'dsh-hands: acp session pool')
+
   async function runAcpTurn(hand, { run, prompt, cwd, model, timeoutSec, sessionId, write }) {
+    // 要写文件时逐次问面板；只读直接拒（不弹授权）
+    const permission = write ? (params) => askPermission(hand, params) : 'reject'
+
+    // 常驻会话：复用进程，live 更新通过 slot.holder 转到当轮 run
+    if (acpPool) {
+      const workdir = path.resolve(cwd || process.cwd())
+      const key = `${hand}|${workdir}|${sessionId || 'new'}`
+      try {
+        const slot = await acpPool.acquire(key, async (current) => {
+          const { createAcpSession } = await import('./acp/runner.mjs')
+          return createAcpSession({
+            agent: hand,
+            cwd: workdir,
+            permission,
+            onUpdate: (update) => current.holder.current?.feedEvent?.(update),
+          })
+        })
+        slot.holder.current = run
+        const started = Date.now()
+        const value = await slot.handle.prompt(prompt, {
+          model: model || undefined,
+          timeoutMs: (Number(timeoutSec) || defaultTimeout) * 1000,
+        })
+        acpPool.touch(key)
+        return {
+          ok: true,
+          text: String(value?.text || ''),
+          stopReason: value?.stopReason ?? null,
+          sessionId: slot.handle.sessionId,
+          usage: value?.usage ?? null,
+          ms: Date.now() - started,
+          resumed: true,
+        }
+      } catch (error) {
+        acpPool.release(key)
+        noteAcpFallback(hand, run.id, error?.message ?? error)
+        return null
+      }
+    }
+
     try {
       const { runAcpTask } = await import('./acp/runner.mjs')
       const result = await runAcpTask({
@@ -1814,8 +1877,7 @@ export function apply(ctx, config = {}) {
         model: model || undefined,
         sessionId: sessionId || undefined,
         timeoutMs: (Number(timeoutSec) || defaultTimeout) * 1000,
-        // 要写文件时逐次问面板；只读直接拒（不弹授权）
-        permission: write ? (params) => askPermission(hand, params) : 'reject',
+        permission,
         onUpdate: (update) => run.feedEvent?.(update),
       })
       if (result?.ok) return result
