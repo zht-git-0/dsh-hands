@@ -2913,9 +2913,11 @@ export function apply(ctx, config = {}) {
           finished: { type: 'boolean' },
           timedOut: { type: 'boolean' },
           waitedMs: { type: 'number' },
-          ms: { type: ['number', 'null'] },
-          delivery: { type: ['string', 'null'] },
-          deliveryError: { type: ['string', 'null'] },
+          // DSH 的 JsonSchema 校验不接受 type 数组，这里只用单类型；
+          // 缺失值在 execute 里归一成 0 / 空串。
+          ms: { type: 'number' },
+          delivery: { type: 'string' },
+          deliveryError: { type: 'string' },
           excerpt: { type: 'string' },
           queue: { type: 'object' },
         },
@@ -2942,9 +2944,9 @@ export function apply(ctx, config = {}) {
         finished,
         timedOut: !finished,
         waitedMs: Date.now() - started,
-        ms: record.ms ?? null,
-        delivery: record.delivery ?? null,
-        deliveryError: record.deliveryError ?? null,
+        ms: Number(record.ms) || 0,
+        delivery: String(record.delivery || ''),
+        deliveryError: String(record.deliveryError || ''),
         excerpt: String(record.report || '').slice(0, 4000),
         queue: asyncQueueStats(),
       })
