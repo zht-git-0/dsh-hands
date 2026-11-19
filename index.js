@@ -2848,6 +2848,75 @@ export function apply(ctx, config = {}) {
     },
   })
 
+  // ── hands_wait：等一个异步任务结束（可选超时）────────────────────────────
+  // 异步派活适合「派完就干别的」；但有时就是要等这一个结果再往下走。
+  // 这里轮询落盘状态（跟 settleAsyncJob 同一份 asyncState），不阻塞事件循环。
+  ctx.tools.register({
+    name: 'hands_wait',
+    description:
+      'Wait for an async hand job (dispatched with async:true) to finish, then return its final status and short report. ' +
+      'Use it only when you truly need this one result before continuing; otherwise keep working and the report ' +
+      'will be delivered back to the session automatically.',
+    parameters: {
+      type: 'object',
+      properties: {
+        jobId: { type: 'string', description: 'The jobId returned by an async:true dispatch.' },
+        timeoutMs: {
+          type: 'number',
+          description: 'Max wait in milliseconds (default 600000, max 1800000). On timeout returns finished:false.',
+        },
+      },
+      required: ['jobId'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          jobId: { type: 'string' },
+          hand: { type: 'string' },
+          status: { type: 'string' },
+          finished: { type: 'boolean' },
+          timedOut: { type: 'boolean' },
+          waitedMs: { type: 'number' },
+          ms: { type: ['number', 'null'] },
+          delivery: { type: ['string', 'null'] },
+          deliveryError: { type: ['string', 'null'] },
+          excerpt: { type: 'string' },
+          queue: { type: 'object' },
+        },
+        required: ['jobId', 'status', 'finished', 'timedOut', 'waitedMs'],
+      },
+      render: (_args, value) => asText(value),
+    },
+    async execute(args) {
+      const id = String(args?.jobId ?? '').trim()
+      if (!id) throw new Error('jobId is required')
+      const timeoutMs = Math.max(1000, Math.min(1_800_000, Number(args?.timeoutMs) || 600_000))
+      const started = Date.now()
+      let record = asyncState.jobs?.[id]
+      if (!record) throw new Error(`没有这个 job：${id}`)
+      while (!record.endedAt && Date.now() - started < timeoutMs) {
+        await new Promise((resolve) => setTimeout(resolve, 500))
+        record = asyncState.jobs?.[id] || record
+      }
+      const finished = !!record.endedAt
+      return clean({
+        jobId: id,
+        hand: String(record.hand || ''),
+        status: finished ? String(record.status || 'UNKNOWN') : 'RUNNING',
+        finished,
+        timedOut: !finished,
+        waitedMs: Date.now() - started,
+        ms: record.ms ?? null,
+        delivery: record.delivery ?? null,
+        deliveryError: record.deliveryError ?? null,
+        excerpt: String(record.report || '').slice(0, 4000),
+        queue: asyncQueueStats(),
+      })
+    },
+  })
+
   // ── claude（Claude Code CLI）：架构规划这个手下 ───────────────────────────
 
   const CLAUDE_INDEX = path.join(os.homedir(), '.dsh', 'claude-sessions.json')
