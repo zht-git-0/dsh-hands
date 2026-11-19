@@ -2290,7 +2290,10 @@ window.__ModuleLoader__.load({
               { className: 'dsh-hands-v2-list' },
               groups.map((group) => {
                 const folderKey = group.cwd || '__none__';
-                const isCollapsed = collapsed[folderKey] === true;
+                const anyRunning = group.sessions.some((row) => toneOf(row) === 'running');
+                // 有活儿的文件夹永远展开：跑着的东西藏在折叠里等于没有
+                const isCollapsed = !anyRunning && collapsed[folderKey] === true;
+                const folderTone = anyRunning ? 'running' : toneOf(group.sessions[0] || {});
                 const children = [
                   h(
                     'button',
@@ -2309,6 +2312,11 @@ window.__ModuleLoader__.load({
                       { className: 'dsh-hands-v2-folderName' },
                       group.label || t('v2NoFolder') || '未分组',
                     ),
+                    h('span', {
+                      className: 'dsh-hands-v2-dot',
+                      'data-tone': folderTone,
+                      style: { '--tone-color': TONE_COLOR[folderTone] || TONE_COLOR.unknown },
+                    }),
                     h('span', { className: 'dsh-hands-v2-folderCount' }, String(group.sessions.length)),
                   ),
                 ];
