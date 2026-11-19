@@ -58,6 +58,11 @@ window.__ModuleLoader__.load({
       statusCancelled: 'Cancelled',
       statusUnknown: 'Unknown',
       exitCode: 'Exit code',
+      asyncTasks: 'Async',
+      asyncRunning: 'running',
+      asyncQueued: 'queued',
+      asyncRetrying: 'delivery retry',
+      asyncFailed: 'delivery failed',
       loadFailed: 'Could not read the dispatch feed.',
       showMore: 'Show older',
       justNow: 'just now',
@@ -123,6 +128,11 @@ window.__ModuleLoader__.load({
       statusCancelled: '已取消',
       statusUnknown: '未知',
       exitCode: '退出码',
+      asyncTasks: '异步',
+      asyncRunning: '跑着',
+      asyncQueued: '排队',
+      asyncRetrying: '回传重试',
+      asyncFailed: '回传失败',
       loadFailed: '读取调度输出失败。',
       showMore: '显示更早',
       justNow: '刚刚',
@@ -1524,6 +1534,7 @@ window.__ModuleLoader__.load({
     const V2_CSS = `
       .dsh-hands-v2{display:flex;flex-direction:column;flex:auto;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}
       .dsh-hands-v2-body{display:flex;flex:1;min-width:0;min-height:0;overflow:hidden}
+      .dsh-hands-asyncbar{flex:none;display:flex;align-items:center;gap:6px;margin:6px 8px 0;padding:3px 8px;border-radius:999px;background:var(--dsw-alias-bg-secondary);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       .dsh-hands-v2-error{flex:none;margin:6px 8px 0;padding:5px 8px;border:.5px solid var(--dsw-alias-state-error-primary);border-radius:var(--dsw-radius-sm);color:var(--dsw-alias-state-error-primary);font-size:11px;line-height:16px;overflow-wrap:anywhere}
       .dsh-hands-v2,.dsh-hands-v2 *{box-sizing:border-box}
       .dsh-hands-v2-rail{flex:none;display:flex;flex-direction:column;width:clamp(168px,24%,220px);min-width:0;padding:8px 6px;border-right:.5px solid var(--dsw-alias-border-l2);overflow:hidden}
@@ -2665,6 +2676,57 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // 异步任务状态条：独立轮询 /dsh-hands/async，不往 store 里塞东西。
+    // 只在有活儿/有异常时显示，平时不占地方（爸爸嫌「今日次数」那种常驻数字碍眼）。
+    function HandsAsyncBar(props) {
+      const t = props.t || ((key) => key);
+      const [snap, setSnap] = React.useState(null);
+
+      React.useEffect(() => {
+        let alive = true;
+        let timer = null;
+        const load = async () => {
+          try {
+            const res = await fetch('/dsh-hands/async?n=20', { cache: 'no-store' });
+            if (res.ok) {
+              const data = await res.json();
+              if (alive) setSnap(data);
+            }
+          } catch {
+            // 拿不到就不显示，不能因为状态条把面板搞挂
+          }
+          if (alive) timer = setTimeout(load, 5000);
+        };
+        load();
+        return () => {
+          alive = false;
+          if (timer) clearTimeout(timer);
+        };
+      }, []);
+
+      if (!snap) return null;
+      const live = Array.isArray(snap.live) ? snap.live : [];
+      const persisted = Array.isArray(snap.persisted) ? snap.persisted : [];
+      const running = live.filter((job) => job && job.status === 'RUNNING').length;
+      const retrying = persisted.filter((job) => job && job.delivery === 'retrying').length;
+      const failed = persisted.filter((job) => job && job.delivery === 'failed').length;
+      const waiting = Number(snap.queue?.waiting) || 0;
+      if (!running && !waiting && !retrying && !failed) return null;
+      const bits = [];
+      if (running) bits.push(`${t('asyncRunning')} ${running}`);
+      if (waiting) bits.push(`${t('asyncQueued')} ${waiting}`);
+      if (retrying) bits.push(`${t('asyncRetrying')} ${retrying}`);
+      if (failed) bits.push(`${t('asyncFailed')} ${failed}`);
+      return h(
+        'div',
+        {
+          className: 'dsh-hands-asyncbar',
+          title: '异步派活队列：跑着/排队/回传重试/回传失败',
+        },
+        `${t('asyncTasks') || '异步'}：${bits.join(' · ')}`,
+      );
+    }
+
     function HandsPaneV2(props) {
       const t = props.t || ((key) => key);
       const store = props.store;
@@ -2723,6 +2785,7 @@ window.__ModuleLoader__.load({
         meta.error
           ? h('div', { className: 'dsh-hands-v2-error' }, `${t('loadFailed')} ${meta.error}`)
           : null,
+        h(HandsAsyncBar, { key: 'async', t }),
         h(
           'div',
           { className: 'dsh-hands-v2-body' },

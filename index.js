@@ -1828,7 +1828,13 @@ export function apply(ctx, config = {}) {
                     hasReport: !!record.report,
                   }),
                 )
-              return send(200, { live, persisted, counts: { live: live.length, persisted: persisted.length } })
+              return send(200, {
+                live,
+                persisted,
+                counts: { live: live.length, persisted: persisted.length },
+                // 队列水位：面板据此显示「排队 N / 跑着 M」，不用自己猜
+                queue: asyncQueueStats(),
+              })
             }
             if (u.pathname === '/dsh-hands/stream') {
               if (res.destroyed || res.writableEnded) return
