@@ -1279,7 +1279,11 @@ export function apply(ctx, config = {}) {
   }
 
   function startDispatch(fields = {}) {
-    const id = `${Date.now().toString(36)}-${(++runSeq).toString(36)}`
+    // 允许调用方预分配 id：异步派活要先拿到 jobId 才能立刻返回，
+    // 而真正的 startDispatch 在队列排到后才执行。
+    const id = fields.id
+      ? String(fields.id)
+      : `${Date.now().toString(36)}-${(++runSeq).toString(36)}`
     const startedMs = Date.now()
     const startedAt = new Date(startedMs).toISOString()
     const session = String(fields.session || '')
@@ -2336,7 +2340,8 @@ export function apply(ctx, config = {}) {
       const prompt = String(args?.prompt ?? '')
       if (!prompt.trim()) throw new Error('prompt is required')
 
-      const perform = async () => {
+      // runId：异步派活时由外层预分配，保证 jobId 和日志 id 是同一个
+      const perform = async (runId = '') => {
       const argv = ['-p', prompt, '--output-format', 'stream-json']
 
       // 三种定位会话的方式，优先级：conversationId > session 名字 > continueLast
@@ -2357,6 +2362,7 @@ export function apply(ctx, config = {}) {
 
       const timeoutSec = Number(args?.timeoutSec) || defaultTimeout
       const run = startDispatch({
+        id: runId || undefined,
         hand: 'agy',
         tool: 'agy_run',
         prompt,
@@ -2427,13 +2433,20 @@ export function apply(ctx, config = {}) {
         saveIndex(idx)
         out.session = label
       }
+      // /cancel 杀掉进程后只会得到一个失败码；回传要如实写 CANCELLED
+      if (run.cancelled) {
+        out.status = 'CANCELLED'
+        out.cancelled = true
+      }
       return out
       }
 
       // 异步：立刻返回 jobId，跑完把结果投回调用方会话
       if (args?.async === true) {
+        // perform 还没跑，先预分配 id，日志里的 run id 和 jobId 保持一致
+        const jobId = crypto.randomUUID()
         const job = {
-          id: run.id,
+          id: jobId,
           hand: 'agy',
           tool: 'agy_run',
           sessionId: sessionIdFromExec(exec),
@@ -2443,13 +2456,13 @@ export function apply(ctx, config = {}) {
           delivery: 'pending',
         }
         beginAsyncJob(job)
-        runQueued(() => perform(), job.id)
+        runQueued(() => perform(jobId), job.id)
           .then((value) => {
             // 排队阶段就被取消了：perform 没跑，直接按 CANCELLED 收尾
-            if (settleCancelledQueuedJob(ctx, job, run, value)) return job
+            if (settleCancelledQueuedJob(ctx, job, null, value)) return job
             return settleAsyncJob(ctx, job, {
-              // /cancel 杀掉进程后 CLI 那条路只会返回失败码；回传要如实写 CANCELLED
-              status: run.cancelled ? 'CANCELLED' : value.status,
+              // 取消的判定在 perform 里做（run 在那边），这里直接用结果
+              status: value.status,
               ms: (Number(value.durationSec) || 0) * 1000,
               exitCode: value.exitCode,
               excerpt: value.response,
@@ -2752,7 +2765,8 @@ export function apply(ctx, config = {}) {
       const prompt = String(args?.prompt ?? '')
       if (!prompt.trim()) throw new Error('prompt is required')
 
-      const perform = async () => {
+      // runId：异步派活时由外层预分配，保证 jobId 和日志 id 是同一个
+      const perform = async (runId = '') => {
       const index = loadCodexIndex()
       const name = args?.session ? String(args.session) : ''
       const known = name && index[name] ? index[name].id : null
@@ -2783,6 +2797,7 @@ export function apply(ctx, config = {}) {
       }
 
       const run = startDispatch({
+        id: runId || undefined,
         hand: 'codex',
         tool: 'codex_run',
         prompt,
@@ -2833,10 +2848,12 @@ export function apply(ctx, config = {}) {
       })
 
       return clean({
-        status: result.timedOut ? 'TIMEOUT' : collected.failed || result.code !== 0 ? 'ERROR' : 'OK',
+        // /cancel 杀掉进程后只会得到一个失败码；回传要如实写 CANCELLED
+        status: run.cancelled ? 'CANCELLED' : result.timedOut ? 'TIMEOUT' : collected.failed || result.code !== 0 ? 'ERROR' : 'OK',
         response: answer || err.slice(-4000) || raw.slice(-4000),
         sessionId: sid || '',
         resumed,
+        cancelled: !!run.cancelled,
         exitCode: result.code,
         tokens: tokens ?? null,
         ms: result.ms,
@@ -2845,8 +2862,10 @@ export function apply(ctx, config = {}) {
 
       // 异步：立刻返回 jobId，跑完把结果投回调用方会话
       if (args?.async === true) {
+        // perform 还没跑，先预分配 id，日志里的 run id 和 jobId 保持一致
+        const jobId = crypto.randomUUID()
         const job = {
-          id: run.id,
+          id: jobId,
           hand: 'codex',
           tool: 'codex_run',
           sessionId: sessionIdFromExec(exec),
@@ -2856,18 +2875,18 @@ export function apply(ctx, config = {}) {
           delivery: 'pending',
         }
         beginAsyncJob(job)
-        runQueued(() => perform(), job.id)
+        runQueued(() => perform(jobId), job.id)
           .then((value) => {
             // 排队阶段就被取消了：perform 没跑，直接按 CANCELLED 收尾
-            if (settleCancelledQueuedJob(ctx, job, run, value)) return job
+            if (settleCancelledQueuedJob(ctx, job, null, value)) return job
             return settleAsyncJob(ctx, job, {
-              // /cancel 杀掉进程后 CLI 那条路只会返回失败码；回传要如实写 CANCELLED
-              status: run.cancelled ? 'CANCELLED' : value.status,
+              // 取消的判定在 perform 里做（run 在那边），这里直接用结果
+              status: value.status,
               ms: value.ms,
               exitCode: value.exitCode,
               excerpt: value.response,
               cost: null,
-              error: value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
+              error: value.status === 'OK' || value.status === 'CANCELLED' ? '' : String(value.response || '').slice(0, 400),
               jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
             })
           })
