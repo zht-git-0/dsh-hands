@@ -1653,7 +1653,10 @@ window.__ModuleLoader__.load({
       .dsh-hands-blockReasoning{border-left:2px solid var(--dsw-alias-border-l2);padding-left:8px;color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:17px}
       .dsh-hands-blockReasoningHead{cursor:pointer;color:var(--dsw-alias-label-tertiary);font-size:10.5px;line-height:15px;user-select:none}
       .dsh-hands-blockReasoningBody{margin-top:4px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
-      .dsh-hands-blockTool{display:flex;align-items:center;gap:6px;min-width:0;padding:2px 6px;border:.5px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-secondary);color:var(--dsw-alias-label-secondary);font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:10.5px;line-height:16px}
+      .dsh-hands-blockTool{min-width:0;padding:2px 6px;border:.5px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-secondary);color:var(--dsw-alias-label-secondary);font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:10.5px;line-height:16px}
+      .dsh-hands-blockToolHead{display:flex;align-items:center;gap:6px;min-width:0;cursor:pointer;list-style:none}
+      .dsh-hands-blockToolHead::-webkit-details-marker{display:none}
+      .dsh-hands-blockToolBody{margin:4px 0 2px;padding:6px 8px;border-radius:6px;background:color-mix(in srgb,var(--dsw-alias-label-primary) 6%,transparent);max-height:30vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font:inherit;font-size:10.5px;line-height:16px}
       .dsh-hands-blockToolName{flex:none;font-weight:600}
       .dsh-hands-blockToolDetail{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.85}
       .dsh-hands-blockToolState{flex:none;opacity:.85}
@@ -2511,21 +2514,34 @@ window.__ModuleLoader__.load({
         { className: 'dsh-hands-blocks' },
         blocks.map((block, index) => {
           if (block.kind === 'tool') {
-            return h(
-              'div',
-              {
-                key: `b${index}`,
-                className: 'dsh-hands-blockTool',
-                'data-status': block.status || '',
-              },
-              h('span', { className: 'dsh-hands-blockToolIcon' }, '⚙'),
-              h('span', { className: 'dsh-hands-blockToolName' }, block.name || 'tool'),
+            const head = [
+              h('span', { key: 'icon', className: 'dsh-hands-blockToolIcon' }, '⚙'),
+              h('span', { key: 'name', className: 'dsh-hands-blockToolName' }, block.name || 'tool'),
               block.detail
-                ? h('span', { className: 'dsh-hands-blockToolDetail', title: block.detail }, block.detail)
+                ? h(
+                    'span',
+                    { key: 'detail', className: 'dsh-hands-blockToolDetail', title: block.detail },
+                    block.detail,
+                  )
                 : null,
               stateText(block.status)
-                ? h('span', { className: 'dsh-hands-blockToolState' }, stateText(block.status))
+                ? h('span', { key: 'state', className: 'dsh-hands-blockToolState' }, stateText(block.status))
                 : null,
+            ];
+            const output = String(block.output || '');
+            // 有输出的工具（改文件/跑命令）：默认折叠，点开看内容
+            if (!output) {
+              return h(
+                'div',
+                { key: `b${index}`, className: 'dsh-hands-blockTool', 'data-status': block.status || '' },
+                h('div', { className: 'dsh-hands-blockToolHead' }, head),
+              );
+            }
+            return h(
+              'details',
+              { key: `b${index}`, className: 'dsh-hands-blockTool', 'data-status': block.status || '' },
+              h('summary', { className: 'dsh-hands-blockToolHead' }, head),
+              h('pre', { className: 'dsh-hands-blockToolBody' }, output),
             );
           }
           if (block.kind === 'reasoning') {

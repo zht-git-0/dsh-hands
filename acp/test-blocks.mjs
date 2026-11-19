@@ -135,4 +135,56 @@ const feed = (view, hand, events) => {
   console.log('7) 前端分块组件 ok')
 }
 
+// ── 8) 工具输出去重：同 id 只留一块，running→completed 更新原块 ────────────
+{
+  const view = createLiveView('opencode')
+  const blocks = feed(view, 'opencode', [
+    { type: 'tool_use', part: { id: 't1', tool: 'write', state: { input: { path: 'a.txt' }, status: 'running' } } },
+    {
+      type: 'tool_use',
+      part: { id: 't1', tool: 'write', state: { input: { path: 'a.txt' }, status: 'completed', output: '写入 12 行' } },
+    },
+  ])
+  const tools = blocks.filter((b) => b.kind === 'tool')
+  assert.equal(tools.length, 1, '同一个 tool id 不产生两个块')
+  assert.equal(tools[0].status, 'completed')
+  assert.equal(tools[0].output, '写入 12 行', '工具输出挂在块上')
+  console.log('8) 工具输出去重 ok')
+}
+
+// ── 9) codex 命令输出也进块 ────────────────────────────────────────────────
+{
+  const view = createLiveView('codex')
+  const blocks = feed(view, 'codex', [
+    { type: 'item.started', item: { id: 'c1', type: 'command_execution', command: 'ls' } },
+    {
+      type: 'item.completed',
+      item: { id: 'c1', type: 'command_execution', command: 'ls', exit_code: 0, aggregated_output: 'a.txt\nb.txt' },
+    },
+  ])
+  const tools = blocks.filter((b) => b.kind === 'tool')
+  assert.equal(tools.length, 1)
+  assert.equal(tools[0].output, 'a.txt\nb.txt')
+  assert.equal(tools[0].status, 'exit 0')
+  console.log('9) codex 命令输出 ok')
+}
+
+// ── 10) claude tool_result 回填 + 2000 字截断 ──────────────────────────────
+{
+  const view = createLiveView('claude')
+  const long = 'y'.repeat(3000)
+  const blocks = feed(view, 'claude', [
+    {
+      type: 'stream_event',
+      event: { type: 'content_block_start', content_block: { type: 'tool_use', id: 'tu1', name: 'Write', input: { file_path: 'a.txt' } } },
+    },
+    { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tu1', content: long }] } },
+  ])
+  const tool = blocks.find((b) => b.kind === 'tool')
+  assert.ok(tool, 'tool 块存在')
+  assert.equal(tool.status, 'completed')
+  assert.equal(tool.output.length, 2000, '输出截断到 2000')
+  console.log('10) claude tool_result 回填 ok')
+}
+
 console.log('ok')

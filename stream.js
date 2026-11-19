@@ -158,13 +158,35 @@ export function createLiveView(hand) {
     }
     pushBlock({ kind: 'reasoning', text: trimBlockText(chunk) })
   }
-  const pushToolBlock = (name, detail, status) => {
+  // 工具块带输出：修改文件类工具的内容放 output，前端默认折叠。
+  // 同一个工具（同 id）running→completed 会更新原块，不会冒出两个。
+  const findToolBlock = (id) => {
+    if (!id) return null
+    for (let i = blocks.length - 1; i >= 0; i -= 1) {
+      const block = blocks[i]
+      if (block.kind === 'tool' && block.toolId === id) return block
+    }
+    return null
+  }
+  const pushToolBlock = (name, detail, status, output = '', id = '') => {
     const tool = String(name || 'tool').trim().slice(0, 80) || 'tool'
+    const detailText = String(detail || '').trim().slice(0, 200)
+    const outputText = String(output || '').slice(-2000)
+    const existing = findToolBlock(String(id || ''))
+    if (existing) {
+      if (tool) existing.name = tool
+      if (detailText) existing.detail = detailText
+      if (status) existing.status = String(status)
+      if (outputText) existing.output = outputText
+      return
+    }
     pushBlock({
       kind: 'tool',
       name: tool,
-      detail: String(detail || '').trim().slice(0, 200),
+      detail: detailText,
       status: String(status || ''),
+      ...(id ? { toolId: String(id) } : {}),
+      ...(outputText ? { output: outputText } : {}),
     })
   }
 
@@ -217,7 +239,13 @@ export function createLiveView(hand) {
       const name = part.tool || part.name || ev.tool || 'tool'
       const detail = input.command || input.filePath || input.file_path || input.path || input.description || ''
       line(`→ ${name}${detail ? `: ${detail}` : ''}`)
-      pushToolBlock(name, detail, state.status || (state.error ? 'error' : ''))
+      pushToolBlock(
+        name,
+        detail,
+        state.status || (state.error ? 'error' : ''),
+        state.output,
+        String(part.id || state.id || ''),
+      )
       if (typeof state.output === 'string' && state.output.trim()) block(state.output)
       if (state.status === 'error' || state.error) line(`! ${state.error || 'tool error'}`)
       return
@@ -231,7 +259,7 @@ export function createLiveView(hand) {
     const item = ev.item
     if (ev.type === 'item.started' && item?.type === 'command_execution') {
       line(`$ ${item.command || ''}`.trim())
-      pushToolBlock('command', item.command)
+      pushToolBlock('command', item.command, '', '', item.id || '')
       return
     }
     if (ev.type === 'item.completed' && item) {
@@ -244,7 +272,13 @@ export function createLiveView(hand) {
         const output = asText(item.aggregated_output) || asText(item.output)
         if (output) block(output)
         if (item.exit_code !== undefined && item.exit_code !== 0) line(`! exit ${item.exit_code}`)
-        pushToolBlock('command', item.command, item.exit_code === undefined ? '' : `exit ${item.exit_code}`)
+        pushToolBlock(
+          'command',
+          item.command,
+          item.exit_code === undefined ? '' : `exit ${item.exit_code}`,
+          output,
+          item.id || '',
+        )
         return
       }
       if (item.type === 'file_change') {
@@ -273,7 +307,7 @@ export function createLiveView(hand) {
         const input = block.input || {}
         const detail = input.command || input.file_path || input.filePath || input.path || input.description || ''
         line(`→ ${block.name || 'tool'}${detail ? `: ${detail}` : ''}`)
-        pushToolBlock(block.name, detail)
+        pushToolBlock(block.name, detail, '', '', String(block.id || ''))
         return
       }
       if (event.type === 'content_block_start' && event.content_block?.type === 'thinking') {
@@ -309,11 +343,31 @@ export function createLiveView(hand) {
           const input = part.input || {}
           const detail = input.command || input.file_path || input.filePath || input.path || input.description || ''
           line(`→ ${part.name || 'tool'}${detail ? `: ${detail}` : ''}`)
-          pushToolBlock(part.name, detail)
+          pushToolBlock(part.name, detail, '', '', String(part.id || ''))
         }
       }
       claude.sawDelta = false
       claude.messageId = ''
+      return
+    }
+    // 工具结果：回填到对应 tool_use 的块里（默认折叠，不占正文）
+    if (ev.type === 'user' && ev.message) {
+      const content = Array.isArray(ev.message.content) ? ev.message.content : []
+      for (const part of content) {
+        if (part.type !== 'tool_result') continue
+        const textContent = Array.isArray(part.content)
+          ? part.content.map((item) => (typeof item?.text === 'string' ? item.text : '')).join('\n')
+          : (typeof part.content === 'string' ? part.content : '')
+        const output = String(textContent || '')
+        const id = String(part.tool_use_id || '')
+        const target = findToolBlock(id)
+        if (target) {
+          if (output) target.output = output.slice(-2000)
+          target.status = part.is_error ? 'failed' : 'completed'
+        } else if (output) {
+          pushToolBlock('result', '', part.is_error ? 'failed' : 'completed', output, id)
+        }
+      }
       return
     }
     if (ev.type === 'result') {
