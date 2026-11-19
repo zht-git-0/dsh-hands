@@ -1863,6 +1863,40 @@ export function apply(ctx, config = {}) {
                 queue: asyncQueueStats(),
               })
             }
+            // 面板内直接派活：复用 rerunInBackground 的后台跑法
+            if (u.pathname === '/dsh-hands/dispatch') {
+              if (req.method !== 'POST') return fail(405, 'POST only')
+              try {
+                const body = parseBody(await readBody(req))
+                const hand = String(body.hand || '').toLowerCase()
+                const prompt = String(body.prompt || '')
+                if (!HANDS[hand]) return fail(400, `unknown hand: ${hand || '(empty)'}`)
+                if (!prompt.trim()) return fail(400, 'prompt is required')
+                const run = rerunInBackground(
+                  {
+                    hand,
+                    tool: `${hand}_run`,
+                    write: body.write === true,
+                    session: String(body.session || ''),
+                    conversationId: String(body.conversationId || ''),
+                    cwd: String(body.cwd || ''),
+                    model: String(body.model || ''),
+                  },
+                  prompt,
+                )
+                if (!run) return fail(400, 'dispatch failed')
+                return send(200, {
+                  ok: true,
+                  id: run.id,
+                  hand,
+                  cwd: run.entry.cwd,
+                  sessionKey: run.entry.sessionKey,
+                })
+              } catch (e) {
+                return fail(500, e)
+              }
+            }
+
             // 打开某个会话的工作目录：只接受已知 cwd（防网页被诱导去开任意路径）
             if (u.pathname === '/dsh-hands/open-folder') {
               if (req.method !== 'POST') return fail(405, 'POST only')

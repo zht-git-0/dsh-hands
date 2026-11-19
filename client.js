@@ -67,6 +67,9 @@ window.__ModuleLoader__.load({
       searchSessions: 'Search sessions or folders',
       searchTurns: 'Search turns',
       searchEmpty: 'No matches',
+      composerPlaceholder: 'Dispatch a task to this hand… (Ctrl+Enter to send)',
+      composerWrite: 'allow file writes',
+      composerSend: 'Dispatch',
       asyncTasks: 'Async',
       asyncRunning: 'running',
       asyncQueued: 'queued',
@@ -151,6 +154,9 @@ window.__ModuleLoader__.load({
       searchSessions: '搜索会话或目录',
       searchTurns: '搜索轮次',
       searchEmpty: '没有匹配',
+      composerPlaceholder: '给这个手下派活…（Ctrl+Enter 发送）',
+      composerWrite: '允许改文件',
+      composerSend: '派活',
       asyncTasks: '异步',
       asyncRunning: '跑着',
       asyncQueued: '排队',
@@ -1658,6 +1664,13 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-list{flex:1;min-height:0;display:flex;flex-direction:column;gap:4px;padding:0 6px 8px;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain}
       .dsh-hands-v2-group{display:flex;flex-direction:column;gap:2px;min-width:0}
       .dsh-hands-v2-search{flex:none;padding:0 8px 6px}
+      .dsh-hands-v2-composer{flex:none;display:flex;flex-direction:column;gap:4px;padding:6px 8px;border-top:.5px solid var(--dsw-alias-border-l2)}
+      .dsh-hands-v2-composerInput{width:100%;box-sizing:border-box;resize:vertical;min-height:36px;max-height:120px;padding:5px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:11.5px;line-height:17px}
+      .dsh-hands-v2-composerInput::placeholder{color:var(--dsw-alias-label-tertiary)}
+      .dsh-hands-v2-composerInput:focus{outline:1px solid var(--dsw-alias-brand-primary);outline-offset:-1px}
+      .dsh-hands-v2-composerRow{display:flex;align-items:center;gap:8px;min-width:0}
+      .dsh-hands-v2-check{display:inline-flex;align-items:center;gap:4px;color:var(--dsw-alias-label-secondary);font-size:10.5px;line-height:15px;cursor:pointer}
+      .dsh-hands-v2-grow{flex:1}
       .dsh-hands-v2-searchInput{width:100%;box-sizing:border-box;padding:3px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:11px;line-height:16px}
       .dsh-hands-v2-searchInput::placeholder{color:var(--dsw-alias-label-tertiary)}
       .dsh-hands-v2-searchInput:focus{outline:1px solid var(--dsw-alias-brand-primary);outline-offset:-1px}
@@ -2941,6 +2954,10 @@ window.__ModuleLoader__.load({
       const turnsSlice = useStoreSlice(store, 'turns');
       const sessions = useStoreSlice(store, 'sessions');
       const [action, setAction] = React.useState({ pending: '', error: '' });
+      // 面板内派活：直接往当前会话派一轮后台任务
+      const [draft, setDraft] = React.useState('');
+      const [writeOn, setWriteOn] = React.useState(false);
+      const [sending, setSending] = React.useState(false);
 
       const row = findSession(sessions.sessions, sel.key);
       const turns = turnsSlice.turns;
@@ -2964,6 +2981,33 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         setAction({ pending: '', error: '' });
       }, [sel.key]);
+
+      const dispatchTask = async () => {
+        const prompt = draft.trim();
+        const hand = String(sel.hand || row?.hand || '');
+        if (!prompt || !hand || sending) return;
+        setSending(true);
+        try {
+          const response = await fetch(endpointOf('dsh-hands/dispatch'), {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json', accept: 'application/json' },
+            body: JSON.stringify({
+              hand,
+              prompt,
+              cwd: String(row?.cwd || ''),
+              session: String(row?.name || ''),
+              write: writeOn,
+            }),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (response.ok && data.ok) setDraft('');
+        } catch {
+          // 派活失败就保留草稿，让用户再点一次
+        }
+        setSending(false);
+        store.refreshAll();
+      };
 
       const runAction = async (kind) => {
         const id = String(activeTurn?.id || '');
@@ -3016,6 +3060,45 @@ window.__ModuleLoader__.load({
           more,
           selectedTurnId: sel.turnId,
         }),
+        h(
+          'div',
+          { className: 'dsh-hands-v2-composer' },
+          h('textarea', {
+            className: 'dsh-hands-v2-composerInput',
+            rows: 2,
+            value: draft,
+            placeholder: t('composerPlaceholder'),
+            onChange: (event) => setDraft(event.target.value),
+            onKeyDown: (event) => {
+              if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') dispatchTask();
+            },
+          }),
+          h(
+            'div',
+            { className: 'dsh-hands-v2-composerRow' },
+            h(
+              'label',
+              { className: 'dsh-hands-v2-check' },
+              h('input', {
+                type: 'checkbox',
+                checked: writeOn,
+                onChange: (event) => setWriteOn(event.target.checked),
+              }),
+              t('composerWrite'),
+            ),
+            h('span', { className: 'dsh-hands-v2-grow' }),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-hands-v2-btn',
+                disabled: sending || !draft.trim() || !sel.hand,
+                onClick: dispatchTask,
+              },
+              sending ? t('loading') : t('composerSend'),
+            ),
+          ),
+        ),
       );
     }
 
