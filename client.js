@@ -63,11 +63,19 @@ window.__ModuleLoader__.load({
       toolDone: 'done',
       toolFailed: 'failed',
       openFolder: 'Open folder',
+      usageHint: 'Session total',
+      searchSessions: 'Search sessions or folders',
+      searchTurns: 'Search turns',
+      searchEmpty: 'No matches',
       asyncTasks: 'Async',
       asyncRunning: 'running',
       asyncQueued: 'queued',
       asyncRetrying: 'delivery retry',
       asyncFailed: 'delivery failed',
+      asyncIdle: 'idle',
+      asyncEmpty: 'no async jobs',
+      asyncDelivery: 'delivery',
+      asyncHint: 'Async dispatch queue: running/queued/retrying/failed; click for details',
       loadFailed: 'Could not read the dispatch feed.',
       showMore: 'Show older',
       justNow: 'just now',
@@ -139,11 +147,19 @@ window.__ModuleLoader__.load({
       toolDone: '完成',
       toolFailed: '失败',
       openFolder: '打开文件夹',
+      usageHint: '整条会话累计',
+      searchSessions: '搜索会话或目录',
+      searchTurns: '搜索轮次',
+      searchEmpty: '没有匹配',
       asyncTasks: '异步',
       asyncRunning: '跑着',
       asyncQueued: '排队',
       asyncRetrying: '回传重试',
       asyncFailed: '回传失败',
+      asyncIdle: '空闲',
+      asyncEmpty: '没有异步任务',
+      asyncDelivery: '投递',
+      asyncHint: '异步派活队列：跑着/排队/回传重试/回传失败，点开看详情',
       loadFailed: '读取调度输出失败。',
       showMore: '显示更早',
       justNow: '刚刚',
@@ -317,6 +333,30 @@ window.__ModuleLoader__.load({
       }
       if (row.model) parts.push({ key: 'model', text: String(row.model) });
       return parts;
+    }
+
+    // 会话级用量汇总：把该会话所有轮次的 tokens / cost 加起来（只统计有值的轮次）。
+    function sumTurnUsage(turns) {
+      const rows = Array.isArray(turns) ? turns : [];
+      let input = 0;
+      let output = 0;
+      let cost = 0;
+      let hasTokens = false;
+      let hasCost = false;
+      for (const row of rows) {
+        const counts = tokenCounts(row?.tokens);
+        if (counts) {
+          hasTokens = true;
+          input += Number(counts.input) || 0;
+          output += Number(counts.output) || 0;
+        }
+        const value = Number(row?.cost);
+        if (Number.isFinite(value) && value > 0) {
+          hasCost = true;
+          cost += value;
+        }
+      }
+      return { input, output, cost, hasTokens, hasCost };
     }
 
     function turnIsRunning(turn) {
@@ -1576,7 +1616,17 @@ window.__ModuleLoader__.load({
     const V2_CSS = `
       .dsh-hands-v2{display:flex;flex-direction:column;flex:auto;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}
       .dsh-hands-v2-body{display:flex;flex:1;min-width:0;min-height:0;overflow:hidden}
-      .dsh-hands-asyncbar{flex:none;display:flex;align-items:center;gap:6px;margin:6px 8px 0;padding:3px 8px;border-radius:999px;background:var(--dsw-alias-bg-secondary);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      .dsh-hands-async{flex:none;display:flex;flex-direction:column;gap:2px;margin:6px 8px 0;min-width:0}
+      .dsh-hands-asyncbar{align-self:flex-start;display:inline-flex;align-items:center;gap:6px;max-width:100%;padding:3px 8px;border:0;border-radius:999px;background:var(--dsw-alias-bg-secondary);color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
+      .dsh-hands-asyncbar:hover{color:var(--dsw-alias-label-primary)}
+      .dsh-hands-asynclist{display:flex;flex-direction:column;gap:2px;margin-top:2px;padding:4px;border:.5px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);max-height:180px;overflow:auto}
+      .dsh-hands-asyncrow{display:flex;align-items:center;gap:6px;min-width:0;padding:2px 4px;border-radius:5px;font-size:10.5px;line-height:15px;color:var(--dsw-alias-label-secondary)}
+      .dsh-hands-asyncrowHand{flex:none;font-weight:600;color:var(--dsw-alias-label-primary)}
+      .dsh-hands-asyncrowStatus{flex:none;font-variant-numeric:tabular-nums}
+      .dsh-hands-asyncrowDelivery{flex:none;opacity:.85}
+      .dsh-hands-asyncrowId{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.6}
+      .dsh-hands-asyncrowError{flex:none;max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-state-error-primary)}
+      .dsh-hands-asyncrow[data-status=failed] .dsh-hands-asyncrowStatus{color:var(--dsw-alias-state-error-primary)}
       .dsh-hands-v2-error{flex:none;margin:6px 8px 0;padding:5px 8px;border:.5px solid var(--dsw-alias-state-error-primary);border-radius:var(--dsw-radius-sm);color:var(--dsw-alias-state-error-primary);font-size:11px;line-height:16px;overflow-wrap:anywhere}
       .dsh-hands-v2,.dsh-hands-v2 *{box-sizing:border-box}
       .dsh-hands-v2-rail{flex:none;display:flex;flex-direction:column;width:clamp(168px,24%,220px);min-width:0;padding:8px 6px;border-right:.5px solid var(--dsw-alias-border-l2);overflow:hidden}
@@ -1607,6 +1657,10 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-iconBtn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
       .dsh-hands-v2-list{flex:1;min-height:0;display:flex;flex-direction:column;gap:4px;padding:0 6px 8px;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain}
       .dsh-hands-v2-group{display:flex;flex-direction:column;gap:2px;min-width:0}
+      .dsh-hands-v2-search{flex:none;padding:0 8px 6px}
+      .dsh-hands-v2-searchInput{width:100%;box-sizing:border-box;padding:3px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:11px;line-height:16px}
+      .dsh-hands-v2-searchInput::placeholder{color:var(--dsw-alias-label-tertiary)}
+      .dsh-hands-v2-searchInput:focus{outline:1px solid var(--dsw-alias-brand-primary);outline-offset:-1px}
       .dsh-hands-v2-folder{display:flex;align-items:center;gap:2px;min-width:0;border-radius:6px}
       .dsh-hands-v2-folderToggle{display:flex;align-items:center;gap:5px;flex:1;min-width:0;padding:3px 4px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:16px;text-align:left;cursor:pointer;overflow:hidden}
       .dsh-hands-v2-folderToggle:hover{background:var(--dsw-alias-bg-secondary)}
@@ -2293,7 +2347,17 @@ window.__ModuleLoader__.load({
       const agents = useStoreSlice(store, 'agents');
       // 按工作目录折叠：默认全展开，状态只留在组件里（不持久化、不进 store）
       const [collapsed, setCollapsed] = React.useState({});
-      const groups = groupSessionsByCwd(slice.sessions);
+      // 会话/目录搜索：名字或 cwd 命中都算（目录命中时目录里所有会话都留下）
+      const [query, setQuery] = React.useState('');
+      const needle = query.trim().toLowerCase();
+      const visibleSessions = needle
+        ? slice.sessions.filter((row) => {
+            const name = String(row?.name || '').toLowerCase();
+            const cwd = String(row?.cwd || '').toLowerCase();
+            return name.includes(needle) || cwd.includes(needle);
+          })
+        : slice.sessions;
+      const groups = groupSessionsByCwd(visibleSessions);
       const current =
         agents.agents.find((agent) => String(agent?.hand || '') === String(slice.hand || '')) ||
         null;
@@ -2341,7 +2405,18 @@ window.__ModuleLoader__.load({
             '↻',
           ),
         ),
-        slice.sessions.length
+        h(
+          'div',
+          { className: 'dsh-hands-v2-search' },
+          h('input', {
+            type: 'search',
+            className: 'dsh-hands-v2-searchInput',
+            value: query,
+            placeholder: t('searchSessions'),
+            onChange: (event) => setQuery(event.target.value),
+          }),
+        ),
+        visibleSessions.length
           ? h(
               'div',
               { className: 'dsh-hands-v2-list' },
@@ -2444,7 +2519,11 @@ window.__ModuleLoader__.load({
           : h(
               'div',
               { className: 'dsh-hands-v2-hint' },
-              slice.phase === 'loading' ? t('loading') : t('v2NoSessions'),
+              slice.phase === 'loading'
+                ? t('loading')
+                : needle
+                  ? t('searchEmpty')
+                  : t('v2NoSessions'),
             ),
       );
     }
@@ -2792,7 +2871,7 @@ window.__ModuleLoader__.load({
     }
 
     function ThreadHead(props) {
-      const { t, mode, onBack, row, fallbackName, turns, activeTurn, action, onCancel, onRerun } =
+      const { t, mode, onBack, row, fallbackName, turns, activeTurn, action, onCancel, onRerun, usage } =
         props;
       const tone = toneOf(activeTurn || row || {});
       const running = turnIsRunning(activeTurn);
@@ -2803,6 +2882,15 @@ window.__ModuleLoader__.load({
         chips.push({ key: 'cwd', text: lastPathPart(row.cwd), title: String(row.cwd) });
       }
       if (row?.model) chips.push({ key: 'model', text: String(row.model), title: String(row.model) });
+      if (usage && usage.hasTokens) {
+        const tokens = usage.input && usage.output
+          ? `${Math.round(usage.input)}/${Math.round(usage.output)}`
+          : String(Math.round(usage.input + usage.output));
+        chips.push({ key: 'usageTokens', text: `${t('v2Tokens')} ${tokens}`, title: t('usageHint') });
+      }
+      if (usage && usage.hasCost) {
+        chips.push({ key: 'usageCost', text: `$${usage.cost.toFixed(2)}`, title: t('usageHint') });
+      }
       return h(
         'div',
         { className: 'dsh-hands-v2-threadHead' },
@@ -2859,6 +2947,18 @@ window.__ModuleLoader__.load({
       const activeTurn =
         turns.find((turn) => String(turn.id || '') === sel.turnId) || turns[0] || null;
       const more = sel.key ? store.turnsMore(sel.key) : false;
+      const usage = React.useMemo(() => sumTurnUsage(turns), [turns]);
+      // 轮次搜索：派活内容和结果摘要都能搜
+      const [query, setQuery] = React.useState('');
+      const needle = query.trim().toLowerCase();
+      const visibleTurns = needle
+        ? turns.filter((turn) =>
+            `${turn?.prompt || ''}\n${turn?.excerpt || ''}`.toLowerCase().includes(needle),
+          )
+        : turns;
+      React.useEffect(() => {
+        setQuery('');
+      }, [sel.key]);
 
       // 切会话时把上一轮的按钮状态和错误清掉，别让红字跟着跑。
       React.useEffect(() => {
@@ -2892,15 +2992,27 @@ window.__ModuleLoader__.load({
           turns,
           activeTurn,
           action,
+          usage,
           onCancel: () => runAction('cancel'),
           onRerun: () => runAction('rerun'),
         }),
         action.error ? h('div', { className: 'dsh-hands-v2-headError' }, action.error) : null,
+        h(
+          'div',
+          { className: 'dsh-hands-v2-search' },
+          h('input', {
+            type: 'search',
+            className: 'dsh-hands-v2-searchInput',
+            value: query,
+            placeholder: t('searchTurns'),
+            onChange: (event) => setQuery(event.target.value),
+          }),
+        ),
         h(TurnList, {
           store,
           t,
           sessionKey: sel.key,
-          turns,
+          turns: visibleTurns,
           more,
           selectedTurnId: sel.turnId,
         }),
@@ -2912,6 +3024,7 @@ window.__ModuleLoader__.load({
     function HandsAsyncBar(props) {
       const t = props.t || ((key) => key);
       const [snap, setSnap] = React.useState(null);
+      const [open, setOpen] = React.useState(false);
 
       React.useEffect(() => {
         let alive = true;
@@ -2942,7 +3055,11 @@ window.__ModuleLoader__.load({
       const retrying = persisted.filter((job) => job && job.delivery === 'retrying').length;
       const failed = persisted.filter((job) => job && job.delivery === 'failed').length;
       const waiting = Number(snap.queue?.waiting) || 0;
-      if (!running && !waiting && !retrying && !failed) return null;
+      const rows = [...live, ...persisted]
+        .filter((job, index, list) => job && job.id && list.findIndex((item) => item && item.id === job.id) === index)
+        .slice(0, 20);
+      // 没任何任务时不占地方；有任务才能点开详情
+      if (!running && !waiting && !retrying && !failed && !rows.length) return null;
       const bits = [];
       if (running) bits.push(`${t('asyncRunning')} ${running}`);
       if (waiting) bits.push(`${t('asyncQueued')} ${waiting}`);
@@ -2950,11 +3067,49 @@ window.__ModuleLoader__.load({
       if (failed) bits.push(`${t('asyncFailed')} ${failed}`);
       return h(
         'div',
-        {
-          className: 'dsh-hands-asyncbar',
-          title: '异步派活队列：跑着/排队/回传重试/回传失败',
-        },
-        `${t('asyncTasks') || '异步'}：${bits.join(' · ')}`,
+        { className: 'dsh-hands-async' },
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'dsh-hands-asyncbar',
+            'data-open': open ? 'true' : 'false',
+            title: t('asyncHint'),
+            onClick: () => setOpen((value) => !value),
+          },
+          `${t('asyncTasks') || '异步'}：${bits.join(' · ') || t('asyncIdle')} ${open ? '▾' : '▸'}`,
+        ),
+        open
+          ? h(
+              'div',
+              { className: 'dsh-hands-asynclist' },
+              rows.length
+                ? rows.map((job) =>
+                    h(
+                      'div',
+                      {
+                        key: String(job.id),
+                        className: 'dsh-hands-asyncrow',
+                        'data-status': String(job.status || '').toLowerCase(),
+                      },
+                      h('span', { className: 'dsh-hands-asyncrowHand' }, job.hand || '—'),
+                      h('span', { className: 'dsh-hands-asyncrowStatus' }, String(job.status || '')),
+                      h(
+                        'span',
+                        { className: 'dsh-hands-asyncrowDelivery' },
+                        `${t('asyncDelivery')} ${job.delivery || '—'}${
+                          job.deliveryAttempts ? `·${job.deliveryAttempts}` : ''
+                        }`,
+                      ),
+                      h('span', { className: 'dsh-hands-asyncrowId', title: String(job.id) }, String(job.id)),
+                      job.deliveryError
+                        ? h('span', { className: 'dsh-hands-asyncrowError' }, String(job.deliveryError))
+                        : null,
+                    ),
+                  )
+                : h('div', { className: 'dsh-hands-asyncrow' }, t('asyncEmpty')),
+            )
+          : null,
       );
     }
 
