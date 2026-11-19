@@ -72,6 +72,7 @@ window.__ModuleLoader__.load({
       v2PickSession: 'Select a conversation',
       v2PickHand: 'Select a hand',
       v2NoSessions: 'No conversations yet',
+      v2NoFolder: 'Ungrouped',
       v2NoTurns: 'No turns yet',
       v2Back: 'Back',
       v2Turns: '{n} turns',
@@ -142,6 +143,7 @@ window.__ModuleLoader__.load({
       v2PickSession: '选择一条会话',
       v2PickHand: '选择一个手下',
       v2NoSessions: '还没有会话',
+      v2NoFolder: '未分组',
       v2NoTurns: '还没有轮次',
       v2Back: '返回',
       v2Turns: '{n} 轮',
@@ -1564,6 +1566,12 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-iconBtn{flex:none;width:22px;height:22px;padding:0;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;line-height:1;cursor:pointer}
       .dsh-hands-v2-iconBtn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
       .dsh-hands-v2-list{flex:1;min-height:0;display:flex;flex-direction:column;gap:4px;padding:0 6px 8px;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain}
+      .dsh-hands-v2-group{display:flex;flex-direction:column;gap:2px;min-width:0}
+      .dsh-hands-v2-folder{display:flex;align-items:center;gap:5px;width:100%;padding:3px 6px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:16px;text-align:left;cursor:pointer;overflow:hidden}
+      .dsh-hands-v2-folder:hover{background:var(--dsw-alias-bg-secondary)}
+      .dsh-hands-v2-folderCaret{flex:none;width:10px;font-size:10px;opacity:.75}
+      .dsh-hands-v2-folderName{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+      .dsh-hands-v2-folderCount{flex:none;opacity:.7;font-variant-numeric:tabular-nums}
       .dsh-hands-v2-row{position:relative;flex:none;display:flex;flex-direction:column;gap:2px;width:100%;padding:6px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:inherit;font:inherit;text-align:left;cursor:pointer;overflow:hidden}
       .dsh-hands-v2-row:hover{background:var(--dsw-alias-interactive-bg-hover)}
       .dsh-hands-v2-row[data-active=true]{background:var(--dsw-alias-interactive-bg-hover)}
@@ -2140,6 +2148,33 @@ window.__ModuleLoader__.load({
       return parts[parts.length - 1] || text;
     }
 
+    // 会话按工作目录分组：先找项目目录，再找会话（爸爸要的索引方式）。
+    // 纯函数、不碰 React，acp/test-session-groups.mjs 直接测。
+    function groupSessionsByCwd(sessions) {
+      const map = new Map();
+      for (const row of Array.isArray(sessions) ? sessions : []) {
+        if (!row) continue;
+        const cwd = String(row.cwd || '').trim();
+        let group = map.get(cwd);
+        if (!group) {
+          group = { cwd, label: cwd ? lastPathPart(cwd) : '', sessions: [], latestAt: '' };
+          map.set(cwd, group);
+        }
+        group.sessions.push(row);
+        const at = String(row.lastAt || row.startedAt || '');
+        if (at > group.latestAt) group.latestAt = at;
+      }
+      const groups = [...map.values()];
+      for (const group of groups) {
+        group.sessions.sort((a, b) =>
+          String(b.lastAt || b.startedAt || '').localeCompare(String(a.lastAt || a.startedAt || '')),
+        );
+      }
+      // 最近有动静的项目排前面；会话之间同样按最近时间倒序。
+      groups.sort((a, b) => String(b.latestAt).localeCompare(String(a.latestAt)));
+      return groups;
+    }
+
     function HandsRail(props) {
       const { store, t, onPick } = props;
       const slice = useStoreSlice(store, 'agents');
@@ -2199,6 +2234,9 @@ window.__ModuleLoader__.load({
       const { store, t, mode, meta, onPick, onBack } = props;
       const slice = useStoreSlice(store, 'sessions');
       const agents = useStoreSlice(store, 'agents');
+      // 按工作目录折叠：默认全展开，状态只留在组件里（不持久化、不进 store）
+      const [collapsed, setCollapsed] = React.useState({});
+      const groups = groupSessionsByCwd(slice.sessions);
       const current =
         agents.agents.find((agent) => String(agent?.hand || '') === String(slice.hand || '')) ||
         null;
@@ -2250,39 +2288,70 @@ window.__ModuleLoader__.load({
           ? h(
               'div',
               { className: 'dsh-hands-v2-list' },
-              slice.sessions.map((row) => {
-                const key = String(row.key || row.sessionKey || '');
-                const tone = toneOf(row);
-                return h(
-                  'button',
-                  {
-                    key: key || String(row.name || ''),
-                    type: 'button',
-                    className: 'dsh-hands-v2-row',
-                    'data-active': slice.selectedKey && key === slice.selectedKey ? 'true' : 'false',
-                    onClick: () => onPick(String(row.hand || slice.hand || ''), key),
-                  },
+              groups.map((group) => {
+                const folderKey = group.cwd || '__none__';
+                const isCollapsed = collapsed[folderKey] === true;
+                const children = [
                   h(
-                    'span',
-                    { className: 'dsh-hands-v2-rowTop' },
-                    h('span', { className: 'dsh-hands-v2-rowName' }, row.name || t('noSession')),
+                    'button',
+                    {
+                      key: 'folder',
+                      type: 'button',
+                      className: 'dsh-hands-v2-folder',
+                      'data-collapsed': isCollapsed ? 'true' : 'false',
+                      title: group.cwd || undefined,
+                      onClick: () =>
+                        setCollapsed((prev) => ({ ...prev, [folderKey]: prev[folderKey] !== true })),
+                    },
+                    h('span', { className: 'dsh-hands-v2-folderCaret' }, isCollapsed ? '▸' : '▾'),
                     h(
                       'span',
-                      { className: 'dsh-hands-v2-rowTurns' },
-                      t('v2Turns', { n: Number(row.turns) || 0 }),
+                      { className: 'dsh-hands-v2-folderName' },
+                      group.label || t('v2NoFolder') || '未分组',
                     ),
-                    h('span', {
-                      className: 'dsh-hands-v2-dot',
-                      'data-tone': tone,
-                      style: { '--tone-color': TONE_COLOR[tone] || TONE_COLOR.unknown },
-                    }),
+                    h('span', { className: 'dsh-hands-v2-folderCount' }, String(group.sessions.length)),
                   ),
-                  h(
-                    'span',
-                    { className: 'dsh-hands-v2-rowTime' },
-                    formatTime(row.lastAt || row.startedAt, t) || '—',
-                  ),
-                );
+                ];
+                if (!isCollapsed) {
+                  for (const row of group.sessions) {
+                    const key = String(row.key || row.sessionKey || '');
+                    const tone = toneOf(row);
+                    children.push(
+                      h(
+                        'button',
+                        {
+                          key: key || String(row.name || ''),
+                          type: 'button',
+                          className: 'dsh-hands-v2-row',
+                          'data-active':
+                            slice.selectedKey && key === slice.selectedKey ? 'true' : 'false',
+                          onClick: () => onPick(String(row.hand || slice.hand || ''), key),
+                        },
+                        h(
+                          'span',
+                          { className: 'dsh-hands-v2-rowTop' },
+                          h('span', { className: 'dsh-hands-v2-rowName' }, row.name || t('noSession')),
+                          h(
+                            'span',
+                            { className: 'dsh-hands-v2-rowTurns' },
+                            t('v2Turns', { n: Number(row.turns) || 0 }),
+                          ),
+                          h('span', {
+                            className: 'dsh-hands-v2-dot',
+                            'data-tone': tone,
+                            style: { '--tone-color': TONE_COLOR[tone] || TONE_COLOR.unknown },
+                          }),
+                        ),
+                        h(
+                          'span',
+                          { className: 'dsh-hands-v2-rowTime' },
+                          formatTime(row.lastAt || row.startedAt, t) || '—',
+                        ),
+                      ),
+                    );
+                  }
+                }
+                return h('div', { key: folderKey, className: 'dsh-hands-v2-group' }, children);
               }),
             )
           : h(
@@ -3032,6 +3101,7 @@ window.__ModuleLoader__.load({
       Turn,
       HandsPage,
       HandsNavIcon,
+      groupSessionsByCwd,
       HandIcon,
       HAND_ICON_PATHS,
       MarkdownLite,
