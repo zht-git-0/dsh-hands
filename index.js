@@ -2315,6 +2315,11 @@ export function apply(ctx, config = {}) {
           items: { type: 'string' },
           description: 'Extra directories to add to the workspace.',
         },
+        async: {
+          type: 'boolean',
+          description:
+            'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
+        },
         timeoutSec: {
           type: 'number',
           description: 'Hard timeout in seconds. The process tree is killed when it expires.',
