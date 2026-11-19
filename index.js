@@ -721,6 +721,33 @@ export function planAsyncRecovery(state) {
   return { deliver, orphan }
 }
 
+// ── 回传重试：投不进去就退避重试，别把一次「会话正忙」当成永久失败 ──────────
+// 场景：异步任务跑完时父会话恰好繁忙 / agent 句柄瞬时拿不到，followup 会抛。
+// 只靠重启补投太重（要重启才有第二次机会），这里在进程内退避重试 3 次。
+export const ASYNC_DELIVERY_RETRY_DELAYS_MS = [30 * 1000, 90 * 1000, 240 * 1000]
+
+export function asyncDeliveryRetryDelay(attempt, delays = ASYNC_DELIVERY_RETRY_DELAYS_MS) {
+  const index = Number(attempt)
+  if (!Number.isInteger(index) || index < 0) return -1
+  const list = Array.isArray(delays) && delays.length ? delays : ASYNC_DELIVERY_RETRY_DELAYS_MS
+  if (index >= list.length) return -1
+  return Math.max(1000, Number(list[index]) || 0)
+}
+
+// 投递结果 → 下一次投递状态。纯函数，acp/test-async-retry.mjs 直接测。
+// attempts 记「已经重试过几次」：第一次失败后 attempts=1，下一次间隔取 delays[0]。
+export function nextAsyncDelivery(record, result, now = Date.now(), delays = ASYNC_DELIVERY_RETRY_DELAYS_MS) {
+  const attempts = Math.max(0, Number(record?.deliveryAttempts || 0))
+  if (result === 'sent') {
+    return { delivery: 'sent', attempts, retryAt: 0, delayMs: 0, exhausted: false }
+  }
+  const delayMs = asyncDeliveryRetryDelay(attempts, delays)
+  if (delayMs < 0) {
+    return { delivery: 'failed', attempts, retryAt: 0, delayMs: 0, exhausted: true }
+  }
+  return { delivery: 'retrying', attempts: attempts + 1, retryAt: now + delayMs, delayMs, exhausted: false }
+}
+
 // 并发闸门：同时最多跑 limit 个，多的排队（先进先出）。
 // 提成模块级是为了能单测：并发上限、排队顺序、失败不卡队列。
 export function createAsyncQueue(limit = 3) {
@@ -1410,18 +1437,78 @@ export function apply(ctx, config = {}) {
       saveAsyncState()
       return job
     }
+    await deliverAsyncWithRetry(ctx, job, record, text)
+    return job
+  }
+
+  // ── 回传的退避重试 ─────────────────────────────────────────────────────
+  // 状态机在 nextAsyncDelivery()（纯函数、可单测）；这里只管定时器和落盘。
+  const asyncDeliveryTimers = new Map() // jobId -> timer
+
+  function clearAsyncDeliveryTimer(id) {
+    const timer = asyncDeliveryTimers.get(id)
+    if (!timer) return
+    clearTimeout(timer)
+    asyncDeliveryTimers.delete(id)
+  }
+
+  function scheduleAsyncDeliveryRetry(ctx, id, delayMs) {
+    clearAsyncDeliveryTimer(id)
+    const timer = setTimeout(() => {
+      asyncDeliveryTimers.delete(id)
+      const record = asyncState.jobs[id]
+      if (!record || record.delivery === 'sent' || !record.report) return
+      const job = {
+        id: record.id,
+        hand: record.hand,
+        tool: record.tool,
+        sessionId: record.sessionId,
+        prompt: record.prompt,
+        delivery: 'pending',
+      }
+      deliverAsyncWithRetry(ctx, job, record, record.report).catch(() => {
+        // 重试失败也要如实落盘，别让状态卡在 retrying
+        record.delivery = 'failed'
+        record.deliveryError = record.deliveryError || '重试投递失败'
+        delete record.nextRetryAt
+        saveAsyncState()
+      })
+    }, Math.max(1000, Number(delayMs) || 0))
+    timer.unref?.()
+    asyncDeliveryTimers.set(id, timer)
+  }
+
+  // 投一次；失败就按退避排下一次。返回是否投成功。
+  async function deliverAsyncWithRetry(ctx, job, record, text) {
+    let ok = false
     try {
-      await deliverAsyncReport(ctx, job, text)
+      ok = await deliverAsyncReport(ctx, job, text)
     } catch (error) {
       job.delivery = 'failed'
       job.deliveryError = String(error?.message ?? error).slice(0, 400)
+      ok = false
     }
-    record.delivery = job.delivery || 'failed'
-    record.deliveryError = job.deliveryError || ''
-    record.deliveredAt = job.deliveredAt || ''
+    const next = nextAsyncDelivery(record, ok ? 'sent' : 'failed')
+    record.delivery = next.delivery
+    record.deliveryAttempts = next.attempts
+    record.deliveryError = ok ? '' : job.deliveryError || record.deliveryError || ''
+    record.deliveredAt = ok ? job.deliveredAt || new Date().toISOString() : record.deliveredAt || ''
+    if (next.delivery === 'retrying') {
+      record.nextRetryAt = next.retryAt
+      scheduleAsyncDeliveryRetry(ctx, record.id, next.delayMs)
+    } else {
+      delete record.nextRetryAt
+      clearAsyncDeliveryTimer(record.id)
+    }
     saveAsyncState()
-    return job
+    return ok
   }
+
+  // 插件卸载时把重试定时器全部撤掉，别让已停用的插件还在后台投东西。
+  ctx.effect(() => () => {
+    for (const timer of asyncDeliveryTimers.values()) clearTimeout(timer)
+    asyncDeliveryTimers.clear()
+  }, 'dsh-hands: async delivery timers')
 
   // 启动时对账：上次没跑完的标 ORPHAN，跑完但没投出去的补投一次
   async function recoverAsyncJobs() {
@@ -1447,10 +1534,8 @@ export function apply(ctx, config = {}) {
         delivery: 'pending',
       }
       try {
-        const ok = await deliverAsyncReport(ctx, job, record.report)
-        record.delivery = ok ? 'sent' : 'failed'
-        record.deliveryError = job.deliveryError || ''
-        record.deliveredAt = job.deliveredAt || ''
+        // 走同一条重试通道：启动时投不进去也别直接判死，继续退避重试。
+        const ok = await deliverAsyncWithRetry(ctx, job, record, record.report)
         if (ok) delivered += 1
       } catch (error) {
         record.delivery = 'failed'
@@ -1700,6 +1785,8 @@ export function apply(ctx, config = {}) {
                     delivery: record.delivery,
                     deliveryError: record.deliveryError,
                     deliveredAt: record.deliveredAt,
+                    deliveryAttempts: record.deliveryAttempts,
+                    nextRetryAt: record.nextRetryAt,
                     hasReport: !!record.report,
                   }),
                 )
@@ -2239,7 +2326,8 @@ export function apply(ctx, config = {}) {
         runQueued(() => perform())
           .then((value) =>
             settleAsyncJob(ctx, job, {
-              status: value.status,
+              // /cancel 杀掉进程后 CLI 那条路只会返回失败码；回传要如实写 CANCELLED
+              status: run.cancelled ? 'CANCELLED' : value.status,
               ms: (Number(value.durationSec) || 0) * 1000,
               exitCode: value.exitCode,
               excerpt: value.response,
@@ -2649,7 +2737,8 @@ export function apply(ctx, config = {}) {
         runQueued(() => perform())
           .then((value) =>
             settleAsyncJob(ctx, job, {
-              status: value.status,
+              // /cancel 杀掉进程后 CLI 那条路只会返回失败码；回传要如实写 CANCELLED
+              status: run.cancelled ? 'CANCELLED' : value.status,
               ms: value.ms,
               exitCode: value.exitCode,
               excerpt: value.response,
@@ -2859,7 +2948,8 @@ export function apply(ctx, config = {}) {
           {
             const value = settle(result)
             return settleAsyncJob(ctx, job, {
-              status: value.status,
+              // /cancel 杀掉进程后 CLI 那条路只会返回失败码；回传要如实写 CANCELLED
+              status: run.cancelled ? 'CANCELLED' : value.status,
               ms: value.ms,
               exitCode: value.exitCode,
               excerpt: value.response,
@@ -3079,7 +3169,8 @@ export function apply(ctx, config = {}) {
         runQueued(() => perform())
           .then((value) =>
             settleAsyncJob(ctx, job, {
-              status: value.status,
+              // /cancel 杀掉进程后 CLI 那条路只会返回失败码；回传要如实写 CANCELLED
+              status: run.cancelled ? 'CANCELLED' : value.status,
               ms: value.ms,
               exitCode: value.exitCode,
               excerpt: value.response,
