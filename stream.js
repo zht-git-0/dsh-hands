@@ -81,7 +81,8 @@ export function mapAcpUpdate(update, state) {
     const title = titleOf()
     if (id) store.toolCalls.set(id, title)
     out.text = `\n[tool] ${title}\n`
-    out.tool = { name: title, status: 'running' }
+    // 带上 id：同一个工具 running→completed 要更新原块，不能冒出两个
+    out.tool = { id, name: title, status: 'running' }
     return out
   }
   if (kind === 'tool_call_update') {
@@ -95,7 +96,7 @@ export function mapAcpUpdate(update, state) {
     if (id) store.toolStatus.set(id, status)
     out.status = status
     out.text = `[tool] ${title} ${status === 'completed' ? 'done' : '失败'}\n`
-    out.tool = { name: title, status }
+    out.tool = { id, name: title, status }
     return out
   }
   if (kind === 'usage_update') {
@@ -468,7 +469,7 @@ export function createLiveView(hand) {
         pushReasoningBlock(mapped.thought)
       }
       if (mapped.usage !== undefined) acp.usage = mapped.usage
-      if (mapped.tool) pushToolBlock(mapped.tool.name, '', mapped.tool.status)
+      if (mapped.tool) pushToolBlock(mapped.tool.name, '', mapped.tool.status, '', mapped.tool.id || '')
       if (mapped.text) {
         feedAcpText(mapped.text)
         if (!mapped.tool) pushTextBlock(mapped.text)

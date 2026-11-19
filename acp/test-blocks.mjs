@@ -187,4 +187,16 @@ const feed = (view, hand, events) => {
   console.log('10) claude tool_result 回填 ok')
 }
 
+// ── 11) ACP tool_call → tool_call_update：只留一个块（opencode 找出来的坑）────
+{
+  const view = createLiveView('opencode')
+  view.feedEvent({ sessionUpdate: 'tool_call', toolCallId: 'tc1', title: 'Bash' })
+  view.feedEvent({ sessionUpdate: 'tool_call_update', toolCallId: 'tc1', status: 'completed' })
+  const tools = view.blocks().filter((b) => b.kind === 'tool')
+  assert.equal(tools.length, 1, '同一个 ACP 工具不产生两个块')
+  assert.equal(tools[0].status, 'completed')
+  assert.equal(tools[0].name, 'Bash')
+  console.log('11) ACP 工具去重 ok')
+}
+
 console.log('ok')
