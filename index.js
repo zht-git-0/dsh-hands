@@ -1764,6 +1764,46 @@ export function apply(ctx, config = {}) {
   // 由调用方回退一次 CLI —— ACP 挂了不能把工具本身弄失败。
   // 权限按 write 折：write=false 一律拒（和 CLI 只读语义对齐），true 才自动放行。
   // 注意：ACP 的进程句柄留在 runner 内部，本轮没接进 RUNNING_PROCS，/cancel 只对 CLI 生效。
+  // ── 权限请求回流：ACP 问「能不能跑这个工具」时挂起，等面板答复 ──────────────
+  // 有写权限时把请求挂进队列，默认 60 秒没人点就 reject（fail-closed），绝不自动放行。
+  const pendingPermissions = new Map()
+  let permissionSeq = 0
+
+  function askPermission(hand, params) {
+    return new Promise((resolve) => {
+      const id = `perm-${Date.now().toString(36)}-${++permissionSeq}`
+      const toolCall = params?.toolCall || {}
+      let detail = ''
+      try {
+        detail = JSON.stringify(toolCall.rawInput || toolCall.input || {}).slice(0, 300)
+      } catch {
+        detail = ''
+      }
+      const entry = {
+        id,
+        hand: String(hand || ''),
+        title: String(toolCall.title || toolCall.name || params?.toolName || 'tool'),
+        kind: String(toolCall.kind || ''),
+        detail,
+        createdAt: Date.now(),
+        resolve: null,
+        timer: null,
+      }
+      const timeoutMs = Math.max(5000, Number(config.permissionTimeoutMs) || 60000)
+      entry.timer = setTimeout(() => {
+        pendingPermissions.delete(id)
+        resolve('reject')
+      }, timeoutMs)
+      entry.timer.unref?.()
+      entry.resolve = (decision) => {
+        pendingPermissions.delete(id)
+        clearTimeout(entry.timer)
+        resolve(decision === 'allow' ? 'allow' : 'reject')
+      }
+      pendingPermissions.set(id, entry)
+    })
+  }
+
   async function runAcpTurn(hand, { run, prompt, cwd, model, timeoutSec, sessionId, write }) {
     try {
       const { runAcpTask } = await import('./acp/runner.mjs')
@@ -1774,7 +1814,8 @@ export function apply(ctx, config = {}) {
         model: model || undefined,
         sessionId: sessionId || undefined,
         timeoutMs: (Number(timeoutSec) || defaultTimeout) * 1000,
-        permission: write ? 'allow' : 'reject',
+        // 要写文件时逐次问面板；只读直接拒（不弹授权）
+        permission: write ? (params) => askPermission(hand, params) : 'reject',
         onUpdate: (update) => run.feedEvent?.(update),
       })
       if (result?.ok) return result
@@ -1863,6 +1904,33 @@ export function apply(ctx, config = {}) {
                 queue: asyncQueueStats(),
               })
             }
+            // 权限请求回流：面板轮询挂起中的授权，POST 回 allow/reject
+            if (u.pathname === '/dsh-hands/permissions') {
+              const list = [...pendingPermissions.values()].map((entry) => ({
+                id: entry.id,
+                hand: entry.hand,
+                title: entry.title,
+                kind: entry.kind,
+                detail: entry.detail,
+                createdAt: entry.createdAt,
+              }))
+              return send(200, { permissions: list })
+            }
+            if (u.pathname === '/dsh-hands/permission') {
+              if (req.method !== 'POST') return fail(405, 'POST only')
+              try {
+                const body = parseBody(await readBody(req))
+                const id = String(body.id || '')
+                const entry = pendingPermissions.get(id)
+                if (!entry) return fail(404, 'not found')
+                const decision = body.decision === 'allow' ? 'allow' : 'reject'
+                entry.resolve(decision)
+                return send(200, { ok: true, id, decision })
+              } catch (e) {
+                return fail(500, e)
+              }
+            }
+
             // 面板内直接派活：复用 rerunInBackground 的后台跑法
             if (u.pathname === '/dsh-hands/dispatch') {
               if (req.method !== 'POST') return fail(405, 'POST only')

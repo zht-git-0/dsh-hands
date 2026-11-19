@@ -21,6 +21,9 @@ plugin_manager install_bundle  target=D:\Program\projects\dsh-hands
 
 装之前先把旧的 `dsh-agy` 停掉，否则 `agy_run` 会注册两遍。
 
+> **权限请求回流**：开启 ACP（`acpHands`）且这一轮要写文件时，手下的每次工具授权都会挂起，
+> 面板顶部弹出「允许 / 拒绝」，60 秒没人点按拒绝（fail-closed）。只读轮次不弹。
+
 > **开发版和上线版是分开的**：这个目录只当开发版用；DSH 里跑的应该是 `D:\Program\tools\dsh-hands-release` 的上线版。
 > 更新上线版必须**爸爸点头 + 先备份**（脚本没有 `-Approved` 会直接拒绝），流程见 [RELEASE.md](./RELEASE.md)。
 
@@ -38,6 +41,7 @@ plugin_manager install_bundle  target=D:\Program\projects\dsh-hands
         timeoutSec: 900
         skipPermissions: true
         acpHands: []          # 例如 ['opencode']：该家改走 ACP（失败自动回退 CLI）
+        permissionTimeoutMs: 60000   # ACP 要写文件时，面板授权弹窗等多久（超时按拒绝）
 ```
 
 路径用正斜杠，别写反斜杠（YAML 里的 `\U` 会被当成转义）。

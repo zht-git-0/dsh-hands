@@ -80,6 +80,8 @@ window.__ModuleLoader__.load({
       asyncDelivery: 'delivery',
       asyncHint: 'Async dispatch queue: running/queued/retrying/failed; click for details',
       asyncCancel: 'cancel',
+      permAllow: 'Allow',
+      permReject: 'Reject',
       loadFailed: 'Could not read the dispatch feed.',
       showMore: 'Show older',
       justNow: 'just now',
@@ -168,6 +170,8 @@ window.__ModuleLoader__.load({
       asyncDelivery: '投递',
       asyncHint: '异步派活队列：跑着/排队/回传重试/回传失败，点开看详情',
       asyncCancel: '取消',
+      permAllow: '允许',
+      permReject: '拒绝',
       loadFailed: '读取调度输出失败。',
       showMore: '显示更早',
       justNow: '刚刚',
@@ -1625,6 +1629,12 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2{display:flex;flex-direction:column;flex:auto;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}
       .dsh-hands-v2-body{display:flex;flex:1;min-width:0;min-height:0;overflow:hidden}
       .dsh-hands-async{flex:none;display:flex;flex-direction:column;gap:2px;margin:6px 8px 0;min-width:0}
+      .dsh-hands-perms{flex:none;display:flex;flex-direction:column;gap:4px;margin:6px 8px 0}
+      .dsh-hands-perm{display:flex;align-items:center;gap:6px;min-width:0;padding:5px 8px;border:.5px solid var(--dsw-alias-state-warn-primary);border-radius:8px;background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 10%,transparent)}
+      .dsh-hands-permText{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}
+      .dsh-hands-permAllow,.dsh-hands-permReject{flex:none;padding:1px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:10.5px;line-height:16px;cursor:pointer}
+      .dsh-hands-permAllow{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}
+      .dsh-hands-permReject:hover{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
       .dsh-hands-asyncbar{align-self:flex-start;display:inline-flex;align-items:center;gap:6px;max-width:100%;padding:3px 8px;border:0;border-radius:999px;background:var(--dsw-alias-bg-secondary);color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
       .dsh-hands-asyncbar:hover{color:var(--dsw-alias-label-primary)}
       .dsh-hands-asynclist{display:flex;flex-direction:column;gap:2px;margin-top:2px;padding:4px;border:.5px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);max-height:180px;overflow:auto}
@@ -3228,6 +3238,87 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // 权限请求：ACP 问「能不能跑这个工具」时，面板上点允许/拒绝（60 秒没人点按拒绝）
+    function HandsPermissionBanner(props) {
+      const t = props.t || ((key) => key);
+      const [items, setItems] = React.useState([]);
+      const [busy, setBusy] = React.useState('');
+
+      React.useEffect(() => {
+        let alive = true;
+        let timer = null;
+        const load = async () => {
+          try {
+            const res = await fetch('/dsh-hands/permissions', { cache: 'no-store' });
+            if (res.ok) {
+              const data = await res.json();
+              if (alive) setItems(Array.isArray(data.permissions) ? data.permissions : []);
+            }
+          } catch {
+            // 拿不到就不显示，别把面板搞挂
+          }
+          if (alive) timer = setTimeout(load, 3000);
+        };
+        load();
+        return () => {
+          alive = false;
+          if (timer) clearTimeout(timer);
+        };
+      }, []);
+
+      if (!items.length) return null;
+      const answer = async (id, decision) => {
+        setBusy(id);
+        try {
+          await fetch('/dsh-hands/permission', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json', accept: 'application/json' },
+            body: JSON.stringify({ id, decision }),
+          });
+        } catch {
+          // 回复失败就等下一轮
+        }
+        setBusy('');
+        setItems((prev) => prev.filter((item) => item.id !== id));
+      };
+      return h(
+        'div',
+        { className: 'dsh-hands-perms' },
+        items.map((item) =>
+          h(
+            'div',
+            { key: item.id, className: 'dsh-hands-perm' },
+            h(
+              'span',
+              { className: 'dsh-hands-permText', title: item.detail || undefined },
+              `${item.hand || ''} · ${item.title || 'tool'}${item.detail ? ` · ${item.detail}` : ''}`,
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-hands-permAllow',
+                disabled: busy === item.id,
+                onClick: () => answer(item.id, 'allow'),
+              },
+              t('permAllow'),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-hands-permReject',
+                disabled: busy === item.id,
+                onClick: () => answer(item.id, 'reject'),
+              },
+              t('permReject'),
+            ),
+          ),
+        ),
+      );
+    }
+
     function HandsPaneV2(props) {
       const t = props.t || ((key) => key);
       const store = props.store;
@@ -3287,6 +3378,7 @@ window.__ModuleLoader__.load({
           ? h('div', { className: 'dsh-hands-v2-error' }, `${t('loadFailed')} ${meta.error}`)
           : null,
         h(HandsAsyncBar, { key: 'async', t }),
+        h(HandsPermissionBanner, { key: 'perm', t }),
         h(
           'div',
           { className: 'dsh-hands-v2-body' },

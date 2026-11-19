@@ -9,10 +9,14 @@ const RESUME_TIMEOUT_MS = 60 * 1000; // load / resume 尝试给 60 秒，失败�
 const MODEL_TIMEOUT_MS = 15 * 1000;
 
 // 只改两处行为：权限按 permission 策略应答；spawn 失败不让进程崩。
-class RunnerClient extends AcpClient {
+export class RunnerClient extends AcpClient {
   constructor(name, options = {}) {
     super(name, options);
-    this.permission = options.permission === "reject" ? "reject" : "allow";
+    // 权限策略：'allow' / 'reject'，或者一个 async 函数 (params) => 'allow'|'reject'
+    // 函数形态给「面板上人工点允许/拒绝」用；函数抛错/超时按 reject 走（fail-closed）。
+    this.permission = typeof options.permission === "function"
+      ? options.permission
+      : options.permission === "reject" ? "reject" : "allow";
   }
 
   start() {
@@ -29,18 +33,28 @@ class RunnerClient extends AcpClient {
   _onRequest(msg) {
     if (msg.method !== "session/request_permission") return super._onRequest(msg);
     const opts = msg.params?.options ?? [];
-    // allow：allow_always 优先，其次 allow_once；reject（或没有可选项）一律 cancelled
-    const pick =
-      this.permission === "allow"
+    const answer = (decision) => {
+      // allow：allow_always 优先，其次 allow_once；reject（或没有可选项）一律 cancelled
+      const pick = decision === "allow"
         ? opts.find((o) => o.kind === "allow_always") || opts.find((o) => o.kind === "allow_once")
         : null;
-    this._write({
-      jsonrpc: "2.0",
-      id: msg.id,
-      result: pick
-        ? { outcome: { outcome: "selected", optionId: pick.optionId } }
-        : { outcome: { outcome: "cancelled" } },
-    });
+      this._write({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: pick
+          ? { outcome: { outcome: "selected", optionId: pick.optionId } }
+          : { outcome: { outcome: "cancelled" } },
+      });
+    };
+    if (typeof this.permission === "function") {
+      // 人工授权：等回调给结论；抛错或拒绝都按 reject 处理（fail-closed）
+      Promise.resolve()
+        .then(() => this.permission(msg.params || {}))
+        .then((decision) => answer(decision === "allow" ? "allow" : "reject"))
+        .catch(() => answer("reject"));
+      return;
+    }
+    answer(this.permission === "allow" ? "allow" : "reject");
   }
 }
 
