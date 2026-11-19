@@ -466,6 +466,11 @@ function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk, onSpawn 
   return new Promise((resolve) => {
     const started = Date.now()
     let child
+    // cwd 不存在时 spawn 会报成「spawn cmd.exe ENOENT」，完全看不出真正原因，先自己说清楚
+    if (cwd && !fs.existsSync(cwd)) {
+      resolve({ code: -1, stdout: '', stderr: `cwd 不存在：${cwd}`, ms: 0, timedOut: false })
+      return
+    }
     try {
       // stdin 必须显式给个已关闭的管道：codex 在非 TTY 下会等 stdin EOF，
       // 继承父进程的 stdin 会一直挂着（踩过，表现为「Reading additional input from stdin...」然后超时）
