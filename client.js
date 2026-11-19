@@ -62,6 +62,7 @@ window.__ModuleLoader__.load({
       toolRunning: 'running',
       toolDone: 'done',
       toolFailed: 'failed',
+      openFolder: 'Open folder',
       asyncTasks: 'Async',
       asyncRunning: 'running',
       asyncQueued: 'queued',
@@ -137,6 +138,7 @@ window.__ModuleLoader__.load({
       toolRunning: '运行中',
       toolDone: '完成',
       toolFailed: '失败',
+      openFolder: '打开文件夹',
       asyncTasks: '异步',
       asyncRunning: '跑着',
       asyncQueued: '排队',
@@ -345,6 +347,20 @@ window.__ModuleLoader__.load({
             ? location.href
             : 'http://127.0.0.1/';
       return new URL(name, base).href;
+    }
+
+    // 打开本机文件夹：服务端只接受「已知会话的 cwd」，这里只负责发请求。
+    function openFolder(folder) {
+      const wanted = String(folder || '');
+      if (!wanted) return;
+      fetch(endpointOf('dsh-hands/open-folder'), {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({ path: wanted }),
+      }).catch(() => {
+        // 打不开就算了，别让面板报错
+      });
     }
 
     // ── v2 数据层：一个 store，三列各取一片 ─────────────────────────────────
@@ -1591,8 +1607,11 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-iconBtn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
       .dsh-hands-v2-list{flex:1;min-height:0;display:flex;flex-direction:column;gap:4px;padding:0 6px 8px;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain}
       .dsh-hands-v2-group{display:flex;flex-direction:column;gap:2px;min-width:0}
-      .dsh-hands-v2-folder{display:flex;align-items:center;gap:5px;width:100%;padding:3px 6px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:16px;text-align:left;cursor:pointer;overflow:hidden}
-      .dsh-hands-v2-folder:hover{background:var(--dsw-alias-bg-secondary)}
+      .dsh-hands-v2-folder{display:flex;align-items:center;gap:2px;min-width:0;border-radius:6px}
+      .dsh-hands-v2-folderToggle{display:flex;align-items:center;gap:5px;flex:1;min-width:0;padding:3px 4px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:16px;text-align:left;cursor:pointer;overflow:hidden}
+      .dsh-hands-v2-folderToggle:hover{background:var(--dsw-alias-bg-secondary)}
+      .dsh-hands-v2-folderOpen{flex:none;width:20px;height:20px;padding:0;border:0;border-radius:5px;background:transparent;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:11px;line-height:20px;cursor:pointer}
+      .dsh-hands-v2-folderOpen:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
       .dsh-hands-v2-folderCaret{flex:none;width:10px;font-size:10px;opacity:.75}
       .dsh-hands-v2-folderName{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
       .dsh-hands-v2-folderCount{flex:none;opacity:.7;font-variant-numeric:tabular-nums}
@@ -2331,28 +2350,50 @@ window.__ModuleLoader__.load({
                 const folderTone = anyRunning ? 'running' : toneOf(group.sessions[0] || {});
                 const children = [
                   h(
-                    'button',
+                    'div',
                     {
                       key: 'folder',
-                      type: 'button',
                       className: 'dsh-hands-v2-folder',
                       'data-collapsed': isCollapsed ? 'true' : 'false',
-                      title: group.cwd || undefined,
-                      onClick: () =>
-                        setCollapsed((prev) => ({ ...prev, [folderKey]: prev[folderKey] !== true })),
                     },
-                    h('span', { className: 'dsh-hands-v2-folderCaret' }, isCollapsed ? '▸' : '▾'),
                     h(
-                      'span',
-                      { className: 'dsh-hands-v2-folderName' },
-                      group.label || t('v2NoFolder') || '未分组',
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'dsh-hands-v2-folderToggle',
+                        title: group.cwd || undefined,
+                        onClick: () =>
+                          setCollapsed((prev) => ({ ...prev, [folderKey]: prev[folderKey] !== true })),
+                      },
+                      h('span', { className: 'dsh-hands-v2-folderCaret' }, isCollapsed ? '▸' : '▾'),
+                      h(
+                        'span',
+                        { className: 'dsh-hands-v2-folderName' },
+                        group.cwd || t('v2NoFolder') || '未分组',
+                      ),
+                      h('span', {
+                        className: 'dsh-hands-v2-dot',
+                        'data-tone': folderTone,
+                        style: { '--tone-color': TONE_COLOR[folderTone] || TONE_COLOR.unknown },
+                      }),
+                      h('span', { className: 'dsh-hands-v2-folderCount' }, String(group.sessions.length)),
                     ),
-                    h('span', {
-                      className: 'dsh-hands-v2-dot',
-                      'data-tone': folderTone,
-                      style: { '--tone-color': TONE_COLOR[folderTone] || TONE_COLOR.unknown },
-                    }),
-                    h('span', { className: 'dsh-hands-v2-folderCount' }, String(group.sessions.length)),
+                    group.cwd
+                      ? h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dsh-hands-v2-folderOpen',
+                            title: t('openFolder'),
+                            'aria-label': t('openFolder'),
+                            onClick: (event) => {
+                              event.stopPropagation();
+                              openFolder(group.cwd);
+                            },
+                          },
+                          '↗',
+                        )
+                      : null,
                   ),
                 ];
                 if (!isCollapsed) {

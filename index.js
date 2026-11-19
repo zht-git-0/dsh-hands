@@ -797,6 +797,22 @@ export function createAsyncQueue(limit = 3) {
   }
 }
 
+// 打开文件夹的安全闸：只允许打开「已知会话的工作目录」，不接受任意路径。
+// 纯函数，acp/test-open-folder.mjs 直接测；返回 '' 表示拒绝。
+export function resolveOpenFolder(knownCwds, wanted) {
+  const raw = String(wanted || '').trim()
+  if (!raw) return ''
+  // Windows 路径不分大小写，但字符串比较分；统一小写后再比。
+  const norm = (value) => (process.platform === 'win32' ? String(value).toLowerCase() : String(value))
+  const target = path.resolve(raw)
+  const known = new Set()
+  for (const value of Array.isArray(knownCwds) ? knownCwds : []) {
+    const item = String(value || '').trim()
+    if (item) known.add(norm(path.resolve(item)))
+  }
+  return known.has(norm(target)) ? target : ''
+}
+
 export function apply(ctx, config = {}) {
   // 四家的二进制：配置 > 本机常用安装位置 > 默认值，取第一个真实存在的。
   // 这样重装 / 目录被清之后不用改配置也能自己找回来。
@@ -1843,6 +1859,28 @@ export function apply(ctx, config = {}) {
                 queue: asyncQueueStats(),
               })
             }
+            // 打开某个会话的工作目录：只接受已知 cwd（防网页被诱导去开任意路径）
+            if (u.pathname === '/dsh-hands/open-folder') {
+              if (req.method !== 'POST') return fail(405, 'POST only')
+              try {
+                const body = parseBody(await readBody(req))
+                const knownCwds = []
+                for (const hand of ['agy', 'codex', 'claude', 'opencode']) {
+                  for (const row of listSessions(hand)) {
+                    if (row && row.cwd) knownCwds.push(row.cwd)
+                  }
+                }
+                const target = resolveOpenFolder(knownCwds, body.path)
+                if (!target) return fail(403, 'unknown folder')
+                if (!fs.existsSync(target)) return fail(404, 'folder not found')
+                const child = spawn('explorer.exe', [target], { detached: true, stdio: 'ignore' })
+                child.unref()
+                return send(200, { ok: true, path: target })
+              } catch (e) {
+                return fail(500, e)
+              }
+            }
+
             if (u.pathname === '/dsh-hands/stream') {
               if (res.destroyed || res.writableEnded) return
               res.writeHead(200, {
