@@ -1315,6 +1315,7 @@ export function apply(ctx, config = {}) {
       push(chunk, source) {
         live.feed(chunk, source)
         entry.output = live.render()
+        entry.blocks = live.blocks()
         entry.outputAt = Date.now()
         touchRunning()
       },
@@ -1322,12 +1323,14 @@ export function apply(ctx, config = {}) {
       feedEvent(update) {
         live.feedEvent(update)
         entry.output = live.render()
+        entry.blocks = live.blocks()
         entry.outputAt = Date.now()
         touchRunning()
       },
       flush() {
         live.flush()
         entry.output = live.render()
+        entry.blocks = live.blocks()
       },
     }
   }
@@ -1373,6 +1376,10 @@ export function apply(ctx, config = {}) {
         cost: fields.cost,
         stopReason: fields.stopReason ? String(fields.stopReason) : undefined,
         runner: fields.runner ? String(fields.runner) : undefined,
+        // 语义分块（思维链/正文/工具）：面板据此分开渲染；老字段 output/excerpt 不动。
+        blocks: Array.isArray(run.entry.blocks) && run.entry.blocks.length
+          ? run.entry.blocks.slice(-80)
+          : undefined,
         error: fields.error ? String(fields.error).slice(0, 1200) : undefined,
       }),
     )
@@ -1939,6 +1946,7 @@ export function apply(ctx, config = {}) {
               let sessionsFingerprint = ''
               let turnsFingerprint = ''
               const sentLengths = new Map()
+              const sentBlocks = new Map() // id -> 分块签名，变了才推
               const settled = new Set()
               let historyTargetId = ''
 
@@ -2012,21 +2020,30 @@ export function apply(ctx, config = {}) {
                 if (!target.running && settled.has(id)) return
                 const text = target.running ? String(target.entry.output || '') : readJobText(target.entry)
                 const delta = computeLiveDelta(text, sentLengths.get(id) || 0)
-                if (!delta.changed) {
+                // 语义分块：只在真的变了才带；老客户端看到多余字段会忽略。
+                // 分块变了但正文没变（比如只多了一条工具记录）也要推一帧。
+                const rawBlocks = Array.isArray(target.entry.blocks) ? target.entry.blocks : []
+                const blocksSig = rawBlocks.length
+                  ? `${rawBlocks.length}:${rawBlocks.map((b) => `${b.kind}${b.text ? b.text.length : 0}${b.name || ''}`).join('|')}`
+                  : ''
+                const blocksChanged = sentBlocks.get(id) !== blocksSig
+                if (!delta.changed && !blocksChanged) {
                   if (!target.running) settled.add(id)
                   return
                 }
                 sentLengths.set(id, delta.next)
+                if (blocksChanged) sentBlocks.set(id, blocksSig)
                 const outputAt = target.running
                   ? Number(target.entry.outputAt) || Date.now()
                   : Date.parse(target.entry.at || target.entry.startedAt) || Date.now()
                 writeV2('live', {
                   key,
                   id,
-                  delta: delta.delta,
+                  delta: delta.changed ? delta.delta : '',
                   next: delta.next,
                   outputAt,
                   idleMs: Math.max(0, Date.now() - outputAt),
+                  ...(blocksChanged && rawBlocks.length ? { blocks: rawBlocks } : {}),
                 })
                 if (!target.running && delta.next >= text.length) settled.add(id)
               }
@@ -2113,7 +2130,18 @@ export function apply(ctx, config = {}) {
                   const text = readJobText(entry)
                   const delta = text.slice(from)
                   const next = from + delta.length
-                  return send(200, { id, from, next, eof: next >= text.length, delta })
+                  // 第一页顺带把语义分块（思维链/正文/工具）带回去，面板不用多请求一次
+                  const blocks = from === 0 && Array.isArray(entry.blocks) && entry.blocks.length
+                    ? entry.blocks
+                    : undefined
+                  return send(200, {
+                    id,
+                    from,
+                    next,
+                    eof: next >= text.length,
+                    delta,
+                    ...(blocks ? { blocks } : {}),
+                  })
                 }
                 return send(200, { turn: entry })
               } catch (e) {

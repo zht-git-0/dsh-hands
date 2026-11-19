@@ -58,6 +58,10 @@ window.__ModuleLoader__.load({
       statusCancelled: 'Cancelled',
       statusUnknown: 'Unknown',
       exitCode: 'Exit code',
+      reasoning: 'Thinking',
+      toolRunning: 'running',
+      toolDone: 'done',
+      toolFailed: 'failed',
       asyncTasks: 'Async',
       asyncRunning: 'running',
       asyncQueued: 'queued',
@@ -129,6 +133,10 @@ window.__ModuleLoader__.load({
       statusCancelled: '已取消',
       statusUnknown: '未知',
       exitCode: '退出码',
+      reasoning: '思维链',
+      toolRunning: '运行中',
+      toolDone: '完成',
+      toolFailed: '失败',
       asyncTasks: '异步',
       asyncRunning: '跑着',
       asyncQueued: '排队',
@@ -739,6 +747,7 @@ window.__ModuleLoader__.load({
           );
           if (life !== lifeToken) return null;
           applyDelta(data?.id || wanted, data?.delta, data?.next, data?.from);
+          if (Array.isArray(data?.blocks)) applyBlocksToTurn(data.id || wanted, data.blocks);
           return data;
         } catch (error) {
           if (life !== lifeToken) return null;
@@ -1105,10 +1114,25 @@ window.__ModuleLoader__.load({
         }
       }
 
+      // 把语义分块挂到轮次对象上：气泡据此把思维链/正文/工具分开渲染。
+      // 只改那一轮，不动别的列；服务端没给 blocks 时保持原样（老轮次继续按文本渲染）。
+      function applyBlocksToTurn(id, blocks) {
+        const turnId = String(id || '');
+        const key = String(state.selection.key || '');
+        if (!turnId || !key || !Array.isArray(blocks)) return;
+        const rows = state.turnsByKey[key] || [];
+        const index = rows.findIndex((row) => String(row?.id || '') === turnId);
+        if (index < 0) return;
+        const next = rows.slice();
+        next[index] = { ...next[index], blocks };
+        emit({ turnsByKey: { ...state.turnsByKey, [key]: next } });
+      }
+
       function handleLiveEvent(event) {
         const data = parseEvent(event);
         if (!data) return;
         appendLive(data.key, data.id, data.delta, data.next);
+        if (Array.isArray(data.blocks)) applyBlocksToTurn(data.id, data.blocks);
       }
 
       function connectStream() {
@@ -1606,6 +1630,17 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-bubbleIcon{display:inline-flex;align-items:center;flex:none}
       .dsh-hands-v2-bubbleName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       .dsh-hands-v2-bubbleText{margin:0;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:12px;line-height:19px;color:var(--dsw-alias-label-primary)}
+      .dsh-hands-blocks{display:flex;flex-direction:column;gap:6px;min-width:0}
+      .dsh-hands-blockReasoning{border-left:2px solid var(--dsw-alias-border-l2);padding-left:8px;color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:17px}
+      .dsh-hands-blockReasoningHead{cursor:pointer;color:var(--dsw-alias-label-tertiary);font-size:10.5px;line-height:15px;user-select:none}
+      .dsh-hands-blockReasoningBody{margin-top:4px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
+      .dsh-hands-blockTool{display:flex;align-items:center;gap:6px;min-width:0;padding:2px 6px;border:.5px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-secondary);color:var(--dsw-alias-label-secondary);font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:10.5px;line-height:16px}
+      .dsh-hands-blockToolName{flex:none;font-weight:600}
+      .dsh-hands-blockToolDetail{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.85}
+      .dsh-hands-blockToolState{flex:none;opacity:.85}
+      .dsh-hands-blockTool[data-status=completed] .dsh-hands-blockToolState,.dsh-hands-blockTool[data-status=ok] .dsh-hands-blockToolState{color:var(--dsw-alias-state-success-primary)}
+      .dsh-hands-blockTool[data-status=failed] .dsh-hands-blockToolState,.dsh-hands-blockTool[data-status=error] .dsh-hands-blockToolState{color:var(--dsw-alias-state-error-primary)}
+      .dsh-hands-blockText{white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
       .dsh-hands-md{display:flex;flex-direction:column;gap:4px;min-width:0}
       .dsh-hands-mdLine{white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
       .dsh-hands-mdHeading{font-weight:600;font-size:12.5px;line-height:18px}
@@ -2419,12 +2454,72 @@ window.__ModuleLoader__.load({
       );
     }
 
+    // 分块气泡：思维链默认折叠、正文走 markdown、工具调用一行等宽小字。
+    // 有任何一块不认识就整段回落成普通文本（BubbleAgent 里判断）。
+    function AgentBlocks(props) {
+      const { t, blocks, running } = props;
+      const stateText = (status) => {
+        const value = String(status || '').toLowerCase();
+        if (value === 'completed' || value === 'ok') return t('toolDone');
+        if (value === 'failed' || value === 'error') return t('toolFailed');
+        if (value === 'running') return t('toolRunning');
+        return '';
+      };
+      return h(
+        'div',
+        { className: 'dsh-hands-blocks' },
+        blocks.map((block, index) => {
+          if (block.kind === 'tool') {
+            return h(
+              'div',
+              {
+                key: `b${index}`,
+                className: 'dsh-hands-blockTool',
+                'data-status': block.status || '',
+              },
+              h('span', { className: 'dsh-hands-blockToolIcon' }, '⚙'),
+              h('span', { className: 'dsh-hands-blockToolName' }, block.name || 'tool'),
+              block.detail
+                ? h('span', { className: 'dsh-hands-blockToolDetail', title: block.detail }, block.detail)
+                : null,
+              stateText(block.status)
+                ? h('span', { className: 'dsh-hands-blockToolState' }, stateText(block.status))
+                : null,
+            );
+          }
+          if (block.kind === 'reasoning') {
+            return h(
+              'details',
+              { key: `b${index}`, className: 'dsh-hands-blockReasoning' },
+              h('summary', { className: 'dsh-hands-blockReasoningHead' }, t('reasoning')),
+              h('div', { className: 'dsh-hands-blockReasoningBody' }, String(block.text || '')),
+            );
+          }
+          return h(
+            'div',
+            { key: `b${index}`, className: 'dsh-hands-blockText' },
+            h(MarkdownBlock, {
+              text: String(block.text || ''),
+              streaming: !!running && index === blocks.length - 1,
+            }),
+          );
+        }),
+        running ? h('span', { className: 'dsh-hands-cursor', 'aria-hidden': true }) : null,
+      );
+    }
+
     function BubbleAgent(props) {
       const { t, turn, view } = props;
       const [expanded, setExpanded] = React.useState(false);
       const full = String(view?.text || '');
       const source = String(view?.source || 'none');
       const running = !!view?.cursor;
+      const blocks = Array.isArray(turn?.blocks) ? turn.blocks : [];
+      const useBlocks =
+        blocks.length > 0 &&
+        blocks.every(
+          (block) => block && (block.kind === 'text' || block.kind === 'reasoning' || block.kind === 'tool'),
+        );
       const canExpand = full.length > BODY_LIMIT;
       const hand = String(turn?.hand || '').toLowerCase();
       const loadFull = source === 'excerpt' && typeof props.onNeedBody === 'function';
@@ -2449,13 +2544,15 @@ window.__ModuleLoader__.load({
             className: 'dsh-hands-v2-bubble dsh-hands-v2-bubbleAgent',
             'data-source': source,
           },
-          full || running
-            ? h(Stream, {
-                text: canExpand && !expanded ? full.slice(0, BODY_LIMIT) : full,
-                running,
-                t,
-              })
-            : h('div', { className: 'dsh-hands-v2-waiting' }, t('noOutput')),
+          useBlocks
+            ? h(AgentBlocks, { t, blocks, running })
+            : full || running
+              ? h(Stream, {
+                  text: canExpand && !expanded ? full.slice(0, BODY_LIMIT) : full,
+                  running,
+                  t,
+                })
+              : h('div', { className: 'dsh-hands-v2-waiting' }, t('noOutput')),
           showToggle
             ? h(
                 'button',
@@ -3106,6 +3203,7 @@ window.__ModuleLoader__.load({
       formatCost,
       BubbleUser,
       BubbleAgent,
+      AgentBlocks,
       Turn,
       HandsPage,
       HandsNavIcon,

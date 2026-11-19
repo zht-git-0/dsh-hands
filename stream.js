@@ -81,6 +81,7 @@ export function mapAcpUpdate(update, state) {
     const title = titleOf()
     if (id) store.toolCalls.set(id, title)
     out.text = `\n[tool] ${title}\n`
+    out.tool = { name: title, status: 'running' }
     return out
   }
   if (kind === 'tool_call_update') {
@@ -94,6 +95,7 @@ export function mapAcpUpdate(update, state) {
     if (id) store.toolStatus.set(id, status)
     out.status = status
     out.text = `[tool] ${title} ${status === 'completed' ? 'done' : '失败'}\n`
+    out.tool = { name: title, status }
     return out
   }
   if (kind === 'usage_update') {
@@ -119,6 +121,53 @@ export function createLiveView(hand) {
   // ACP 的结构化状态：工具 id → 标题，以及 thought / usage 留给以后用
   const acp = { toolCalls: new Map(), toolStatus: new Map(), thought: '', usage: null }
 
+  // ── 分块输出：思维链 / 正文 / 工具调用 ───────────────────────────────────
+  // text 仍是原来的扁平文本（向后兼容，外部摘要/日志都靠它）；
+  // blocks 是同一批事件的语义视图，面板据此把三类内容分开渲染。
+  // 解析拿不准就只记 text，绝不丢内容。
+  const MAX_BLOCK_TEXT = 4000
+  const MAX_BLOCKS = 120
+  const blocks = []
+  const trimBlockText = (value) => String(value || '').slice(-MAX_BLOCK_TEXT)
+  const pushBlock = (block) => {
+    blocks.push(block)
+    if (blocks.length > MAX_BLOCKS) blocks.splice(0, blocks.length - MAX_BLOCKS)
+  }
+  const pushTextBlock = (value, id = '') => {
+    const chunk = asText(value)
+    if (!chunk) return
+    const last = blocks[blocks.length - 1]
+    if (last && last.kind === 'text' && id && last.id === id) {
+      // 同一个 part 反复发累计文本：整段替换，不叠加
+      last.text = trimBlockText(chunk)
+      return
+    }
+    if (last && last.kind === 'text' && !id) {
+      last.text = trimBlockText((last.text || '') + chunk)
+      return
+    }
+    pushBlock({ kind: 'text', text: trimBlockText(chunk), ...(id ? { id } : {}) })
+  }
+  const pushReasoningBlock = (value) => {
+    const chunk = asText(value)
+    if (!chunk) return
+    const last = blocks[blocks.length - 1]
+    if (last && last.kind === 'reasoning') {
+      last.text = trimBlockText((last.text || '') + chunk)
+      return
+    }
+    pushBlock({ kind: 'reasoning', text: trimBlockText(chunk) })
+  }
+  const pushToolBlock = (name, detail, status) => {
+    const tool = String(name || 'tool').trim().slice(0, 80) || 'tool'
+    pushBlock({
+      kind: 'tool',
+      name: tool,
+      detail: String(detail || '').trim().slice(0, 200),
+      status: String(status || ''),
+    })
+  }
+
   const append = (value) => {
     const chunk = asText(value)
     if (!chunk) return
@@ -141,6 +190,11 @@ export function createLiveView(hand) {
   }
 
   function handleOpencode(ev) {
+    if ((ev.type === 'reasoning' || ev.part?.type === 'reasoning')
+      && typeof (ev.part?.text ?? ev.text) === 'string') {
+      pushReasoningBlock(ev.part?.text ?? ev.text)
+      return
+    }
     if (ev.type === 'text' && ev.part && typeof ev.part.text === 'string') {
       const value = ev.part.text
       const id = String(ev.part.id || '')
@@ -153,6 +207,7 @@ export function createLiveView(hand) {
         block(value)
         lastPart = { id, length: value.length }
       }
+      pushTextBlock(value, id)
       return
     }
     if (ev.type === 'tool_use' || ev.part?.type === 'tool') {
@@ -162,6 +217,7 @@ export function createLiveView(hand) {
       const name = part.tool || part.name || ev.tool || 'tool'
       const detail = input.command || input.filePath || input.file_path || input.path || input.description || ''
       line(`→ ${name}${detail ? `: ${detail}` : ''}`)
+      pushToolBlock(name, detail, state.status || (state.error ? 'error' : ''))
       if (typeof state.output === 'string' && state.output.trim()) block(state.output)
       if (state.status === 'error' || state.error) line(`! ${state.error || 'tool error'}`)
       return
@@ -175,26 +231,31 @@ export function createLiveView(hand) {
     const item = ev.item
     if (ev.type === 'item.started' && item?.type === 'command_execution') {
       line(`$ ${item.command || ''}`.trim())
+      pushToolBlock('command', item.command)
       return
     }
     if (ev.type === 'item.completed' && item) {
       if (item.type === 'agent_message') {
         block(item.text)
+        pushTextBlock(item.text, item.id || '')
         return
       }
       if (item.type === 'command_execution') {
         const output = asText(item.aggregated_output) || asText(item.output)
         if (output) block(output)
         if (item.exit_code !== undefined && item.exit_code !== 0) line(`! exit ${item.exit_code}`)
+        pushToolBlock('command', item.command, item.exit_code === undefined ? '' : `exit ${item.exit_code}`)
         return
       }
       if (item.type === 'file_change') {
         const changes = Array.isArray(item.changes) ? item.changes : []
         for (const change of changes) line(`✎ ${change.path || change.file || 'file'}`)
+        pushToolBlock('file_change', changes.map((change) => change.path || change.file || 'file').join(', '))
         return
       }
       if (item.type === 'reasoning' && item.text) {
         block(item.text)
+        pushReasoningBlock(item.text)
       }
     }
   }
@@ -212,6 +273,15 @@ export function createLiveView(hand) {
         const input = block.input || {}
         const detail = input.command || input.file_path || input.filePath || input.path || input.description || ''
         line(`→ ${block.name || 'tool'}${detail ? `: ${detail}` : ''}`)
+        pushToolBlock(block.name, detail)
+        return
+      }
+      if (event.type === 'content_block_start' && event.content_block?.type === 'thinking') {
+        pushReasoningBlock(event.content_block.thinking || '')
+        return
+      }
+      if (event.type === 'content_block_delta' && event.delta?.type === 'thinking_delta') {
+        pushReasoningBlock(event.delta.thinking)
         return
       }
       if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
@@ -220,6 +290,7 @@ export function createLiveView(hand) {
           if (!claude.sawDelta) newline()
           append(value)
           claude.sawDelta = true
+          pushTextBlock(value, claude.messageId)
         }
       }
       return
@@ -229,11 +300,16 @@ export function createLiveView(hand) {
       // 已经用 stream_event 增量显示过同一条消息，就别把整段再打一遍。
       const skipText = claude.sawDelta && String(ev.message.id || '') === claude.messageId
       for (const part of content) {
-        if (part.type === 'text' && part.text && !skipText) block(part.text)
+        if (part.type === 'text' && part.text && !skipText) {
+          block(part.text)
+          pushTextBlock(part.text, part.id || '')
+        }
+        if (part.type === 'thinking') pushReasoningBlock(part.thinking || part.text)
         if (part.type === 'tool_use') {
           const input = part.input || {}
           const detail = input.command || input.file_path || input.filePath || input.path || input.description || ''
           line(`→ ${part.name || 'tool'}${detail ? `: ${detail}` : ''}`)
+          pushToolBlock(part.name, detail)
         }
       }
       claude.sawDelta = false
@@ -256,19 +332,29 @@ export function createLiveView(hand) {
       if (delta) {
         // 大多数时候是增量；如果它其实是累计文本，只补新增的那一段。
         if (delta.length > 8 && agy.last && delta.startsWith(agy.last)) {
-          append(delta.slice(agy.last.length))
+          const piece = delta.slice(agy.last.length)
+          append(piece)
+          pushTextBlock(piece)
         } else if (delta !== agy.last) {
           append(delta)
+          pushTextBlock(delta)
         }
         agy.last = delta
       } else if (step.state === 'DONE' && typeof step.text === 'string') {
         block(step.text)
+        pushTextBlock(step.text)
       }
-      if (step.tool_name) line(`→ ${step.tool_name}`)
+      if (step.tool_name) {
+        line(`→ ${step.tool_name}`)
+        pushToolBlock(step.tool_name)
+      }
       return
     }
     if (ev.event === 'result') {
-      if (!text.trim() && ev.result?.response) block(ev.result.response)
+      if (!text.trim() && ev.result?.response) {
+        block(ev.result.response)
+        pushTextBlock(ev.result.response)
+      }
     }
   }
 
@@ -282,6 +368,7 @@ export function createLiveView(hand) {
     if (source === 'stderr' && /^Reading additional input from stdin/i.test(trimmed)) return
     if (!trimmed.startsWith('{')) {
       line(raw)
+      pushTextBlock(raw)
       return
     }
     let ev = null
@@ -289,6 +376,7 @@ export function createLiveView(hand) {
       ev = JSON.parse(trimmed)
     } catch {
       line(raw)
+      pushTextBlock(raw)
       return
     }
     if (!ev || typeof ev !== 'object') {
@@ -321,9 +409,16 @@ export function createLiveView(hand) {
   return {
     feedEvent(update) {
       const mapped = mapAcpUpdate(update, acp)
-      if (mapped.thought) acp.thought += mapped.thought
+      if (mapped.thought) {
+        acp.thought += mapped.thought
+        pushReasoningBlock(mapped.thought)
+      }
       if (mapped.usage !== undefined) acp.usage = mapped.usage
-      if (mapped.text) feedAcpText(mapped.text)
+      if (mapped.tool) pushToolBlock(mapped.tool.name, '', mapped.tool.status)
+      if (mapped.text) {
+        feedAcpText(mapped.text)
+        if (!mapped.tool) pushTextBlock(mapped.text)
+      }
       return mapped
     },
     feed(chunk, source = 'stdout') {
@@ -354,6 +449,10 @@ export function createLiveView(hand) {
     },
     render() {
       return text
+    },
+    // 语义分块（思维链/正文/工具）。老调用方只读 render()，不受影响。
+    blocks() {
+      return blocks.map((block) => ({ ...block }))
     },
   }
 }
