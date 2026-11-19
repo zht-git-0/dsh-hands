@@ -79,6 +79,7 @@ window.__ModuleLoader__.load({
       asyncEmpty: 'no async jobs',
       asyncDelivery: 'delivery',
       asyncHint: 'Async dispatch queue: running/queued/retrying/failed; click for details',
+      asyncCancel: 'cancel',
       loadFailed: 'Could not read the dispatch feed.',
       showMore: 'Show older',
       justNow: 'just now',
@@ -166,6 +167,7 @@ window.__ModuleLoader__.load({
       asyncEmpty: '没有异步任务',
       asyncDelivery: '投递',
       asyncHint: '异步派活队列：跑着/排队/回传重试/回传失败，点开看详情',
+      asyncCancel: '取消',
       loadFailed: '读取调度输出失败。',
       showMore: '显示更早',
       justNow: '刚刚',
@@ -1632,6 +1634,8 @@ window.__ModuleLoader__.load({
       .dsh-hands-asyncrowDelivery{flex:none;opacity:.85}
       .dsh-hands-asyncrowId{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.6}
       .dsh-hands-asyncrowError{flex:none;max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-state-error-primary)}
+      .dsh-hands-asyncrowCancel{flex:none;padding:0 6px;border:.5px solid var(--dsw-alias-border-l2);border-radius:999px;background:transparent;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:10px;line-height:15px;cursor:pointer}
+      .dsh-hands-asyncrowCancel:hover{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
       .dsh-hands-asyncrow[data-status=failed] .dsh-hands-asyncrowStatus{color:var(--dsw-alias-state-error-primary)}
       .dsh-hands-v2-error{flex:none;margin:6px 8px 0;padding:5px 8px;border:.5px solid var(--dsw-alias-state-error-primary);border-radius:var(--dsw-radius-sm);color:var(--dsw-alias-state-error-primary);font-size:11px;line-height:16px;overflow-wrap:anywhere}
       .dsh-hands-v2,.dsh-hands-v2 *{box-sizing:border-box}
@@ -3108,6 +3112,7 @@ window.__ModuleLoader__.load({
       const t = props.t || ((key) => key);
       const [snap, setSnap] = React.useState(null);
       const [open, setOpen] = React.useState(false);
+      const [reload, setReload] = React.useState(0);
 
       React.useEffect(() => {
         let alive = true;
@@ -3129,7 +3134,7 @@ window.__ModuleLoader__.load({
           alive = false;
           if (timer) clearTimeout(timer);
         };
-      }, []);
+      }, [reload]);
 
       if (!snap) return null;
       const live = Array.isArray(snap.live) ? snap.live : [];
@@ -3143,6 +3148,19 @@ window.__ModuleLoader__.load({
         .slice(0, 20);
       // 没任何任务时不占地方；有任务才能点开详情
       if (!running && !waiting && !retrying && !failed && !rows.length) return null;
+      const cancelJob = async (id) => {
+        try {
+          await fetch(endpointOf('dsh-hands/cancel'), {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json', accept: 'application/json' },
+            body: JSON.stringify({ id }),
+          });
+        } catch {
+          // 取消失败就等下一轮刷新，别把面板弄挂
+        }
+        setReload((value) => value + 1);
+      };
       const bits = [];
       if (running) bits.push(`${t('asyncRunning')} ${running}`);
       if (waiting) bits.push(`${t('asyncQueued')} ${waiting}`);
@@ -3185,6 +3203,20 @@ window.__ModuleLoader__.load({
                         }`,
                       ),
                       h('span', { className: 'dsh-hands-asyncrowId', title: String(job.id) }, String(job.id)),
+                      String(job.status || '').toUpperCase() === 'RUNNING'
+                        ? h(
+                            'button',
+                            {
+                              type: 'button',
+                              className: 'dsh-hands-asyncrowCancel',
+                              onClick: (event) => {
+                                event.stopPropagation();
+                                cancelJob(job.id);
+                              },
+                            },
+                            t('asyncCancel'),
+                          )
+                        : null,
                       job.deliveryError
                         ? h('span', { className: 'dsh-hands-asyncrowError' }, String(job.deliveryError))
                         : null,
