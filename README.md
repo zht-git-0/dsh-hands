@@ -214,7 +214,9 @@ node acp/test-cancel.mjs        # 进程树击杀
   进程是**排队之后才起**的，不是起了再挂起。同步调用不受限（调用方自己愿意等）。
   派活返回值里带 `queue: {limit, active, waiting}`。
 - **观测口**：`GET /dsh-hands/async?n=50` 一次看到在跑的（`live`）和落盘的（`persisted`），
-  每条带 `delivery` / `deliveryError` / `deliveredAt`。
+  每条带 `delivery` / `deliveryError` / `deliveredAt` / `deliveryAttempts` / `nextRetryAt`。
+- **取消**：`POST /dsh-hands/cancel {id}` 先查正在跑的进程（`taskkill /T`），再查排队队列；
+  排队中的任务会被从队列摘下、`perform` 不执行，回传如实写 `CANCELLED`（`cancelled: 'queued'`）。
 - 已知代价：正在跑的任务随进程一起没，只能标孤儿，不能续跑（ACP/CLI 都是子进程，没有断点）。
 
 

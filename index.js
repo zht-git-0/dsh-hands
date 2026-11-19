@@ -750,11 +750,15 @@ export function nextAsyncDelivery(record, result, now = Date.now(), delays = ASY
 
 // 并发闸门：同时最多跑 limit 个，多的排队（先进先出）。
 // 提成模块级是为了能单测：并发上限、排队顺序、失败不卡队列。
+// run(start, key) 的第二参数是调用方的稳定标识（异步任务传 jobId）；
+// cancel(key) 把还在排队的条目摘下、promise 立刻 resolve({cancelled:true})，
+// start 不会再被调用；已在跑的条目取消不了（取消在总线上拦截进程）。
 export function createAsyncQueue(limit = 3) {
   // 0 要夹到 1（不能退化成默认值），没传/非数字才用默认 3
   const raw = limit === undefined || limit === null || limit === '' ? NaN : Math.trunc(Number(limit))
   const max = Number.isFinite(raw) ? Math.max(1, Math.min(16, raw)) : 3
   let active = 0
+  let seq = 0
   const waiting = []
 
   function pump() {
@@ -772,11 +776,20 @@ export function createAsyncQueue(limit = 3) {
   }
 
   return {
-    run(start) {
+    run(start, key) {
+      const id = key === undefined || key === null ? seq : key
+      seq += 1
       return new Promise((resolve, reject) => {
-        waiting.push({ start, resolve, reject })
+        waiting.push({ start, resolve, reject, key: id })
         pump()
       })
+    },
+    cancel(key) {
+      const index = waiting.findIndex((task) => task.key === key)
+      if (index < 0) return false
+      const [task] = waiting.splice(index, 1)
+      task.resolve({ cancelled: true })
+      return true
     },
     stats() {
       return { limit: max, active, waiting: waiting.length }
@@ -1391,7 +1404,8 @@ export function apply(ctx, config = {}) {
   // 四个手下同时起进程会把机器压死（每个都是独立 CLI，还带自己的模型会话）。
   // 同步调用不受限：那是调用方自己愿意等的。
   const asyncQueue = createAsyncQueue(config.maxAsync)
-  const runQueued = (start) => asyncQueue.run(start)
+  // 第二参数 key：异步任务传 jobId，/dsh-hands/cancel 就拿它去 asyncQueue.cancel
+  const runQueued = (start, key) => asyncQueue.run(start, key)
   const asyncQueueStats = () => asyncQueue.stats()
 
   async function deliverAsyncReport(ctx, job, text) {
@@ -1439,6 +1453,30 @@ export function apply(ctx, config = {}) {
     }
     await deliverAsyncWithRetry(ctx, job, record, text)
     return job
+  }
+
+  // 队列期取消（/dsh-hands/cancel 把排队中的条目摘下、value.cancelled）：
+  // perform 没跑，从运行表摘下并写 end 记录，回传按 CANCELLED 收尾。返回 true。
+  // 已在跑正常走 settleAsyncJob，返回 false。
+  function settleCancelledQueuedJob(ctx, job, run, value) {
+    if (!value?.cancelled) return false
+    if (run && !run.finished) {
+      finishDispatch(run, {
+        status: 'CANCELLED',
+        ok: false,
+        ms: Date.now() - job.startedAt,
+        error: 'cancelled',
+        excerpt: 'cancelled',
+      })
+    }
+    settleAsyncJob(ctx, job, {
+      status: 'CANCELLED',
+      ms: Date.now() - job.startedAt,
+      exitCode: null,
+      excerpt: '排队时被取消，进程没有启动',
+      error: 'cancelled while queued',
+    })
+    return true
   }
 
   // ── 回传的退避重试 ─────────────────────────────────────────────────────
@@ -2085,6 +2123,11 @@ export function apply(ctx, config = {}) {
                 if (!id) return fail(400, 'id is required')
                 const proc = RUNNING_PROCS.get(id)
                 if (!proc || proc.run?.finished) {
+                  // 排队中、还没起进程的任务：从队列里摘掉，promise 以 cancelled 收尾，
+                  // 由 settleCancelledQueuedJob 写 CANCELLED 回传。
+                  if (asyncQueue.cancel(id)) {
+                    return send(200, { ok: true, id, cancelled: 'queued', killed: false })
+                  }
                   // 幂等：跑完的、取消过的、不存在的 id 都按「没在跑」回，别谎报成功
                   return send(404, {
                     ok: false,
@@ -2323,9 +2366,11 @@ export function apply(ctx, config = {}) {
           delivery: 'pending',
         }
         beginAsyncJob(job)
-        runQueued(() => perform())
-          .then((value) =>
-            settleAsyncJob(ctx, job, {
+        runQueued(() => perform(), job.id)
+          .then((value) => {
+            // 排队阶段就被取消了：perform 没跑，直接按 CANCELLED 收尾
+            if (settleCancelledQueuedJob(ctx, job, run, value)) return job
+            return settleAsyncJob(ctx, job, {
               // /cancel 杀掉进程后 CLI 那条路只会返回失败码；回传要如实写 CANCELLED
               status: run.cancelled ? 'CANCELLED' : value.status,
               ms: (Number(value.durationSec) || 0) * 1000,
@@ -2334,8 +2379,8 @@ export function apply(ctx, config = {}) {
               cost: null,
               error: value.status === 'SUCCESS' || value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
               jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
-            }),
-          )
+            })
+          })
           .catch((error) =>
             settleAsyncJob(ctx, job, {
               status: 'ERROR',
@@ -2734,9 +2779,11 @@ export function apply(ctx, config = {}) {
           delivery: 'pending',
         }
         beginAsyncJob(job)
-        runQueued(() => perform())
-          .then((value) =>
-            settleAsyncJob(ctx, job, {
+        runQueued(() => perform(), job.id)
+          .then((value) => {
+            // 排队阶段就被取消了：perform 没跑，直接按 CANCELLED 收尾
+            if (settleCancelledQueuedJob(ctx, job, run, value)) return job
+            return settleAsyncJob(ctx, job, {
               // /cancel 杀掉进程后 CLI 那条路只会返回失败码；回传要如实写 CANCELLED
               status: run.cancelled ? 'CANCELLED' : value.status,
               ms: value.ms,
@@ -2745,8 +2792,8 @@ export function apply(ctx, config = {}) {
               cost: null,
               error: value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
               jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
-            }),
-          )
+            })
+          })
           .catch((error) =>
             settleAsyncJob(ctx, job, {
               status: 'ERROR',
@@ -2958,15 +3005,18 @@ export function apply(ctx, config = {}) {
               jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
             })
           }
-        }).catch((error) =>
-          settleAsyncJob(ctx, job, {
-            status: 'ERROR',
-            ms: Date.now() - job.startedAt,
-            exitCode: null,
-            excerpt: '',
-            error: String(error?.message ?? error),
-          }),
-        )
+        }, job.id)
+          // 排队阶段就被取消了：spawn 没跑，直接按 CANCELLED 收尾
+          .then((value) => settleCancelledQueuedJob(ctx, job, run, value))
+          .catch((error) =>
+            settleAsyncJob(ctx, job, {
+              status: 'ERROR',
+              ms: Date.now() - job.startedAt,
+              exitCode: null,
+              excerpt: '',
+              error: String(error?.message ?? error),
+            }),
+          )
         return clean({
           status: 'RUNNING',
           jobId: job.id,
@@ -3166,9 +3216,11 @@ export function apply(ctx, config = {}) {
           delivery: 'pending',
         }
         beginAsyncJob(job)
-        runQueued(() => perform())
-          .then((value) =>
-            settleAsyncJob(ctx, job, {
+        runQueued(() => perform(), job.id)
+          .then((value) => {
+            // 排队阶段就被取消了：perform 没跑，直接按 CANCELLED 收尾
+            if (settleCancelledQueuedJob(ctx, job, run, value)) return job
+            return settleAsyncJob(ctx, job, {
               // /cancel 杀掉进程后 CLI 那条路只会返回失败码；回传要如实写 CANCELLED
               status: run.cancelled ? 'CANCELLED' : value.status,
               ms: value.ms,
@@ -3177,8 +3229,8 @@ export function apply(ctx, config = {}) {
               cost: value.cost,
               error: value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
               jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
-            }),
-          )
+            })
+          })
           .catch((error) =>
             settleAsyncJob(ctx, job, {
               status: 'ERROR',
