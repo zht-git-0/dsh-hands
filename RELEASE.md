@@ -6,8 +6,8 @@
 
 | 角色 | 目录 | 谁能改 |
 |---|---|---|
-| **开发版** | `D:\Program\projects\dsh-hands`（本仓库） | 随便改，改崩了不关线上事 |
-| **上线版** | `D:\Program\tools\dsh-hands-release` | **只允许 `scripts/release.ps1 -Approved` 写入**，禁止手改 |
+| **开发版** | `<repo>`（本仓库） | 随便改，改崩了不关线上事 |
+| **上线版** | `<release-dir>` | **只允许 `scripts/release.ps1 -Approved` 写入**，禁止手改 |
 
 DSH profile 的 `dsh-hands` link 指向**上线版**，不指向开发版。开发版只用来写代码和测试。
 
@@ -34,7 +34,7 @@ DSH profile 的 `dsh-hands` link 指向**上线版**，不指向开发版。开�
 
 ```powershell
 # 0. 开发版里改完，测试先过
-cd D:\Program\projects\dsh-hands
+cd <repo>
 node --test                     # 或项目现有的测试/冒烟
 
 # 1. 找爸爸确认（唯一开关，不能自己给自己点头）
@@ -54,7 +54,7 @@ curl http://127.0.0.1:<当前端口>/dsh-hands/health
 ## 回滚
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\release.ps1 -Rollback "D:\Program\backups\dsh-hands\release-<时间戳>"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\release.ps1 -Rollback "<backup-dir>\release-<时间戳>"
 # 然后同样 toggle / 重启 DSH
 ```
 

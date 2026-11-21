@@ -856,31 +856,45 @@ export function resolveOpenFolder(knownCwds, wanted) {
 export function apply(ctx, config = {}) {
   // 四家的二进制：配置 > 本机常用安装位置 > 默认值，取第一个真实存在的。
   // 这样重装 / 目录被清之后不用改配置也能自己找回来。
-  const NODE_DIR = process.env.DSH_NODE_DIR || 'D:\\Program\\environment\\nodejs'
+  // 自动找二进制，开源版不写死任何本机路径：
+  // 配置 > PATH 里的同名命令 > DSH 自带 node 目录 > 各家常见安装位置。
+  const NODE_DIR =
+    process.env.DSH_NODE_DIR || (process.execPath ? path.dirname(process.execPath) : '')
+  const LOCAL_BIN = path.join(os.homedir(), '.local', 'bin')
   const bin = pickBin([
     config.agyBin,
     config.bin,
-    path.join(NODE_DIR, 'agy.exe'),
+    'agy',
+    'agy.exe',
+    NODE_DIR && path.join(NODE_DIR, 'agy.exe'),
+    LOCAL_BIN && path.join(LOCAL_BIN, 'agy.exe'),
     DEFAULT_BIN,
   ])
   const codexBin = pickBin([
     config.codexBin,
-    path.join(NODE_DIR, 'codex.cmd'),
+    'codex',
+    'codex.cmd',
+    NODE_DIR && path.join(NODE_DIR, 'codex.cmd'),
     DEFAULT_CODEX_BIN,
   ])
   const claudeBin = pickBin([
     config.claudeBin,
-    path.join(NODE_DIR, 'claude.exe'),
-    path.join(os.homedir(), '.local', 'bin', 'claude.exe'),
+    'claude',
+    'claude.exe',
+    LOCAL_BIN && path.join(LOCAL_BIN, 'claude.exe'),
+    NODE_DIR && path.join(NODE_DIR, 'claude.exe'),
     DEFAULT_CLAUDE_BIN,
   ])
   const opencodeBin = pickBin([
     config.opencodeBin,
-    path.join(NODE_DIR, 'opencode.cmd'),
+    'opencode',
+    'opencode.cmd',
+    NODE_DIR && path.join(NODE_DIR, 'opencode.cmd'),
     DEFAULT_OPENCODE_BIN,
   ])
   const defaultTimeout = Number(config.timeoutSec) || 900
-  const skipPermissions = config.skipPermissions !== false
+  // 默认不跳过权限确认；要用「写入模式」就显式在配置里开 skipPermissions: true
+  const skipPermissions = config.skipPermissions === true
   // ACP 开关（第 6 步）：默认空 = 四家全走 CLI，和以前完全一样。
   // 填 ['opencode'] 就让 opencode 走 ACP runner，其余照旧；一家一家切，出事删掉这个配置即可回退。
   const acpHands = new Set(

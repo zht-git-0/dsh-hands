@@ -1,11 +1,9 @@
+# dsh-hands 的插件清单。四个 CLI 默认自动探测（PATH / DSH node 目录 / 常见安装位置），
+# 找不到再在这里显式写路径：agyBin / codexBin / claudeBin / opencodeBin。
 - insert:
     - id: hands
       name: 'dsh-hands'
       config:
-        agyBin: 'C:/Users/Administrator/AppData/Local/agy/bin/agy.exe'
-        codexBin: 'D:/Program/environment/nodejs/codex.cmd'
-        claudeBin: 'C:/Users/Administrator/.local/bin/claude.exe'
-        opencodeBin: 'D:/Program/environment/nodejs/opencode.cmd'
         timeoutSec: 900
-        skipPermissions: true
-        acpHands: ['opencode']
+        # skipPermissions: true   # 默认 false：agy 不跳过权限确认；要写入模式再打开
+        acpHands: []

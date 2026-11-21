@@ -18,6 +18,8 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
+    "skill/",
+    "assets/icons/",
     "README.md",
     "LICENSE"
   ],
@@ -32,5 +34,28 @@
         "@deepseek-ai/dsh-client-ui-sidebar-right"
       ]
     }
+  },
+  "license": "MIT",
+  "author": "dsh-hands contributors",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OWNER/dsh-hands.git"
+  },
+  "homepage": "https://github.com/OWNER/dsh-hands#readme",
+  "bugs": {
+    "url": "https://github.com/OWNER/dsh-hands/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "agent",
+    "codex",
+    "claude",
+    "opencode",
+    "antigravity",
+    "plugin"
+  ],
+  "engines": {
+    "node": ">=20"
   }
 }

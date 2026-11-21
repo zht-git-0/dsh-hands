@@ -2,3 +2,4 @@ node_modules/
 *.log
 acp/last-delegation.md
 *.bak-*
+acp/task-step*.md
