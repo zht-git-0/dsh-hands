@@ -429,6 +429,7 @@ window.__ModuleLoader__.load({
       selection: 'selection',
       phase: 'meta',
       connected: 'meta',
+      archivedView: 'sessions',
       error: 'meta',
       checkedAt: 'meta',
     };
@@ -581,6 +582,7 @@ window.__ModuleLoader__.load({
             sessions: state.sessionsByHand[sel.hand] || EMPTY_LIST,
             selectedKey: sel.key,
             phase: state.phase,
+            archivedView: !!state.archivedView,
           };
         }
         if (name === 'turns') {
@@ -702,14 +704,17 @@ window.__ModuleLoader__.load({
         }
       }
 
-      async function loadSessions(hand) {
+      async function loadSessions(hand, opts = {}) {
         const wanted = String(hand || '');
         if (!wanted) return [];
+        const archived = opts.archived === undefined ? !!state.archivedView : !!opts.archived;
         const seq = (sessionSeq.get(wanted) || 0) + 1;
         sessionSeq.set(wanted, seq);
         const life = lifeToken;
         try {
-          const data = await getJson(`dsh-hands/sessions?hand=${encodeURIComponent(wanted)}`);
+          const data = await getJson(
+            `dsh-hands/sessions?hand=${encodeURIComponent(wanted)}${archived ? '&archived=1' : ''}`,
+          );
           if (life !== lifeToken) return [];
           if (sessionSeq.get(wanted) !== seq) return []; // 更晚的请求已经出发，旧包不要
           const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
@@ -943,6 +948,29 @@ window.__ModuleLoader__.load({
         } catch (error) {
           return { ok: false, error: failureOf(error) };
         }
+      }
+
+      async function archiveSession(key, archived) {
+        const wanted = String(key || '');
+        if (!wanted) return { ok: false, error: 'key is required' };
+        try {
+          const data = await postJson('dsh-hands/archive-session', {
+            key: wanted,
+            hand: String(slice.hand || ''),
+            archived: archived !== false,
+          });
+          await loadSessions(String(slice.hand || ''), { archived: !!state.archivedView });
+          loadAgents();
+          return { ok: true, data };
+        } catch (error) {
+          return { ok: false, error: failureOf(error) };
+        }
+      }
+
+      async function setArchivedView(on) {
+        emit({ archivedView: !!on });
+        const hand = String(slice.hand || '');
+        if (hand) await loadSessions(hand, { archived: !!on });
       }
 
       async function deleteSession(key) {
@@ -1331,6 +1359,8 @@ window.__ModuleLoader__.load({
         ensureTurnBody,
         cancelTurn,
         deleteSession,
+        archiveSession,
+        setArchivedView,
         rerunTurn,
         appendLive,
         // 测试用：断言 timer / EventSource / live 记账都清干净
@@ -1693,7 +1723,10 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-check{display:inline-flex;align-items:center;gap:4px;color:var(--dsw-alias-label-secondary);font-size:10.5px;line-height:15px;cursor:pointer}
       .dsh-hands-v2-grow{flex:1}
       .dsh-hands-v2-stopBtn{flex:none;padding:2px 10px;border-radius:999px;border:1px solid color-mix(in srgb,var(--dsw-alias-state-error-primary) 60%,transparent);background:transparent;color:var(--dsw-alias-state-error-primary);font:inherit;font-size:11px;line-height:18px;cursor:pointer}
-      .dsh-hands-v2-searchInput{width:100%;box-sizing:border-box;padding:3px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:11px;line-height:16px}
+      .dsh-hands-v2-search{display:flex;align-items:center;gap:6px;min-width:0}
+      .dsh-hands-v2-searchInput{flex:1;min-width:0;box-sizing:border-box;padding:3px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:11px;line-height:16px}
+      .dsh-hands-v2-archToggle{flex:none;padding:2px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:11px;line-height:16px;cursor:pointer}
+      .dsh-hands-v2-archToggle[data-active=true]{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
       .dsh-hands-v2-searchInput::placeholder{color:var(--dsw-alias-label-tertiary)}
       .dsh-hands-v2-searchInput:focus{outline:1px solid var(--dsw-alias-brand-primary);outline-offset:-1px}
       .dsh-hands-v2-folder{display:flex;align-items:center;gap:2px;min-width:0;border-radius:6px}
@@ -1704,6 +1737,9 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-folderCaret{flex:none;width:10px;font-size:10px;opacity:.75}
       .dsh-hands-v2-folderName{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
       .dsh-hands-v2-folderCount{flex:none;opacity:.7;font-variant-numeric:tabular-nums}
+      .dsh-hands-v2-rowArch{flex:none;width:16px;height:16px;line-height:16px;text-align:center;border-radius:50%;color:var(--dsw-alias-label-tertiary);font-size:11px;opacity:0;transition:opacity .12s}
+      .dsh-hands-v2-row:hover .dsh-hands-v2-rowArch{opacity:1}
+      .dsh-hands-v2-rowArch:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
       .dsh-hands-v2-rowDel{flex:none;width:16px;height:16px;line-height:16px;text-align:center;border-radius:50%;color:var(--dsw-alias-label-tertiary);font-size:11px;opacity:0;transition:opacity .12s}
       .dsh-hands-v2-row:hover .dsh-hands-v2-rowDel{opacity:1}
       .dsh-hands-v2-rowDel:hover{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 18%,transparent);color:var(--dsw-alias-state-error-primary)}
@@ -2484,6 +2520,17 @@ window.__ModuleLoader__.load({
             placeholder: t('searchSessions'),
             onChange: (event) => setQuery(event.target.value),
           }),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-hands-v2-archToggle',
+              'data-active': slice.archivedView ? 'true' : 'false',
+              title: slice.archivedView ? '回到会话列表' : '看归档会话',
+              onClick: () => store.setArchivedView && store.setArchivedView(!slice.archivedView),
+            },
+            slice.archivedView ? '归档中' : '归档',
+          ),
         ),
         visibleSessions.length
           ? h(
@@ -2567,6 +2614,18 @@ window.__ModuleLoader__.load({
                             { className: 'dsh-hands-v2-rowTurns' },
                             t('v2Turns', { n: Number(row.turns) || 0 }),
                           ),
+                          h('span', {
+                            className: 'dsh-hands-v2-rowArch',
+                            title: slice.archivedView ? '取消归档' : '归档会话',
+                            'aria-label': slice.archivedView ? '取消归档' : '归档会话',
+                            onClick: (event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              if (typeof store.archiveSession === 'function') {
+                                store.archiveSession(key, !slice.archivedView);
+                              }
+                            },
+                          }, slice.archivedView ? '↩' : '⤓'),
                           h('span', {
                             className: 'dsh-hands-v2-rowDel',
                             title: '删除会话',

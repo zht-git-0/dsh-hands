@@ -965,6 +965,12 @@ export function apply(ctx, config = {}) {
   const JOBS_DIR = path.join(os.homedir(), '.dsh', 'hands-jobs')
   // 被删掉的会话：只从面板里隐藏，不动各家自己的会话文件（那些删了不可逆）。
   const HIDDEN_FILE = path.join(os.homedir(), '.dsh', 'hands-hidden.json')
+  const ARCHIVE_FILE = path.join(os.homedir(), '.dsh', 'hands-archive.json')
+  const readArchive = () => {
+    const raw = readJson(ARCHIVE_FILE, { keys: [] }) || {}
+    return Array.isArray(raw.keys) ? raw.keys.map(String) : []
+  }
+  const writeArchive = (keys) => writeJson(ARCHIVE_FILE, { keys: [...new Set(keys.map(String))] })
   const readHidden = () => {
     const raw = readJson(HIDDEN_FILE, { keys: [] }) || {}
     return Array.isArray(raw.keys) ? raw.keys.map(String) : []
@@ -1176,7 +1182,8 @@ export function apply(ctx, config = {}) {
     ]
   }
 
-  function listSessions(handFilter = '') {
+  function listSessions(handFilter = '', opts = {}) {
+    const wantArchived = !!opts.archived
     ensureToday()
     const rows = new Map()
     const ensureRow = (key, hand) => {
@@ -1270,8 +1277,10 @@ export function apply(ctx, config = {}) {
     }
 
     const hidden = new Set(readHidden())
+    const archived = new Set(readArchive())
     return [...rows.values()]
       .filter((row) => !hidden.has(String(row.key)))
+      .filter((row) => (wantArchived ? archived.has(String(row.key)) : !archived.has(String(row.key))))
       .sort((a, b) => String(b.lastAt || '').localeCompare(String(a.lastAt || '')))
   }
 
@@ -1717,10 +1726,10 @@ export function apply(ctx, config = {}) {
     return { checkedAt, revision: agentsRevision, agents }
   }
 
-  function sessionsForHand(hand) {
+  function sessionsForHand(hand, opts = {}) {
     const wanted = String(hand || '')
     // 原样包一层 listSessions()，不动它已有的字段
-    return { hand: wanted, sessions: listSessions(wanted) }
+    return { hand: wanted, sessions: listSessions(wanted, opts) }
   }
 
   function sessionsRevisionOf(hand) {
@@ -2321,7 +2330,7 @@ export function apply(ctx, config = {}) {
 
             if (u.pathname === '/dsh-hands/sessions') {
               try {
-                return send(200, sessionsForHand(String(u.searchParams.get('hand') || '')))
+                return send(200, sessionsForHand(String(u.searchParams.get('hand') || ''), { archived: u.searchParams.get('archived') === '1' }))
               } catch (e) {
                 return fail(500, e)
               }
@@ -2371,6 +2380,23 @@ export function apply(ctx, config = {}) {
               }
             }
 
+            if (u.pathname === '/dsh-hands/archive-session') {
+              if (req.method !== 'POST') return fail(405, 'POST only')
+              try {
+                const body = parseBody(await readBody(req))
+                const key = String(body.key || '').trim()
+                if (!key) return fail(400, 'key is required')
+                const archived = body.archived !== false
+                const keys = readArchive()
+                const next = archived ? [...keys.filter((k) => k !== key), key] : keys.filter((k) => k !== key)
+                writeArchive(next)
+                const hand = String(body.hand || '')
+                if (hand) handRevisions.set(hand, (handRevisions.get(hand) || 0) + 1)
+                return send(200, { ok: true, key, archived, count: next.length })
+              } catch (error) {
+                return fail(400, String(error?.message ?? error))
+              }
+            }
             if (u.pathname === '/dsh-hands/delete-session') {
               if (req.method !== 'POST') return fail(405, 'POST only')
               try {
