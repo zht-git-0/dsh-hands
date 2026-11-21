@@ -121,10 +121,10 @@ const t = (key) => key
   const tree = flatten(page)
 
   assert.ok(byClass(tree, 'dsh-hands-page').length === 1, '外层 .dsh-hands-page')
-  assert.ok(byClass(tree, 'dsh-hands-pageHead').length === 1, '头部')
+  assert.ok(byClass(tree, 'dsh-hands-pageHead').length === 0, '头部已删')
   assert.ok(byClass(tree, 'dsh-hands-pageBody').length === 1, '主体')
-  assert.ok(byClass(tree, 'dsh-hands-pageTitle').length === 1, '标题')
-  assert.ok(byClass(tree, 'dsh-hands-pageSub').length === 1, '副标题')
+  assert.ok(byClass(tree, 'dsh-hands-pageTitle').length === 0, '标题已删')
+  assert.ok(byClass(tree, 'dsh-hands-pageSub').length === 0, '副标题已删')
   // 顶部横条：先 rail 再 body（爸爸 2026-11-21 19:37 要求把 AI 标签挪到顶部）
   const topwrap = byClass(tree, 'dsh-hands-v2-topwrap')[0]
   assert.ok(topwrap, '顶部横条容器存在')
@@ -145,8 +145,8 @@ const t = (key) => key
   assert.ok(byClass(tree, 'dsh-hands-v2-thread').length === 1, '第三列对话')
 
   const text = textOf(tree)
-  assert.ok(text.includes('navLabel'), '标题走 navLabel')
-  assert.ok(text.includes('pageSub'), '副标题走 pageSub')
+  assert.ok(!text.includes('navLabel'), '顶层标题不再渲染')
+  assert.ok(!text.includes('pageSub'), '副标题不再渲染')
   assert.ok(text.includes('refresh') === false, '刷新是 title 不是正文')
   console.log('2) 整页结构 ok')
 }

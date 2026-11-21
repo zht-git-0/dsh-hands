@@ -65,6 +65,7 @@ window.__ModuleLoader__.load({
       openFolder: 'Open folder',
       usageHint: 'Session total',
       searchSessions: 'Search sessions or folders',
+      searchArchivedSessions: 'Search archived sessions',
       searchTurns: 'Search turns',
       searchEmpty: 'No matches',
       asyncTasks: 'Async',
@@ -153,6 +154,7 @@ window.__ModuleLoader__.load({
       openFolder: '打开文件夹',
       usageHint: '整条会话累计',
       searchSessions: '搜索会话或目录',
+      searchArchivedSessions: '搜索归档会话',
       searchTurns: '搜索轮次',
       searchEmpty: '没有匹配',
       asyncTasks: '异步',
@@ -2502,7 +2504,7 @@ window.__ModuleLoader__.load({
             type: 'search',
             className: 'dsh-hands-v2-searchInput',
             value: query,
-            placeholder: t('searchSessions'),
+            placeholder: slice.archivedView ? t('searchArchivedSessions') : t('searchSessions'),
             onChange: (event) => setQuery(event.target.value),
           }),
           h(
@@ -2511,10 +2513,11 @@ window.__ModuleLoader__.load({
               type: 'button',
               className: 'dsh-hands-v2-archToggle',
               'data-active': slice.archivedView ? 'true' : 'false',
-              title: slice.archivedView ? '回到会话列表' : '看归档会话',
+              title: slice.archivedView ? '返回会话列表' : '查看归档会话',
+              'aria-label': slice.archivedView ? '返回会话列表' : '查看归档会话',
               onClick: () => store.setArchivedView && store.setArchivedView(!slice.archivedView),
             },
-            slice.archivedView ? '归档中' : '归档',
+            slice.archivedView ? '←' : '▤',
           ),
         ),
         visibleSessions.length
@@ -3459,10 +3462,6 @@ window.__ModuleLoader__.load({
 
     const PAGE_CSS = `
       .dsh-hands-page{display:flex;flex-direction:column;flex:auto;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;color:var(--dsw-alias-label-primary)}
-      .dsh-hands-pageHead{flex:none;display:flex;align-items:center;gap:8px;min-width:0;padding:16px 18px 12px}
-      .dsh-hands-pageMain{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
-      .dsh-hands-pageTitle{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px;line-height:21px;font-weight:600}
-      .dsh-hands-pageSub{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:17px}
       .dsh-hands-pageBody{flex:1;display:flex;min-width:0;min-height:0;padding:0 6px 6px;overflow:hidden}
     `;
 
@@ -3489,48 +3488,10 @@ window.__ModuleLoader__.load({
     function HandsPage(props) {
       const t = props.t || ((key) => key);
       const store = props.store;
-      const meta = useStoreSlice(store, 'meta');
       return h(
         'div',
         { className: 'dsh-hands-page' },
         h('style', null, PAGE_CSS),
-        h(
-          'div',
-          { className: 'dsh-hands-pageHead' },
-          h(
-            'div',
-            { className: 'dsh-hands-pageMain' },
-            h('div', { className: 'dsh-hands-pageTitle' }, t('navLabel')),
-            h('div', { className: 'dsh-hands-pageSub' }, t('pageSub')),
-          ),
-          h('span', {
-            className: 'dsh-hands-v2-dot',
-            'data-tone': meta.connected ? 'running' : 'idle',
-            style: {
-              '--tone-color': meta.connected
-                ? 'var(--dsw-alias-state-success-primary)'
-                : 'var(--dsw-alias-label-tertiary)',
-            },
-          }),
-          h(
-            'span',
-            {
-              className: 'dsh-hands-v2-liveTag',
-              'data-connected': meta.connected ? 'true' : 'false',
-            },
-            meta.connected ? t('live') : t('reconnecting'),
-          ),
-          h(
-            'button',
-            {
-              type: 'button',
-              className: 'dsh-hands-v2-iconBtn',
-              title: t('refresh'),
-              onClick: () => store.refreshAll(),
-            },
-            '↻',
-          ),
-        ),
         h('div', { className: 'dsh-hands-pageBody' }, h(HandsPaneV2, { t, store })),
       );
     }
