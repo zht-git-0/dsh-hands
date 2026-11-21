@@ -4036,7 +4036,25 @@ export function apply(ctx, config = {}) {
           id: jobId,
           hand: to,
           tool: 'hands_run',
-          sessionId: known || '',
+          // 投递要靠「调用方 DSH 会话 id」，不是手下自己的会话 id。
+          // 2026-11-22 02:14 实测这里还是空的：多试几种形状，并把 ctx 结构记下来。
+          sessionId:
+            sessionIdFromExec(ctx) ||
+            String(ctx?.session?.id || ctx?.sessionId || ctx?.agent?.session?.id || ''),
+          debugCtx: (() => {
+            try {
+              if (!ctx) return null;
+              const agent = ctx.agent || ctx.caller || ctx.agentRef || null;
+              return {
+                keys: Object.keys(ctx).slice(0, 30),
+                agentKeys: agent ? Object.keys(agent).slice(0, 30) : null,
+                sessionKeys: agent && agent.session ? Object.keys(agent.session).slice(0, 20) : null,
+                sessionId: agent && agent.session ? (agent.session.id || agent.session.sessionId || '') : '',
+              };
+            } catch {
+              return null;
+            }
+          })(),
           prompt,
           startedAt: Date.now(),
           status: 'RUNNING',
