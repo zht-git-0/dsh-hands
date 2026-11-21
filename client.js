@@ -971,7 +971,13 @@ window.__ModuleLoader__.load({
 
       async function setArchivedView(on) {
         emit({ archivedView: !!on });
-        const hand = String(slice.hand || '');
+        // 没选中的手就挑第一个：否则切了归档视图列表不会动，看着像没生效
+        let hand = String(slice.hand || '');
+        if (!hand) {
+          const first = (state.agents || []).find((a) => a && a.hand);
+          hand = first ? String(first.hand) : '';
+          if (hand) store.select(hand, state.selection.key || '');
+        }
         if (hand) await loadSessions(hand, { archived: !!on });
       }
 

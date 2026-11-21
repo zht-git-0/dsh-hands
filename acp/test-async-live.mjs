@@ -5,11 +5,11 @@
 //   1. 工具是不是**立刻**返回 RUNNING + jobId（不等模型）
 //   2. 跑完之后是不是真的调了 agent.followup，正文是不是契约格式
 //
-// 会花一点钱（一次极小会话），想跳过就设 SKIP_LIVE=1。
+// ⚠️ 会真花钱（起一次 claude 会话，约 $0.05）。默认跳过，必须显式 HANDS_LIVE=1 才跑。
 import assert from 'node:assert/strict'
 
-if (process.env.SKIP_LIVE === '1') {
-  console.log('skip (SKIP_LIVE=1)')
+if (process.env.HANDS_LIVE !== '1') {
+  console.log('skip (设置 HANDS_LIVE=1 才跑真链路测试，避免意外花钱)')
   process.exit(0)
 }
 
