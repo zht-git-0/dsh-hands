@@ -893,8 +893,8 @@ export function apply(ctx, config = {}) {
     DEFAULT_OPENCODE_BIN,
   ])
   const defaultTimeout = Number(config.timeoutSec) || 900
-  // 默认不跳过权限确认；要用「写入模式」就显式在配置里开 skipPermissions: true
-  const skipPermissions = config.skipPermissions === true
+  // 默认跳过权限确认（发布版行为）；要收紧就在配置里写 skipPermissions: false
+  const skipPermissions = config.skipPermissions !== false
   // ACP 开关（第 6 步）：默认空 = 四家全走 CLI，和以前完全一样。
   // 填 ['opencode'] 就让 opencode 走 ACP runner，其余照旧；一家一家切，出事删掉这个配置即可回退。
   const acpHands = new Set(

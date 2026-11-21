@@ -1,6 +1,6 @@
 {
   "name": "dsh-hands",
-  "version": "2.6.13",
+  "version": "2.6.14",
   "type": "module",
   "description": "把本机的 agy、codex、claude、opencode 四个命令行智能体接成 DSH 工具，并在对话右侧边栏提供实时「手下任务」流式看板。",
   "main": "./index.js",

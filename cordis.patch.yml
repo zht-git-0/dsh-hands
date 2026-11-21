@@ -5,5 +5,5 @@
       name: 'dsh-hands'
       config:
         timeoutSec: 900
-        # skipPermissions: true   # 默认 false：agy 不跳过权限确认；要写入模式再打开
+        skipPermissions: true   # 默认全跳过；要收紧改成 false
         acpHands: []
