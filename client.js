@@ -29,7 +29,7 @@ window.__ModuleLoader__.load({
 
     const en = {
       title: 'Hands',
-      navLabel: 'Xike',
+      navLabel: 'Agent Hands',
       pageSub: 'Dispatched hands and the replies they stream back.',
       subtitle: 'Your briefs and the hand’s live output.',
       guide: 'Watch dispatched hands and what they are saying right now.',
@@ -67,9 +67,6 @@ window.__ModuleLoader__.load({
       searchSessions: 'Search sessions or folders',
       searchTurns: 'Search turns',
       searchEmpty: 'No matches',
-      composerPlaceholder: 'Dispatch a task to this hand… (Ctrl+Enter to send)',
-      composerWrite: 'allow file writes',
-      composerSend: 'Dispatch',
       asyncTasks: 'Async',
       asyncRunning: 'running',
       asyncQueued: 'queued',
@@ -98,6 +95,7 @@ window.__ModuleLoader__.load({
       v2Today: '{n} today',
       v2Hands: 'Hands',
       v2TodayTimes: '{n} today',
+      v2Stop: 'Stop',
       v2Idle: 'Idle',
       v2RunningN: '{n} running',
       v2Cancel: 'Cancel',
@@ -119,7 +117,7 @@ window.__ModuleLoader__.load({
 
     const zh = {
       title: '手下任务',
-      navLabel: '希可',
+      navLabel: 'Agent Hands',
       pageSub: '派出去的活，和它们正在回的。',
       subtitle: '你派出去的活，和对面实时返回的输出。',
       guide: '看派出去的手下正在说什么。',
@@ -157,9 +155,6 @@ window.__ModuleLoader__.load({
       searchSessions: '搜索会话或目录',
       searchTurns: '搜索轮次',
       searchEmpty: '没有匹配',
-      composerPlaceholder: '给这个手下派活…（Ctrl+Enter 发送）',
-      composerWrite: '允许改文件',
-      composerSend: '派活',
       asyncTasks: '异步',
       asyncRunning: '跑着',
       asyncQueued: '排队',
@@ -188,6 +183,7 @@ window.__ModuleLoader__.load({
       v2Today: '今日 {n} 轮',
       v2Hands: '手下',
       v2TodayTimes: '今日 {n} 次',
+      v2Stop: '停止',
       v2Idle: '空闲',
       v2RunningN: '在跑 {n}',
       v2Cancel: '取消',
@@ -1649,7 +1645,7 @@ window.__ModuleLoader__.load({
       .dsh-hands-asyncrow[data-status=failed] .dsh-hands-asyncrowStatus{color:var(--dsw-alias-state-error-primary)}
       .dsh-hands-v2-error{flex:none;margin:6px 8px 0;padding:5px 8px;border:.5px solid var(--dsw-alias-state-error-primary);border-radius:var(--dsw-radius-sm);color:var(--dsw-alias-state-error-primary);font-size:11px;line-height:16px;overflow-wrap:anywhere}
       .dsh-hands-v2,.dsh-hands-v2 *{box-sizing:border-box}
-      .dsh-hands-v2-rail{flex:none;display:flex;flex-direction:column;width:clamp(168px,24%,220px);min-width:0;padding:8px 6px;border-right:.5px solid var(--dsw-alias-border-l2);overflow:hidden}
+      .dsh-hands-v2-rail{flex:none;display:flex;flex-direction:column;width:clamp(104px,14%,132px);min-width:0;padding:8px 4px;border-right:.5px solid var(--dsw-alias-border-l2);overflow:hidden}
       .dsh-hands-v2-railHead{flex:none;padding:0 6px 6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:16px}
       .dsh-hands-v2-agentList{flex:1;min-height:0;display:flex;flex-direction:column;gap:6px;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain}
       .dsh-hands-v2-agent{position:relative;flex:none;display:flex;align-items:center;gap:10px;width:100%;min-height:56px;padding:8px 10px;border:0;border-radius:10px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
@@ -1665,7 +1661,7 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--tone-color,var(--dsw-alias-label-tertiary))}
       .dsh-hands-v2-dot[data-tone=running]{animation:dsh-hands-pulse 1.6s ease-out infinite}
       .dsh-hands-v2-sessions{flex:none;display:flex;flex-direction:column;width:clamp(150px,22%,200px);min-width:0;border-right:.5px solid var(--dsw-alias-border-l2);overflow:hidden}
-      .dsh-hands-v2[data-mode=narrow] .dsh-hands-v2-rail{width:130px}
+      .dsh-hands-v2[data-mode=narrow] .dsh-hands-v2-rail{width:96px}
       .dsh-hands-v2[data-mode=narrow] .dsh-hands-v2-sessions{width:120px}
       .dsh-hands-v2[data-mode=narrow] .dsh-hands-v2-railHead{padding:0 4px 6px}
       .dsh-hands-v2[data-mode=drill] .dsh-hands-v2-rail,.dsh-hands-v2[data-mode=drill] .dsh-hands-v2-sessions,.dsh-hands-v2[data-mode=drill] .dsh-hands-v2-thread{width:100%;border-right:0}
@@ -1678,13 +1674,9 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-list{flex:1;min-height:0;display:flex;flex-direction:column;gap:4px;padding:0 6px 8px;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain}
       .dsh-hands-v2-group{display:flex;flex-direction:column;gap:2px;min-width:0}
       .dsh-hands-v2-search{flex:none;padding:0 8px 6px}
-      .dsh-hands-v2-composer{flex:none;display:flex;flex-direction:column;gap:4px;padding:6px 8px;border-top:.5px solid var(--dsw-alias-border-l2)}
-      .dsh-hands-v2-composerInput{width:100%;box-sizing:border-box;resize:vertical;min-height:36px;max-height:120px;padding:5px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:11.5px;line-height:17px}
-      .dsh-hands-v2-composerInput::placeholder{color:var(--dsw-alias-label-tertiary)}
-      .dsh-hands-v2-composerInput:focus{outline:1px solid var(--dsw-alias-brand-primary);outline-offset:-1px}
-      .dsh-hands-v2-composerRow{display:flex;align-items:center;gap:8px;min-width:0}
       .dsh-hands-v2-check{display:inline-flex;align-items:center;gap:4px;color:var(--dsw-alias-label-secondary);font-size:10.5px;line-height:15px;cursor:pointer}
       .dsh-hands-v2-grow{flex:1}
+      .dsh-hands-v2-stopBtn{flex:none;padding:2px 10px;border-radius:999px;border:1px solid color-mix(in srgb,var(--dsw-alias-state-error-primary) 60%,transparent);background:transparent;color:var(--dsw-alias-state-error-primary);font:inherit;font-size:11px;line-height:18px;cursor:pointer}
       .dsh-hands-v2-searchInput{width:100%;box-sizing:border-box;padding:3px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:11px;line-height:16px}
       .dsh-hands-v2-searchInput::placeholder{color:var(--dsw-alias-label-tertiary)}
       .dsh-hands-v2-searchInput:focus{outline:1px solid var(--dsw-alias-brand-primary);outline-offset:-1px}
@@ -2268,9 +2260,13 @@ window.__ModuleLoader__.load({
     }
 
     // agent 卡片主标题：服务端 label 形如「agy（文案）」，去掉括号里的注解只留名字。
+    // 手下展示名：爸爸 2026-11-21 定的，agy 用全名，其余首字母大写。
+    const HAND_DISPLAY = { agy: 'Antigravity', codex: 'Codex', claude: 'Claude', opencode: 'OpenCode' };
+
     function handTitle(agent) {
+      const hand = String(agent?.hand || '').toLowerCase();
+      if (HAND_DISPLAY[hand]) return HAND_DISPLAY[hand];
       const label = String(agent?.label || '').trim();
-      const hand = String(agent?.hand || '');
       const stripped = label
         .replace(/[（(][^（()）]*[）)]/g, '')
         .replace(/\s+/g, ' ')
@@ -2319,7 +2315,6 @@ window.__ModuleLoader__.load({
       return h(
         'div',
         { className: 'dsh-hands-v2-rail' },
-        h('div', { className: 'dsh-hands-v2-railHead' }, t('v2Hands')),
         h(
           'div',
           { className: 'dsh-hands-v2-agentList' },
@@ -2327,8 +2322,6 @@ window.__ModuleLoader__.load({
             const hand = String(agent.hand || '');
             const running = Number(agent.running) || 0;
             const tone = running > 0 ? 'running' : toneOf(agent);
-            // 今日次数不再显示（爸爸 2026-11-18 23:52 说去掉），只留在跑/空闲
-            const sub = running > 0 ? t('v2RunningN', { n: running }) : t('v2Idle');
             return h(
               'button',
               {
@@ -2348,12 +2341,7 @@ window.__ModuleLoader__.load({
                 },
                 h(HandIcon, { hand, size: 20 }),
               ),
-              h(
-                'span',
-                { className: 'dsh-hands-v2-agentText' },
-                h('span', { className: 'dsh-hands-v2-agentName' }, handTitle(agent)),
-                h('span', { className: 'dsh-hands-v2-agentMeta' }, sub),
-              ),
+              h('span', { className: 'dsh-hands-v2-agentText' }, h('span', { className: 'dsh-hands-v2-agentName' }, handTitle(agent))),
               h('span', { className: 'dsh-hands-v2-agentDot', 'data-tone': tone }),
             );
           }),
@@ -2951,6 +2939,19 @@ window.__ModuleLoader__.load({
               row?.name || fallbackName || t('v2PickSession'),
             ),
           ),
+          running
+            ? h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-hands-v2-stopBtn',
+                  title: t('v2Stop'),
+                  disabled: busy,
+                  onClick: onCancel,
+                },
+                t('v2Stop'),
+              )
+            : null,
         ),
         h(
           'div',
@@ -2968,10 +2969,6 @@ window.__ModuleLoader__.load({
       const turnsSlice = useStoreSlice(store, 'turns');
       const sessions = useStoreSlice(store, 'sessions');
       const [action, setAction] = React.useState({ pending: '', error: '' });
-      // 面板内派活：直接往当前会话派一轮后台任务
-      const [draft, setDraft] = React.useState('');
-      const [writeOn, setWriteOn] = React.useState(false);
-      const [sending, setSending] = React.useState(false);
 
       const row = findSession(sessions.sessions, sel.key);
       const turns = turnsSlice.turns;
@@ -2995,33 +2992,6 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         setAction({ pending: '', error: '' });
       }, [sel.key]);
-
-      const dispatchTask = async () => {
-        const prompt = draft.trim();
-        const hand = String(sel.hand || row?.hand || '');
-        if (!prompt || !hand || sending) return;
-        setSending(true);
-        try {
-          const response = await fetch(endpointOf('dsh-hands/dispatch'), {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: { 'content-type': 'application/json', accept: 'application/json' },
-            body: JSON.stringify({
-              hand,
-              prompt,
-              cwd: String(row?.cwd || ''),
-              session: String(row?.name || ''),
-              write: writeOn,
-            }),
-          });
-          const data = await response.json().catch(() => ({}));
-          if (response.ok && data.ok) setDraft('');
-        } catch {
-          // 派活失败就保留草稿，让用户再点一次
-        }
-        setSending(false);
-        store.refreshAll();
-      };
 
       const runAction = async (kind) => {
         const id = String(activeTurn?.id || '');
@@ -3074,45 +3044,6 @@ window.__ModuleLoader__.load({
           more,
           selectedTurnId: sel.turnId,
         }),
-        h(
-          'div',
-          { className: 'dsh-hands-v2-composer' },
-          h('textarea', {
-            className: 'dsh-hands-v2-composerInput',
-            rows: 2,
-            value: draft,
-            placeholder: t('composerPlaceholder'),
-            onChange: (event) => setDraft(event.target.value),
-            onKeyDown: (event) => {
-              if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') dispatchTask();
-            },
-          }),
-          h(
-            'div',
-            { className: 'dsh-hands-v2-composerRow' },
-            h(
-              'label',
-              { className: 'dsh-hands-v2-check' },
-              h('input', {
-                type: 'checkbox',
-                checked: writeOn,
-                onChange: (event) => setWriteOn(event.target.checked),
-              }),
-              t('composerWrite'),
-            ),
-            h('span', { className: 'dsh-hands-v2-grow' }),
-            h(
-              'button',
-              {
-                type: 'button',
-                className: 'dsh-hands-v2-btn',
-                disabled: sending || !draft.trim() || !sel.hand,
-                onClick: dispatchTask,
-              },
-              sending ? t('loading') : t('composerSend'),
-            ),
-          ),
-        ),
       );
     }
 
