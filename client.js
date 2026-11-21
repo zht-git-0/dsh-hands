@@ -973,19 +973,6 @@ window.__ModuleLoader__.load({
         if (hand) await loadSessions(hand, { archived: !!on });
       }
 
-      async function deleteSession(key) {
-        const wanted = String(key || '');
-        if (!wanted) return { ok: false, error: 'key is required' };
-        try {
-          const data = await postJson('dsh-hands/delete-session', { key: wanted, hand: String(slice.hand || '') });
-          await loadSessions(String(slice.hand || ''));
-          loadAgents();
-          return { ok: true, data };
-        } catch (error) {
-          return { ok: false, error: failureOf(error) };
-        }
-      }
-
       async function rerunTurn(id, prompt) {
         const wanted = String(id || '');
         if (!wanted) return { ok: false, error: 'id is required' };
@@ -1358,7 +1345,6 @@ window.__ModuleLoader__.load({
         loadTurnBody,
         ensureTurnBody,
         cancelTurn,
-        deleteSession,
         archiveSession,
         setArchivedView,
         rerunTurn,
@@ -1740,9 +1726,8 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-rowArch{flex:none;width:16px;height:16px;line-height:16px;text-align:center;border-radius:50%;color:var(--dsw-alias-label-tertiary);font-size:11px;opacity:0;transition:opacity .12s}
       .dsh-hands-v2-row:hover .dsh-hands-v2-rowArch{opacity:1}
       .dsh-hands-v2-rowArch:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
-      .dsh-hands-v2-rowDel{flex:none;width:16px;height:16px;line-height:16px;text-align:center;border-radius:50%;color:var(--dsw-alias-label-tertiary);font-size:11px;opacity:0;transition:opacity .12s}
-      .dsh-hands-v2-row:hover .dsh-hands-v2-rowDel{opacity:1}
-      .dsh-hands-v2-rowDel:hover{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 18%,transparent);color:var(--dsw-alias-state-error-primary)}
+      .dsh-hands-v2-rowRestore{flex:none;height:16px;line-height:16px;font-size:10px;font-weight:600;color:var(--dsw-alias-state-success-primary);cursor:pointer}
+      .dsh-hands-v2-rowRestore:hover{text-decoration:underline}
       .dsh-hands-v2-row{position:relative;flex:none;display:flex;flex-direction:column;gap:2px;width:100%;padding:6px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:inherit;font:inherit;text-align:left;cursor:pointer;overflow:hidden}
       .dsh-hands-v2-row:hover{background:var(--dsw-alias-interactive-bg-hover)}
       .dsh-hands-v2-row[data-active=true]{background:var(--dsw-alias-interactive-bg-hover)}
@@ -2626,16 +2611,18 @@ window.__ModuleLoader__.load({
                               }
                             },
                           }, slice.archivedView ? '↩' : '⤓'),
-                          h('span', {
-                            className: 'dsh-hands-v2-rowDel',
-                            title: '删除会话',
-                            'aria-label': '删除会话',
-                            onClick: (event) => {
-                              event.preventDefault();
-                              event.stopPropagation();
-                              if (typeof store.deleteSession === 'function') store.deleteSession(key);
-                            },
-                          }, '✕'),
+                          slice.archivedView
+                            ? h('span', {
+                                className: 'dsh-hands-v2-rowRestore',
+                                title: '恢复会话',
+                                'aria-label': '恢复会话',
+                                onClick: (event) => {
+                                  event.preventDefault();
+                                  event.stopPropagation();
+                                  if (typeof store.archiveSession === 'function') store.archiveSession(key, false);
+                                },
+                              }, '恢复')
+                            : null,
                           h('span', {
                             className: 'dsh-hands-v2-dot',
                             'data-tone': tone,

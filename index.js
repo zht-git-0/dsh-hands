@@ -606,6 +606,25 @@ export function pickBin(candidates) {
   return list[list.length - 1] || ''
 }
 
+// 派活的默认目录：优先用调用方 DSH 会话的 cwd，其次 args.cwd，最后才落到进程 cwd。
+// 之前直接 process.cwd()，结果会话被建到 ~/.dsh/profiles/desktop 下（2026-11-21 踩到）。
+export function cwdFromExec(exec) {
+  try {
+    const session = exec && (exec.agent?.session || exec.session || exec.caller?.session)
+    const cwd = (session && (session.cwd || session.directory)) || (exec && exec.cwd) || ''
+    return typeof cwd === 'string' ? cwd : ''
+  } catch {
+    return ''
+  }
+}
+
+export function resolveRunCwd(args, exec) {
+  const explicit = args && args.cwd ? String(args.cwd) : ''
+  if (explicit) return path.resolve(explicit)
+  const fromSession = cwdFromExec(exec)
+  return fromSession ? path.resolve(fromSession) : process.cwd()
+}
+
 export function sessionIdFromExec(exec) {
   try {
     const agent = exec && (exec.agent || exec.caller || exec.agentRef)
@@ -963,19 +982,12 @@ export function apply(ctx, config = {}) {
   // 流式片段仍然只在内存里滚（createLiveView），不落盘。
   const LOG_FILE = path.join(os.homedir(), '.dsh', 'hands-log.jsonl')
   const JOBS_DIR = path.join(os.homedir(), '.dsh', 'hands-jobs')
-  // 被删掉的会话：只从面板里隐藏，不动各家自己的会话文件（那些删了不可逆）。
-  const HIDDEN_FILE = path.join(os.homedir(), '.dsh', 'hands-hidden.json')
   const ARCHIVE_FILE = path.join(os.homedir(), '.dsh', 'hands-archive.json')
   const readArchive = () => {
     const raw = readJson(ARCHIVE_FILE, { keys: [] }) || {}
     return Array.isArray(raw.keys) ? raw.keys.map(String) : []
   }
   const writeArchive = (keys) => writeJson(ARCHIVE_FILE, { keys: [...new Set(keys.map(String))] })
-  const readHidden = () => {
-    const raw = readJson(HIDDEN_FILE, { keys: [] }) || {}
-    return Array.isArray(raw.keys) ? raw.keys.map(String) : []
-  }
-  const writeHidden = (keys) => writeJson(HIDDEN_FILE, { keys: [...new Set(keys.map(String))] })
   const LOG_KEEP = 1000
   const JOB_MAX_BYTES = 1024 * 1024
   const NL = String.fromCharCode(10)
@@ -1276,10 +1288,8 @@ export function apply(ctx, config = {}) {
       }
     }
 
-    const hidden = new Set(readHidden())
     const archived = new Set(readArchive())
     return [...rows.values()]
-      .filter((row) => !hidden.has(String(row.key)))
       .filter((row) => (wantArchived ? archived.has(String(row.key)) : !archived.has(String(row.key))))
       .sort((a, b) => String(b.lastAt || '').localeCompare(String(a.lastAt || '')))
   }
@@ -2397,22 +2407,6 @@ export function apply(ctx, config = {}) {
                 return fail(400, String(error?.message ?? error))
               }
             }
-            if (u.pathname === '/dsh-hands/delete-session') {
-              if (req.method !== 'POST') return fail(405, 'POST only')
-              try {
-                const body = parseBody(await readBody(req))
-                const key = String(body.key || '').trim()
-                if (!key) return fail(400, 'key is required')
-                const keys = readHidden()
-                if (!keys.includes(key)) keys.push(key)
-                writeHidden(keys)
-                const hand = String(body.hand || '')
-                if (hand) handRevisions.set(hand, (handRevisions.get(hand) || 0) + 1)
-                return send(200, { ok: true, key, hidden: keys.length })
-              } catch (error) {
-                return fail(400, String(error?.message ?? error))
-              }
-            }
             if (u.pathname === '/dsh-hands/cancel') {
               if (req.method !== 'POST') return fail(405, 'POST only')
               try {
@@ -2997,7 +2991,7 @@ export function apply(ctx, config = {}) {
       const known = name && index[name] ? index[name].id : null
 
       const sandbox = String(args?.sandbox || 'read-only')
-      const workdir = args?.cwd ? path.resolve(String(args.cwd)) : process.cwd()
+      const workdir = resolveRunCwd(args, exec)
 
       let argv
       let resumed = false
@@ -3317,7 +3311,7 @@ export function apply(ctx, config = {}) {
         write: args?.permissionMode === 'acceptEdits' || args?.permissionMode === 'auto',
         session: name,
         conversationId: known || '',
-        cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
+        cwd: resolveRunCwd(args, exec),
         model: args?.model || '',
       })
 
@@ -3363,7 +3357,7 @@ export function apply(ctx, config = {}) {
 
       const spawn = () =>
         runProcess(claudeBin, argv, {
-          cwd: args?.cwd ? path.resolve(String(args.cwd)) : process.cwd(),
+          cwd: resolveRunCwd(args, exec),
           timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
           onChunk: run.push,
           onSpawn: (child) => trackProc(run.id, child, run),
@@ -3483,7 +3477,7 @@ export function apply(ctx, config = {}) {
       const index = readJson(OPENCODE_INDEX, {}) || {}
       const name = args?.session ? String(args.session) : ''
       const known = name && index[name] ? index[name].id : null
-      const runCwd = args?.cwd ? path.resolve(String(args.cwd)) : process.cwd()
+      const runCwd = resolveRunCwd(args, exec)
       const model = args?.model ? String(args.model) : ''
       const timeoutSec = Number(args?.timeoutSec) || defaultTimeout
 
@@ -3926,7 +3920,7 @@ export function apply(ctx, config = {}) {
       const known = name && index[name] ? index[name].id : null
 
       const opts = { write: !!args?.write, model: args?.model || '' }
-      const runCwd = args?.cwd ? path.resolve(String(args.cwd)) : process.cwd()
+      const runCwd = resolveRunCwd(args, ctx)
       const timeoutSec = Number(args?.timeoutSec) || defaultTimeout
       const run = startDispatch({
         hand: to,
