@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -592,6 +592,30 @@ const DEFAULT_CODEX_BIN =
 // 二进制会搬家：重装、升级、开机后目录没了（2026-11-18 实测：~/.local/bin 整个不见了）。
 // 按顺序试，第一个真实存在的就用；一个都不在就返回最后一个，
 // 至少报错信息里那个路径是「本来该在的位置」，不是瞎编的。
+// 裸命令名走 PATH 解析：where（Windows）/ which（其他），拿到绝对路径再判存在。
+export function whichBin(name) {
+  const raw = String(name || '').trim()
+  if (!raw || /[\\/]/.test(raw)) return ''
+  try {
+    const probe = spawnSync(process.platform === 'win32' ? 'where' : 'which', [raw], {
+      encoding: 'utf8',
+      timeout: 4000,
+      windowsHide: true,
+    })
+    if (probe.status !== 0) return ''
+    const rows = String(probe.stdout || '')
+      .split(/\r?\n/)
+      .map((x) => x.trim())
+      .filter((x) => x && fs.existsSync(x))
+    // Windows 上 npm 会同时给 opencode / opencode.cmd / opencode.ps1，
+    // 无扩展名那个是 sh 脚本，spawn 不了；优先挑可执行的 .exe/.cmd/.bat。
+    const runnable = rows.find((x) => /\.(exe|cmd|bat)$/i.test(x))
+    return runnable || rows[0] || ''
+  } catch {
+    return ''
+  }
+}
+
 export function pickBin(candidates) {
   const list = (Array.isArray(candidates) ? candidates : [candidates])
     .map((item) => String(item || '').trim())
@@ -599,6 +623,11 @@ export function pickBin(candidates) {
   for (const candidate of list) {
     try {
       if (fs.existsSync(candidate)) return candidate
+      // 裸命令名：交给 PATH
+      if (!/[\\/]/.test(candidate)) {
+        const resolved = whichBin(candidate)
+        if (resolved) return resolved
+      }
     } catch {
       // 权限问题就当它不存在，继续试下一个
     }
