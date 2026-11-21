@@ -99,11 +99,15 @@ const t = (key) => key
     const icon = mod.HandIcon({ hand, size: 18 })
     assert.equal(icon.type, 'svg', `${hand} 是 svg`)
     assert.equal(icon.props.width, 18, `${hand} 跟着 size 走`)
-    assert.equal(icon.props.stroke, 'currentColor', `${hand} 颜色跟外层`)
+    assert.ok(
+      icon.props.fill === 'currentColor' || icon.props.stroke === 'currentColor',
+      `${hand} 颜色跟外层`,
+    )
     assert.ok(icon.children.length >= 1, `${hand} 至少一条 path`)
   }
   assert.equal(mod.HandIcon({ hand: 'mystery' }).type, 'span', '不认识的手退回字母')
   assert.ok(mod.HAND_ICON_PATHS.claude.length >= 4, 'claude 是星芒（多条线）')
+  assert.equal(Object.keys(mod.HAND_BRAND_PATHS).length, 4, '四家都有品牌 mark')
   console.log('1.5) 各家图标 ok')
 }
 

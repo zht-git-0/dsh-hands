@@ -1645,10 +1645,11 @@ window.__ModuleLoader__.load({
       .dsh-hands-asyncrow[data-status=failed] .dsh-hands-asyncrowStatus{color:var(--dsw-alias-state-error-primary)}
       .dsh-hands-v2-error{flex:none;margin:6px 8px 0;padding:5px 8px;border:.5px solid var(--dsw-alias-state-error-primary);border-radius:var(--dsw-radius-sm);color:var(--dsw-alias-state-error-primary);font-size:11px;line-height:16px;overflow-wrap:anywhere}
       .dsh-hands-v2,.dsh-hands-v2 *{box-sizing:border-box}
-      .dsh-hands-v2-rail{flex:none;display:flex;flex-direction:column;width:clamp(104px,14%,132px);min-width:0;padding:8px 4px;border-right:.5px solid var(--dsw-alias-border-l2);overflow:hidden}
+      .dsh-hands-v2-rail{flex:none;display:flex;flex-direction:row;align-items:center;gap:4px;width:auto;min-width:0;padding:6px 8px;border-right:0;border-bottom:.5px solid var(--dsw-alias-border-l2);overflow-x:auto;overflow-y:hidden}
+      .dsh-hands-v2-body{flex:1;display:flex;min-width:0;min-height:0}
       .dsh-hands-v2-railHead{flex:none;padding:0 6px 6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:16px}
       .dsh-hands-v2-agentList{flex:1;min-height:0;display:flex;flex-direction:column;gap:6px;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain}
-      .dsh-hands-v2-agent{position:relative;flex:none;display:flex;align-items:center;gap:10px;width:100%;min-height:56px;padding:8px 10px;border:0;border-radius:10px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}
+      .dsh-hands-v2-agent{position:relative;flex:none;display:flex;align-items:center;gap:6px;width:auto;min-height:0;padding:4px 10px;border:0;border-radius:999px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer;white-space:nowrap}
       .dsh-hands-v2-agent:hover{background:var(--dsw-alias-interactive-bg-hover)}
       .dsh-hands-v2-agent[data-active=true]{background:var(--dsw-alias-interactive-bg-hover);box-shadow:inset 0 0 0 1px var(--dsw-alias-brand-primary)}
       .dsh-hands-v2-agentIcon{flex:none;display:flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:10px;background:color-mix(in srgb,var(--hand-color,var(--dsw-alias-label-tertiary)) 14%,transparent);color:var(--hand-color,var(--dsw-alias-label-secondary))}
@@ -1661,7 +1662,7 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--tone-color,var(--dsw-alias-label-tertiary))}
       .dsh-hands-v2-dot[data-tone=running]{animation:dsh-hands-pulse 1.6s ease-out infinite}
       .dsh-hands-v2-sessions{flex:none;display:flex;flex-direction:column;width:clamp(150px,22%,200px);min-width:0;border-right:.5px solid var(--dsw-alias-border-l2);overflow:hidden}
-      .dsh-hands-v2[data-mode=narrow] .dsh-hands-v2-rail{width:96px}
+      .dsh-hands-v2[data-mode=narrow] .dsh-hands-v2-rail{width:auto}
       .dsh-hands-v2[data-mode=narrow] .dsh-hands-v2-sessions{width:120px}
       .dsh-hands-v2[data-mode=narrow] .dsh-hands-v2-railHead{padding:0 4px 6px}
       .dsh-hands-v2[data-mode=drill] .dsh-hands-v2-rail,.dsh-hands-v2[data-mode=drill] .dsh-hands-v2-sessions,.dsh-hands-v2[data-mode=drill] .dsh-hands-v2-thread{width:100%;border-right:0}
@@ -2229,9 +2230,25 @@ window.__ModuleLoader__.load({
       opencode: ['M3.2 5.2h17.6v13.6H3.2z', 'M7.2 10l2.8 2.4-2.8 2.4', 'M12.4 14.8h4.4'],
     };
 
+    // 真图标：Google / OpenAI / Anthropic / OpenCode 的官方 mark（单色）。
+    const HAND_BRAND_PATHS = {
+      agy: 'M12.48 10.92v3.28h7.84c-.24 1.84-.853 3.187-1.787 4.133-1.147 1.147-2.933 2.4-6.053 2.4-4.827 0-8.6-3.893-8.6-8.72s3.773-8.72 8.6-8.72c2.6 0 4.507 1.027 5.907 2.347l2.307-2.307C18.747 1.44 16.133 0 12.48 0 5.867 0 .307 5.387.307 12s5.56 12 12.173 12c3.573 0 6.267-1.173 8.373-3.36 2.16-2.16 2.84-5.213 2.84-7.667 0-.76-.053-1.467-.173-2.053H12.48z',
+      codex: 'M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.872zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zM8.3065 12.863l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zm1.0976-2.3654l2.602-1.4998 2.6069 1.4998v2.9994l-2.5974 1.4997-2.6067-1.4997Z',
+      claude: 'M17.3041 3.541h-3.6718l6.696 16.918H24Zm-10.6082 0L0 20.459h3.7442l1.3693-3.5527h7.0052l1.3693 3.5528h3.7442L10.5363 3.5409Zm-.3712 10.2232 2.2914-5.9456 2.2914 5.9456Z',
+      opencode: 'M22 24H2V0h20zM17 4.8H7v14.4h10z',
+    };
+
     function HandIcon(props) {
       const hand = String(props?.hand || '').toLowerCase();
       const size = Number(props?.size) || 20;
+      const brand = HAND_BRAND_PATHS[hand];
+      if (brand) {
+        return h(
+          'svg',
+          { width: size, height: size, viewBox: '0 0 24 24', fill: 'currentColor', 'aria-hidden': true, focusable: false },
+          h('path', { d: brand }),
+        );
+      }
       const paths = HAND_ICON_PATHS[hand] || null;
       if (!paths) {
         // 不认识的手：退回字母，至少不空着
@@ -2261,7 +2278,7 @@ window.__ModuleLoader__.load({
 
     // agent 卡片主标题：服务端 label 形如「agy（文案）」，去掉括号里的注解只留名字。
     // 手下展示名：爸爸 2026-11-21 定的，agy 用全名，其余首字母大写。
-    const HAND_DISPLAY = { agy: 'Antigravity', codex: 'Codex', claude: 'Claude', opencode: 'OpenCode' };
+    const HAND_DISPLAY = { agy: 'Antigravity', codex: 'Codex', claude: 'Claude Code', opencode: 'OpenCode' };
 
     function handTitle(agent) {
       const hand = String(agent?.hand || '').toLowerCase();
@@ -3314,6 +3331,9 @@ window.__ModuleLoader__.load({
           'div',
           { className: 'dsh-hands-v2-body' },
           showRail ? h(HandsRail, { key: 'rail', store, t, onPick: pickHand }) : null,
+          h(
+            'div',
+            { className: 'dsh-hands-v2-body' },
           showSessions
             ? h(HandsSessions, {
                 key: 'sessions',
@@ -3334,6 +3354,7 @@ window.__ModuleLoader__.load({
                 onBack: () => setView('sessions'),
               })
             : null,
+          ),
         ),
       );
     }
@@ -3560,6 +3581,7 @@ window.__ModuleLoader__.load({
       groupSessionsByCwd,
       HandIcon,
       HAND_ICON_PATHS,
+      HAND_BRAND_PATHS,
       MarkdownLite,
       MarkdownBlock,
     };
