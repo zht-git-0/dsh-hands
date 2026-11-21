@@ -1474,6 +1474,7 @@ export function apply(ctx, config = {}) {
     const text = asyncReportText(job, summary)
     const record = asyncState.jobs[job.id] || (asyncState.jobs[job.id] = { ...job })
     Object.assign(record, {
+      sessionId: job.sessionId || record.sessionId || '',
       status: job.status,
       ms: job.ms,
       endedAt: job.endedAt,
@@ -3452,7 +3453,7 @@ export function apply(ctx, config = {}) {
             cwd: runCwd,
             model,
             timeoutSec,
-            sessionId: known || '',
+            sessionId: sessionIdFromExec(ctx) || '',
             write: !!args?.auto,
           })
         : null
@@ -3982,6 +3983,7 @@ export function apply(ctx, config = {}) {
           id: jobId,
           hand: to,
           tool: 'hands_run',
+          sessionId: known || '',
           prompt,
           startedAt: Date.now(),
           status: 'RUNNING',
