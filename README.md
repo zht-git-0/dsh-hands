@@ -1,6 +1,6 @@
 # dsh-hands
 
-把本机四个命令行智能体接成 DSH 工具，并在**对话窗口右侧边栏**提供「手下任务」实时看板：派活内容、对面正在说的话、成没成、跑了多久，都在里面。**自用版**，不带安装向导、不做环境检查面板。
+把本机四个命令行智能体接成 DSH 工具，并在**对话窗口右侧边栏**提供「手下任务」实时看板：派活内容、对面正在说的话、成没成、跑了多久，都在里面。插件只负责把四个 CLI 接进来：装好 CLI 并登录，它自己探测二进制；没有安装向导。
 
 | 手下 | 干什么 | 工具 |
 |---|---|---|
@@ -11,7 +11,7 @@
 | — | 探活 | `hands_status` |
 | 对话右侧边栏 → 手下任务 | 派活内容和对面**实时流式输出** | 可视化面板 |
 
-分工：**claude / codex 出方案 → opencode 落地 → 希可验收**，agy 只管文案。
+分工：**claude / codex 出方案 → opencode 落地 → 调用方验收**，agy 只管文案。
 
 ## 装
 
@@ -28,25 +28,24 @@ plugin_manager install_bundle  target=<repo>
 > 面板顶部弹出「允许 / 拒绝」，60 秒没人点按拒绝（fail-closed）。只读轮次不弹。
 
 > **开发版和上线版是分开的**：这个目录只当开发版用；DSH 里跑的应该是 `<release-dir>` 的上线版。
-> 更新上线版必须**爸爸点头 + 先备份**（脚本没有 `-Approved` 会直接拒绝），流程见 [RELEASE.md](./RELEASE.md)。
+> 更新上线版先备份、再加 `-Approved` 运行发布脚本（没有 `-Approved` 会直接拒绝），流程见 [RELEASE.md](./RELEASE.md)。
 
 ## 配置
 
-`cordis.patch.yml`：
+`cordis.patch.yml` 默认什么都不用填：四个 CLI 按「配置 → PATH → DSH 自带 node 目录 → 常见安装位置」自动探测。
 
 ```yaml
 - insert:
     - id: hands
       name: 'dsh-hands'
       config:
-        agyBin: '...agy.exe'
-        codexBin: '...codex.exe'
         timeoutSec: 900
-        skipPermissions: true
-        acpHands: []          # 例如 ['opencode']：该家改走 ACP（失败自动回退 CLI）
-        acpPersist: false     # true = 同一 hand+cwd+会话 id 复用常驻 ACP 进程（默认关）
-        acpIdleMs: 600000     # 常驻会话闲置多久回收
-        permissionTimeoutMs: 60000   # ACP 要写文件时，面板授权弹窗等多久（超时按拒绝）
+        # skipPermissions: true  # 默认 false；要让 agy 跳过权限确认再打开
+        acpHands: []             # 例如 ['opencode']：该家改走 ACP（失败自动回退 CLI）
+        acpPersist: false        # true = 同一 hand+cwd+会话 id 复用常驻 ACP 进程（默认关）
+        acpIdleMs: 600000        # 常驻会话闲置多久回收
+        permissionTimeoutMs: 60000  # ACP 要写文件时，面板授权弹窗等多久（超时按拒绝）
+        # 自动探测不到时再显式写：agyBin / codexBin / claudeBin / opencodeBin
 ```
 
 路径用正斜杠，别写反斜杠（YAML 里的 `\U` 会被当成转义）。
@@ -265,3 +264,7 @@ codex 交活之后**不许直接信**：
 2.2.0 把可视化从设置页搬到对话右侧边栏，并把四家的输出改成事件流，加了 SSE 实时推送。
 2.3.0 v2 数据层：派发改 start/end 双记录、启动时补 INTERRUPTED、`sessionKey`、全文另存 `~/.dsh/hands-jobs/`。
 2.4.0 三层面板：`/agents /sessions /turns /turn /health /cancel /rerun` + `/stream?key=` 四种事件；前端 `createHandsStore`、三列骨架、气泡与增量正文；ACP runner 接入（`acpHands` 开关，失败回退 CLI）。`USE_V2` 默认关，实机验证后再打开。
+
+## License
+
+MIT © dsh-hands contributors
