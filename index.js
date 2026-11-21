@@ -1289,8 +1289,9 @@ export function apply(ctx, config = {}) {
     }
 
     const archived = new Set(readArchive())
+    // 归档不再单独成视图：给每行打标记，前端在文件夹底部折叠展示
     return [...rows.values()]
-      .filter((row) => (wantArchived ? archived.has(String(row.key)) : !archived.has(String(row.key))))
+      .map((row) => ({ ...row, archived: archived.has(String(row.key)) }))
       .sort((a, b) => String(b.lastAt || '').localeCompare(String(a.lastAt || '')))
   }
 

@@ -34,7 +34,7 @@ metadata:
 | `codex_run` | 规划、代码审查 | 中 | sandbox 在**建会话时**定死，resume 改不了 |
 | `claude_run` | 架构设计、复杂推理 | **贵，一次至少 $0.05**（系统提示就两百 K） | **必须显式传 model**（如 `model: 'sonnet'`），不传会走 CLI 默认，可能直接上 opus |
 
-价格差三个数量级。日常干活走 opencode / agy，真需要架构判断才上 claude。
+价格差三个数量级。日常干活走 opencode / agy；**架构设计/评审优先 codex**（便宜，够用），claude 只在真正需要长上下文推理时才上。
 
 **别跑 `acp/four-agents.mjs` 这类探活脚本**：它每跑一次就真起一轮 sonnet 会话（一句「收到」≈ $0.05），面板里会堆一串「未命名」。健康检查看 `/dsh-hands/health` 就够，那个只跑 `--version`。
 

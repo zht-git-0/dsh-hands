@@ -431,7 +431,6 @@ window.__ModuleLoader__.load({
       selection: 'selection',
       phase: 'meta',
       connected: 'meta',
-      archivedView: 'sessions',
       error: 'meta',
       checkedAt: 'meta',
     };
@@ -584,7 +583,6 @@ window.__ModuleLoader__.load({
             sessions: state.sessionsByHand[sel.hand] || EMPTY_LIST,
             selectedKey: sel.key,
             phase: state.phase,
-            archivedView: !!state.archivedView,
           };
         }
         if (name === 'turns') {
@@ -969,18 +967,6 @@ window.__ModuleLoader__.load({
         }
       }
 
-      async function setArchivedView(on) {
-        emit({ archivedView: !!on });
-        // 没选中的手就挑第一个：否则切了归档视图列表不会动，看着像没生效
-        let hand = String(slice.hand || '');
-        if (!hand) {
-          const first = (state.agents || []).find((a) => a && a.hand);
-          hand = first ? String(first.hand) : '';
-          if (hand) store.select(hand, state.selection.key || '');
-        }
-        if (hand) await loadSessions(hand, { archived: !!on });
-      }
-
       async function rerunTurn(id, prompt) {
         const wanted = String(id || '');
         if (!wanted) return { ok: false, error: 'id is required' };
@@ -1354,7 +1340,6 @@ window.__ModuleLoader__.load({
         ensureTurnBody,
         cancelTurn,
         archiveSession,
-        setArchivedView,
         rerunTurn,
         appendLive,
         // 测试用：断言 timer / EventSource / live 记账都清干净
@@ -1719,8 +1704,6 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-stopBtn{flex:none;padding:2px 10px;border-radius:999px;border:1px solid color-mix(in srgb,var(--dsw-alias-state-error-primary) 60%,transparent);background:transparent;color:var(--dsw-alias-state-error-primary);font:inherit;font-size:11px;line-height:18px;cursor:pointer}
       .dsh-hands-v2-search{display:flex;align-items:center;gap:6px;min-width:0}
       .dsh-hands-v2-searchInput{flex:1;min-width:0;box-sizing:border-box;padding:3px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:11px;line-height:16px}
-      .dsh-hands-v2-archToggle{flex:none;padding:2px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:11px;line-height:16px;cursor:pointer}
-      .dsh-hands-v2-archToggle[data-active=true]{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
       .dsh-hands-v2-searchInput::placeholder{color:var(--dsw-alias-label-tertiary)}
       .dsh-hands-v2-searchInput:focus{outline:1px solid var(--dsw-alias-brand-primary);outline-offset:-1px}
       .dsh-hands-v2-folder{display:flex;align-items:center;gap:2px;min-width:0;border-radius:6px}
@@ -1731,6 +1714,10 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-folderCaret{flex:none;width:10px;font-size:10px;opacity:.75}
       .dsh-hands-v2-folderName{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
       .dsh-hands-v2-folderCount{flex:none;opacity:.7;font-variant-numeric:tabular-nums}
+      .dsh-hands-v2-archRow{display:flex;align-items:center;gap:5px;margin:2px 0 1px;padding:3px 4px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:11px;line-height:16px;text-align:left;cursor:pointer}
+      .dsh-hands-v2-archRow:hover{background:var(--dsw-alias-bg-secondary)}
+      .dsh-hands-v2-archLabel{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .dsh-hands-v2-row[data-archived=true]{opacity:.7}
       .dsh-hands-v2-rowArch{flex:none;width:16px;height:16px;line-height:16px;text-align:center;border-radius:50%;color:var(--dsw-alias-label-tertiary);font-size:11px;opacity:0;transition:opacity .12s}
       .dsh-hands-v2-row:hover .dsh-hands-v2-rowArch{opacity:1}
       .dsh-hands-v2-rowArch:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
@@ -2510,21 +2497,9 @@ window.__ModuleLoader__.load({
             type: 'search',
             className: 'dsh-hands-v2-searchInput',
             value: query,
-            placeholder: slice.archivedView ? t('searchArchivedSessions') : t('searchSessions'),
+            placeholder: t('searchSessions'),
             onChange: (event) => setQuery(event.target.value),
           }),
-          h(
-            'button',
-            {
-              type: 'button',
-              className: 'dsh-hands-v2-archToggle',
-              'data-active': slice.archivedView ? 'true' : 'false',
-              title: slice.archivedView ? '返回会话列表' : '查看归档会话',
-              'aria-label': slice.archivedView ? '返回会话列表' : '查看归档会话',
-              onClick: () => store.setArchivedView && store.setArchivedView(!slice.archivedView),
-            },
-            slice.archivedView ? '←' : '▤',
-          ),
         ),
         visibleSessions.length
           ? h(
@@ -2585,7 +2560,34 @@ window.__ModuleLoader__.load({
                   ),
                 ];
                 if (!isCollapsed) {
-                  for (const row of group.sessions) {
+                  const archKey = 'arch:' + folderKey;
+                  const archOpen = collapsed[archKey] === true;
+                  let archHeaderPushed = false;
+                  const orderedRows = [...group.sessions].sort(
+                    (a, b) => Number(!!a.archived) - Number(!!b.archived),
+                  );
+                  for (const row of orderedRows) {
+                    const isArchived = row.archived === true;
+                    if (isArchived && !archHeaderPushed) {
+                      archHeaderPushed = true;
+                      const archCount = orderedRows.filter((x) => x.archived === true).length;
+                      children.push(
+                        h(
+                          'button',
+                          {
+                            key: 'arch:' + folderKey,
+                            type: 'button',
+                            className: 'dsh-hands-v2-archRow',
+                            'data-open': archOpen ? 'true' : 'false',
+                            onClick: () =>
+                              setCollapsed((prev) => ({ ...prev, [archKey]: prev[archKey] !== true })),
+                          },
+                          h('span', { className: 'dsh-hands-v2-folderCaret' }, archOpen ? '▾' : '▸'),
+                          h('span', { className: 'dsh-hands-v2-archLabel' }, '已归档 (' + archCount + ')'),
+                        ),
+                      );
+                    }
+                    if (isArchived && !archOpen) continue;
                     const key = String(row.key || row.sessionKey || '');
                     const tone = toneOf(row);
                     children.push(
@@ -2597,6 +2599,7 @@ window.__ModuleLoader__.load({
                           className: 'dsh-hands-v2-row',
                           'data-active':
                             slice.selectedKey && key === slice.selectedKey ? 'true' : 'false',
+                          'data-archived': row.archived ? 'true' : 'false',
                           onClick: () => onPick(String(row.hand || slice.hand || ''), key),
                         },
                         h(
@@ -2610,28 +2613,16 @@ window.__ModuleLoader__.load({
                           ),
                           h('span', {
                             className: 'dsh-hands-v2-rowArch',
-                            title: slice.archivedView ? '取消归档' : '归档会话',
-                            'aria-label': slice.archivedView ? '取消归档' : '归档会话',
+                            title: row.archived ? '恢复会话' : '归档会话',
+                            'aria-label': row.archived ? '恢复会话' : '归档会话',
                             onClick: (event) => {
                               event.preventDefault();
                               event.stopPropagation();
                               if (typeof store.archiveSession === 'function') {
-                                store.archiveSession(key, !slice.archivedView);
+                                store.archiveSession(key, !row.archived);
                               }
                             },
-                          }, slice.archivedView ? '↩' : '⤓'),
-                          slice.archivedView
-                            ? h('span', {
-                                className: 'dsh-hands-v2-rowRestore',
-                                title: '恢复会话',
-                                'aria-label': '恢复会话',
-                                onClick: (event) => {
-                                  event.preventDefault();
-                                  event.stopPropagation();
-                                  if (typeof store.archiveSession === 'function') store.archiveSession(key, false);
-                                },
-                              }, '恢复')
-                            : null,
+                          }, row.archived ? '↩' : '⤓'),
                           h('span', {
                             className: 'dsh-hands-v2-dot',
                             'data-tone': tone,
