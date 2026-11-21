@@ -1647,6 +1647,7 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2,.dsh-hands-v2 *{box-sizing:border-box}
       .dsh-hands-v2-rail{flex:none;display:flex;flex-direction:row;align-items:center;gap:4px;width:auto;min-width:0;padding:6px 8px;border-right:0;border-bottom:.5px solid var(--dsw-alias-border-l2);overflow-x:auto;overflow-y:hidden}
       .dsh-hands-v2-body{flex:1;display:flex;min-width:0;min-height:0}
+      .dsh-hands-v2-topwrap{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
       .dsh-hands-v2-railHead{flex:none;padding:0 6px 6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:16px}
       .dsh-hands-v2-agentList{flex:1;min-height:0;display:flex;flex-direction:column;gap:6px;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain}
       .dsh-hands-v2-agent{position:relative;flex:none;display:flex;align-items:center;gap:6px;width:auto;min-height:0;padding:4px 10px;border:0;border-radius:999px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer;white-space:nowrap}
@@ -3329,7 +3330,7 @@ window.__ModuleLoader__.load({
         h(HandsPermissionBanner, { key: 'perm', t }),
         h(
           'div',
-          { className: 'dsh-hands-v2-body' },
+          { className: 'dsh-hands-v2-topwrap' },
           showRail ? h(HandsRail, { key: 'rail', store, t, onPick: pickHand }) : null,
           h(
             'div',
