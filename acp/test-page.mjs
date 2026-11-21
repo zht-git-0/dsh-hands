@@ -122,6 +122,16 @@ const t = (key) => key
   assert.ok(byClass(tree, 'dsh-hands-pageBody').length === 1, '主体')
   assert.ok(byClass(tree, 'dsh-hands-pageTitle').length === 1, '标题')
   assert.ok(byClass(tree, 'dsh-hands-pageSub').length === 1, '副标题')
+  // 顶部横条：先 rail 再 body（爸爸 2026-11-21 19:37 要求把 AI 标签挪到顶部）
+  const topwrap = byClass(tree, 'dsh-hands-v2-topwrap')[0]
+  assert.ok(topwrap, '顶部横条容器存在')
+  const kids = (topwrap.children || []).filter((c) => c && c.props && c.props.className)
+  const classes = (topwrap.children || []).map((c) => String((c && c.props && c.props.className) || ''))
+  const bodyIdx = classes.findIndex((name) => name.includes('dsh-hands-v2-body'))
+  assert.ok(bodyIdx >= 0, '两列装在顶条容器里')
+  const railIdx = classes.findIndex((name) => name.includes('dsh-hands-v2-rail'))
+  // 整页模式下可能不挂横条（showRail=false）；挂了就必须在 body 前面
+  if (railIdx >= 0) assert.ok(railIdx < bodyIdx, '横条在两列上面')
   // 页面自己的刷新按钮（第二列也有一个同名按钮，所以只要求至少一个）
   assert.ok(byClass(tree, 'dsh-hands-v2-iconBtn').length >= 1, '刷新按钮')
 
