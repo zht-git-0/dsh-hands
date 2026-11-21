@@ -528,7 +528,7 @@ function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk, onSpawn 
         }
       }
     }
-    const timer = setTimeout(() => {
+    const timer = timeoutSec > 0 ? setTimeout(() => {
       timedOut = true
       try {
         if (process.platform === 'win32' && child.pid) {
@@ -539,7 +539,7 @@ function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk, onSpawn 
       } catch {
         /* 尽力而为 */
       }
-    }, Math.max(5, timeoutSec) * 1000)
+    }, Math.max(5, timeoutSec) * 1000) : null
 
     child.stdout?.on('data', (chunk) => {
       const text = outDecoder.write(chunk)
@@ -2530,7 +2530,10 @@ export function apply(ctx, config = {}) {
       }
       if (skipPermissions) argv.push('--dangerously-skip-permissions')
 
-      const timeoutSec = Number(args?.timeoutSec) || defaultTimeout
+      // 异步任务默认不限时：跑长活被 15 分钟砍掉过一次（fatal-lock），
+      // 要限时就在调用时显式传 timeoutSec。
+      const timeoutSec =
+        args?.async === true ? Number(args?.timeoutSec) || 0 : Number(args?.timeoutSec) || defaultTimeout
       const run = startDispatch({
         id: runId || undefined,
         hand: 'agy',
