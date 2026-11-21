@@ -3456,7 +3456,10 @@ export function apply(ctx, config = {}) {
             cwd: runCwd,
             model,
             timeoutSec,
-            sessionId: sessionIdFromExec(ctx) || '',
+            sessionId:
+            sessionIdFromExec(ctx) ||
+            String(ctx?.session?.id || ctx?.sessionId || ctx?.agent?.session?.id || ''),
+          debugCtx: ctx ? Object.keys(ctx).slice(0, 24) : null,
             write: !!args?.auto,
           })
         : null
