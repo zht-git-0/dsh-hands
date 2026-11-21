@@ -7,7 +7,7 @@
 | `agy`（Antigravity CLI） | 文案、写作、风格 | `agy_run` `agy_session` `agy_sessions` `agy_agents` `agy_models` |
 | `codex`（OpenAI Codex CLI） | 规划、评审（旗舰后） | `codex_run` |
 | `claude`（Claude Code） | 架构级规划、设计评审 | `claude_run` |
-| `opencode` | **核心写代码**（用订阅，不按 token 计费） | `opencode_run` |
+| `opencode` | 脏活累活 | `opencode_run` |
 | — | 探活 | `hands_status` |
 | 对话右侧边栏 → 手下任务 | 派活内容和对面**实时流式输出** | 可视化面板 |
 
