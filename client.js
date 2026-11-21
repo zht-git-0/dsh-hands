@@ -1645,7 +1645,7 @@ window.__ModuleLoader__.load({
     // v2 三列骨架的样式：类名统一 dsh-hands-v2- 前缀，变量沿用 --dsw-alias-*。
     // 宽度断点由组件量出来的 data-mode 决定，这里只负责三档布局。
     const V2_CSS = `
-      .dsh-hands-v2{display:flex;flex-direction:column;flex:auto;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}
+      .dsh-hands-v2{position:relative;display:flex;flex-direction:column;flex:auto;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}
       .dsh-hands-v2-body{display:flex;flex:1;min-width:0;min-height:0;overflow:hidden}
       .dsh-hands-async{flex:none;display:flex;flex-direction:column;gap:2px;margin:6px 8px 0;min-width:0}
       .dsh-hands-perms{flex:none;display:flex;flex-direction:column;gap:4px;margin:6px 8px 0}
@@ -1654,6 +1654,7 @@ window.__ModuleLoader__.load({
       .dsh-hands-permAllow,.dsh-hands-permReject{flex:none;padding:1px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:10.5px;line-height:16px;cursor:pointer}
       .dsh-hands-permAllow{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}
       .dsh-hands-permReject:hover{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
+      .dsh-hands-async{position:absolute;left:8px;bottom:6px;z-index:6;max-width:calc(100% - 16px);display:flex;flex-direction:column;align-items:flex-start}
       .dsh-hands-asyncbar{align-self:flex-start;display:inline-flex;align-items:center;gap:6px;max-width:100%;padding:2px 8px;border:0;border-radius:999px;background:var(--dsw-alias-bg-secondary);color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
       .dsh-hands-asyncbar:hover{color:var(--dsw-alias-label-primary)}
       .dsh-hands-asynclist{display:flex;flex-direction:column;gap:2px;margin-top:2px;padding:4px;border:.5px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);max-height:180px;overflow:auto}
