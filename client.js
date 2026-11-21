@@ -69,10 +69,10 @@ window.__ModuleLoader__.load({
       searchTurns: 'Search turns',
       searchEmpty: 'No matches',
       asyncTasks: 'Async',
-      asyncRunning: 'running',
+      asyncRunning: 'Running',
       asyncQueued: 'queued',
       asyncRetrying: 'delivery retry',
-      asyncFailed: 'delivery failed',
+      asyncFailed: 'Failed',
       asyncIdle: 'idle',
       asyncEmpty: 'no async jobs',
       asyncDelivery: 'delivery',
@@ -158,10 +158,10 @@ window.__ModuleLoader__.load({
       searchTurns: '搜索轮次',
       searchEmpty: '没有匹配',
       asyncTasks: '异步',
-      asyncRunning: '跑着',
+      asyncRunning: '在跑',
       asyncQueued: '排队',
       asyncRetrying: '回传重试',
-      asyncFailed: '回传失败',
+      asyncFailed: '失败',
       asyncIdle: '空闲',
       asyncEmpty: '没有异步任务',
       asyncDelivery: '投递',
@@ -707,7 +707,7 @@ window.__ModuleLoader__.load({
       async function loadSessions(hand, opts = {}) {
         const wanted = String(hand || '');
         if (!wanted) return [];
-        const archived = opts.archived === undefined ? !!state.archivedView : !!opts.archived;
+        const archived = !!opts.archived;
         const seq = (sessionSeq.get(wanted) || 0) + 1;
         sessionSeq.set(wanted, seq);
         const life = lifeToken;
@@ -959,7 +959,7 @@ window.__ModuleLoader__.load({
             hand: String(slice.hand || ''),
             archived: archived !== false,
           });
-          await loadSessions(String(slice.hand || ''), { archived: !!state.archivedView });
+          await loadSessions(String(slice.hand || ''));
           loadAgents();
           return { ok: true, data };
         } catch (error) {
@@ -1654,7 +1654,7 @@ window.__ModuleLoader__.load({
       .dsh-hands-permAllow,.dsh-hands-permReject{flex:none;padding:1px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:10.5px;line-height:16px;cursor:pointer}
       .dsh-hands-permAllow{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}
       .dsh-hands-permReject:hover{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
-      .dsh-hands-asyncbar{align-self:flex-start;display:inline-flex;align-items:center;gap:6px;max-width:100%;padding:3px 8px;border:0;border-radius:999px;background:var(--dsw-alias-bg-secondary);color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
+      .dsh-hands-asyncbar{align-self:flex-start;display:inline-flex;align-items:center;gap:6px;max-width:100%;padding:2px 8px;border:0;border-radius:999px;background:var(--dsw-alias-bg-secondary);color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
       .dsh-hands-asyncbar:hover{color:var(--dsw-alias-label-primary)}
       .dsh-hands-asynclist{display:flex;flex-direction:column;gap:2px;margin-top:2px;padding:4px;border:.5px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);max-height:180px;overflow:auto}
       .dsh-hands-asyncrow{display:flex;align-items:center;gap:6px;min-width:0;padding:2px 4px;border-radius:5px;font-size:10.5px;line-height:15px;color:var(--dsw-alias-label-secondary)}
@@ -1722,8 +1722,6 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-rowArch{flex:none;width:16px;height:16px;line-height:16px;text-align:center;border-radius:50%;color:var(--dsw-alias-label-tertiary);font-size:11px;opacity:0;transition:opacity .12s}
       .dsh-hands-v2-row:hover .dsh-hands-v2-rowArch{opacity:1}
       .dsh-hands-v2-rowArch:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
-      .dsh-hands-v2-rowRestore{flex:none;height:16px;line-height:16px;font-size:10px;font-weight:600;color:var(--dsw-alias-state-success-primary);cursor:pointer}
-      .dsh-hands-v2-rowRestore:hover{text-decoration:underline}
       .dsh-hands-v2-row{position:relative;flex:none;display:flex;flex-direction:column;gap:2px;width:100%;margin-left:12px;padding:6px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:inherit;font:inherit;text-align:left;cursor:pointer;overflow:hidden}
       .dsh-hands-v2-row:hover{background:var(--dsw-alias-interactive-bg-hover)}
       .dsh-hands-v2-row[data-active=true]{border-left-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-interactive-bg-hover)}
@@ -3193,14 +3191,12 @@ window.__ModuleLoader__.load({
       const live = Array.isArray(snap.live) ? snap.live : [];
       const persisted = Array.isArray(snap.persisted) ? snap.persisted : [];
       const running = live.filter((job) => job && job.status === 'RUNNING').length;
-      const retrying = persisted.filter((job) => job && job.delivery === 'retrying').length;
       const failed = persisted.filter((job) => job && job.delivery === 'failed').length;
-      const waiting = Number(snap.queue?.waiting) || 0;
       const rows = [...live, ...persisted]
         .filter((job, index, list) => job && job.id && list.findIndex((item) => item && item.id === job.id) === index)
         .slice(0, 20);
-      // 没任何任务时不占地方；有任务才能点开详情
-      if (!running && !waiting && !retrying && !failed && !rows.length) return null;
+      // 没有在跑、也没有失败的记录时，整条不渲染
+      if (!running && !failed) return null;
       const cancelJob = async (id) => {
         try {
           await fetch(endpointOf('dsh-hands/cancel'), {
@@ -3215,10 +3211,8 @@ window.__ModuleLoader__.load({
         setReload((value) => value + 1);
       };
       const bits = [];
-      if (running) bits.push(`${t('asyncRunning')} ${running}`);
-      if (waiting) bits.push(`${t('asyncQueued')} ${waiting}`);
-      if (retrying) bits.push(`${t('asyncRetrying')} ${retrying}`);
-      if (failed) bits.push(`${t('asyncFailed')} ${failed}`);
+      if (running) bits.push(`${running} ${t('asyncRunning')}`);
+      if (failed) bits.push(`${failed} ${t('asyncFailed')}`);
       return h(
         'div',
         { className: 'dsh-hands-async' },
@@ -3231,7 +3225,7 @@ window.__ModuleLoader__.load({
             title: t('asyncHint'),
             onClick: () => setOpen((value) => !value),
           },
-          `${t('asyncTasks') || '异步'}：${bits.join(' · ') || t('asyncIdle')} ${open ? '▾' : '▸'}`,
+          `${t('asyncTasks')} ${bits.join(' · ')} ${open ? '▾' : '▸'}`,
         ),
         open
           ? h(
