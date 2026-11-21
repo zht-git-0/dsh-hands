@@ -97,13 +97,16 @@ const t = (key) => key
 {
   for (const hand of ['claude', 'codex', 'agy', 'opencode']) {
     const icon = mod.HandIcon({ hand, size: 18 })
-    assert.equal(icon.type, 'svg', `${hand} 是 svg`)
+    assert.ok(icon.type === 'svg' || icon.type === 'img', `${hand} 有图标节点`)
+    if (icon.type === 'img') assert.ok(String(icon.props.src).startsWith('data:image/'), `${hand} 用内联 data URI`)
     assert.equal(icon.props.width, 18, `${hand} 跟着 size 走`)
-    assert.ok(
-      icon.props.fill === 'currentColor' || icon.props.stroke === 'currentColor',
-      `${hand} 颜色跟外层`,
-    )
-    assert.ok(icon.children.length >= 1, `${hand} 至少一条 path`)
+    if (icon.type === 'svg') {
+      assert.ok(
+        icon.props.fill === 'currentColor' || icon.props.stroke === 'currentColor',
+        `${hand} 颜色跟外层`,
+      )
+    }
+    if (icon.type === 'svg') assert.ok(icon.children.length >= 1, `${hand} 至少一条 path`)
   }
   assert.equal(mod.HandIcon({ hand: 'mystery' }).type, 'span', '不认识的手退回字母')
   assert.ok(mod.HAND_ICON_PATHS.claude.length >= 4, 'claude 是星芒（多条线）')
