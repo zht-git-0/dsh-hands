@@ -945,6 +945,19 @@ window.__ModuleLoader__.load({
         }
       }
 
+      async function deleteSession(key) {
+        const wanted = String(key || '');
+        if (!wanted) return { ok: false, error: 'key is required' };
+        try {
+          const data = await postJson('dsh-hands/delete-session', { key: wanted, hand: String(slice.hand || '') });
+          await loadSessions(String(slice.hand || ''));
+          loadAgents();
+          return { ok: true, data };
+        } catch (error) {
+          return { ok: false, error: failureOf(error) };
+        }
+      }
+
       async function rerunTurn(id, prompt) {
         const wanted = String(id || '');
         if (!wanted) return { ok: false, error: 'id is required' };
@@ -1317,6 +1330,7 @@ window.__ModuleLoader__.load({
         loadTurnBody,
         ensureTurnBody,
         cancelTurn,
+        deleteSession,
         rerunTurn,
         appendLive,
         // 测试用：断言 timer / EventSource / live 记账都清干净
@@ -1690,6 +1704,9 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-folderCaret{flex:none;width:10px;font-size:10px;opacity:.75}
       .dsh-hands-v2-folderName{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
       .dsh-hands-v2-folderCount{flex:none;opacity:.7;font-variant-numeric:tabular-nums}
+      .dsh-hands-v2-rowDel{flex:none;width:16px;height:16px;line-height:16px;text-align:center;border-radius:50%;color:var(--dsw-alias-label-tertiary);font-size:11px;opacity:0;transition:opacity .12s}
+      .dsh-hands-v2-row:hover .dsh-hands-v2-rowDel{opacity:1}
+      .dsh-hands-v2-rowDel:hover{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 18%,transparent);color:var(--dsw-alias-state-error-primary)}
       .dsh-hands-v2-row{position:relative;flex:none;display:flex;flex-direction:column;gap:2px;width:100%;padding:6px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:inherit;font:inherit;text-align:left;cursor:pointer;overflow:hidden}
       .dsh-hands-v2-row:hover{background:var(--dsw-alias-interactive-bg-hover)}
       .dsh-hands-v2-row[data-active=true]{background:var(--dsw-alias-interactive-bg-hover)}
@@ -2550,6 +2567,16 @@ window.__ModuleLoader__.load({
                             { className: 'dsh-hands-v2-rowTurns' },
                             t('v2Turns', { n: Number(row.turns) || 0 }),
                           ),
+                          h('span', {
+                            className: 'dsh-hands-v2-rowDel',
+                            title: '删除会话',
+                            'aria-label': '删除会话',
+                            onClick: (event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              if (typeof store.deleteSession === 'function') store.deleteSession(key);
+                            },
+                          }, '✕'),
                           h('span', {
                             className: 'dsh-hands-v2-dot',
                             'data-tone': tone,

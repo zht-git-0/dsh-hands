@@ -963,6 +963,13 @@ export function apply(ctx, config = {}) {
   // 流式片段仍然只在内存里滚（createLiveView），不落盘。
   const LOG_FILE = path.join(os.homedir(), '.dsh', 'hands-log.jsonl')
   const JOBS_DIR = path.join(os.homedir(), '.dsh', 'hands-jobs')
+  // 被删掉的会话：只从面板里隐藏，不动各家自己的会话文件（那些删了不可逆）。
+  const HIDDEN_FILE = path.join(os.homedir(), '.dsh', 'hands-hidden.json')
+  const readHidden = () => {
+    const raw = readJson(HIDDEN_FILE, { keys: [] }) || {}
+    return Array.isArray(raw.keys) ? raw.keys.map(String) : []
+  }
+  const writeHidden = (keys) => writeJson(HIDDEN_FILE, { keys: [...new Set(keys.map(String))] })
   const LOG_KEEP = 1000
   const JOB_MAX_BYTES = 1024 * 1024
   const NL = String.fromCharCode(10)
@@ -1262,7 +1269,10 @@ export function apply(ctx, config = {}) {
       }
     }
 
-    return [...rows.values()].sort((a, b) => String(b.lastAt || '').localeCompare(String(a.lastAt || '')))
+    const hidden = new Set(readHidden())
+    return [...rows.values()]
+      .filter((row) => !hidden.has(String(row.key)))
+      .sort((a, b) => String(b.lastAt || '').localeCompare(String(a.lastAt || '')))
   }
 
   // 历史记录不把整段输出塞进每次快照：默认只带摘录，点开某一行时再单独取。
@@ -2361,6 +2371,22 @@ export function apply(ctx, config = {}) {
               }
             }
 
+            if (u.pathname === '/dsh-hands/delete-session') {
+              if (req.method !== 'POST') return fail(405, 'POST only')
+              try {
+                const body = parseBody(await readBody(req))
+                const key = String(body.key || '').trim()
+                if (!key) return fail(400, 'key is required')
+                const keys = readHidden()
+                if (!keys.includes(key)) keys.push(key)
+                writeHidden(keys)
+                const hand = String(body.hand || '')
+                if (hand) handRevisions.set(hand, (handRevisions.get(hand) || 0) + 1)
+                return send(200, { ok: true, key, hidden: keys.length })
+              } catch (error) {
+                return fail(400, String(error?.message ?? error))
+              }
+            }
             if (u.pathname === '/dsh-hands/cancel') {
               if (req.method !== 'POST') return fail(405, 'POST only')
               try {
