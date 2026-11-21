@@ -2,8 +2,8 @@
 name: dsh-hands
 description: 把活派给别的 agent（claude / codex / agy / opencode）时读这个。包含异步派活的正确姿势（派完立刻返回、跑完自动回传）、四个手怎么选和各自的价格、任务书怎么写、以及验收子代理产出的四道关卡。只要你要调用 claude_run / codex_run / agy_run / opencode_run / hands_run，或者要「派活出去等结果」，就先读它。
 metadata:
-  version: "1.0.0"
-  date: "2026-11-18"
+  version: "1.1.0"
+  date: "2026-11-21"
 ---
 
 # dsh-hands
@@ -35,6 +35,23 @@ metadata:
 | `claude_run` | 架构设计、复杂推理 | **贵，一次至少 $0.05**（系统提示就两百 K） | **必须显式传 model**（如 `model: 'sonnet'`），不传会走 CLI 默认，可能直接上 opus |
 
 价格差三个数量级。日常干活走 opencode / agy，真需要架构判断才上 claude。
+
+## 会话命名：一个项目，一个会话（2026-11-21 爸爸明确要求）
+
+派活时**永远带 `session`**，名字按项目定，同一项目后续一律用同一个名字：
+
+- 名字用「项目名 + 用途」，例如 `fatal-lock 接管`、`dsh-hands 面板`、`agy-id 排查`。
+- 同一个 `session` 会复用同一个底层对话：agent 记得上次读到哪、改过什么，不用每次重新交代背景。
+- 换项目就换名字；**不要**用「任务1/任务2」这种一次性名字，那样每次都是新会话、上下文全丢。
+- 同一个项目并行两条线时，才用两个名字区分（例如 `fatal-lock UI` / `fatal-lock 存档`）。
+- 名字一旦定下就写进任务书开头，方便下一个人接手。
+
+## hands_run 的异步是真的异步（2.6.3 起）
+
+- `async: true` → 立刻返回 `{status:'RUNNING', jobId}`，**这一轮不被钉住**；跑完由插件把结果投回当前会话。
+- 异步任务默认**不限时**（`timeoutSec` 传 0）；要限时就在调用时显式传秒数。
+- 投递依赖「调用方 DSH 会话 id」：job 里拿不到 id 时会标 `no-agent`，任务本身可能已经跑完，去 `~/.dsh/hands-async.json` 或 `GET /dsh-hands/async` 看 `delivery` / `deliveryError`。
+- 老会话里工具实例不会热更：插件发版后要重启 DSH 或新开会话，异步修复才生效。
 
 ## 任务书怎么写
 
