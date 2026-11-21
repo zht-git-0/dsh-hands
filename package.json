@@ -39,11 +39,11 @@
   "author": "dsh-hands contributors",
   "repository": {
     "type": "git",
-    "url": "https://github.com/OWNER/dsh-hands.git"
+    "url": "https://github.com/zht-git-0/dsh-hands.git"
   },
-  "homepage": "https://github.com/OWNER/dsh-hands#readme",
+  "homepage": "https://github.com/zht-git-0/dsh-hands#readme",
   "bugs": {
-    "url": "https://github.com/OWNER/dsh-hands/issues"
+    "url": "https://github.com/zht-git-0/dsh-hands/issues"
   },
   "keywords": [
     "dsh",
