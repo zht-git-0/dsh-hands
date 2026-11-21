@@ -646,6 +646,21 @@ export function sessionIdFromExec(exec) {
 export function findAgentFor(ctx, sessionId) {
   const raw = String(sessionId || '').trim()
   if (!raw) return undefined
+  // 工具 execute 收到的 ctx 直接挂着调用方 agent（ctx.agent.followup），
+  // 这是最可靠的一条路；ctx.get('agents') 那套是另一层服务上下文，未必在。
+  try {
+    const direct = ctx && typeof ctx === 'object' ? ctx.agent || ctx.caller || ctx.agentRef : null
+    if (direct && typeof direct.followup === 'function') {
+      const sid = direct.session && (direct.session.id || direct.session.sessionId)
+      // 有 session id 时对一下，避免把 A 会话的回传投到 B
+      if (!sid || !raw || String(sid) === raw) return direct
+      if (String(sid) !== raw && String(sid).replace(/^session-/, '') === raw.replace(/^session-/, '')) {
+        return direct
+      }
+    }
+  } catch {
+    /* 落到下面的注册表查找 */
+  }
   let agents
   try {
     agents = (ctx && typeof ctx.get === 'function' ? ctx.get('agents') : undefined) || ctx?.agents
