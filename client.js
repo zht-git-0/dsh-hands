@@ -1649,11 +1649,11 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-body{flex:1;display:flex;min-width:0;min-height:0}
       .dsh-hands-v2-topwrap{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
       .dsh-hands-v2-railHead{flex:none;padding:0 6px 6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:16px}
-      .dsh-hands-v2-agentList{flex:1;min-height:0;display:flex;flex-direction:column;gap:6px;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain}
-      .dsh-hands-v2-agent{position:relative;flex:none;display:flex;align-items:center;gap:6px;width:auto;min-height:0;padding:4px 10px;border:0;border-radius:999px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer;white-space:nowrap}
+      .dsh-hands-v2-agentList{flex:1;min-height:0;display:flex;flex-direction:row;align-items:center;gap:2px;overflow-x:auto;overscroll-behavior-x:contain}
+      .dsh-hands-v2-agent{position:relative;flex:none;display:flex;align-items:center;gap:6px;width:auto;min-height:0;padding:4px 10px;border:0;border-radius:8px 8px 0 0;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer;white-space:nowrap}
       .dsh-hands-v2-agent:hover{background:var(--dsw-alias-interactive-bg-hover)}
-      .dsh-hands-v2-agent[data-active=true]{background:var(--dsw-alias-interactive-bg-hover);box-shadow:inset 0 0 0 1px var(--dsw-alias-brand-primary)}
-      .dsh-hands-v2-agentIcon{flex:none;display:flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:10px;background:color-mix(in srgb,var(--hand-color,var(--dsw-alias-label-tertiary)) 14%,transparent);color:var(--hand-color,var(--dsw-alias-label-secondary))}
+      .dsh-hands-v2-agent[data-active=true]{background:var(--dsw-alias-bg-layer-1);border-bottom:2px solid var(--dsw-alias-brand-primary)}
+      .dsh-hands-v2-agentIcon{flex:none;display:flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:5px;background:color-mix(in srgb,var(--hand-color,var(--dsw-alias-label-tertiary)) 14%,transparent);color:var(--hand-color,var(--dsw-alias-label-secondary))}
       .dsh-hands-v2-agentIconText{font-size:11.5px;font-weight:600;letter-spacing:.02em}
       .dsh-hands-v2-agentText{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
       .dsh-hands-v2-agentName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:14px;color:var(--dsw-alias-label-primary);font-size:12.5px;line-height:17px;font-weight:500}
@@ -2357,7 +2357,7 @@ window.__ModuleLoader__.load({
                   style: { '--hand-color': HAND_COLOR[hand] || 'var(--dsw-alias-label-tertiary)' },
                   'aria-hidden': true,
                 },
-                h(HandIcon, { hand, size: 20 }),
+                h(HandIcon, { hand, size: 16 }),
               ),
               h('span', { className: 'dsh-hands-v2-agentText' }, h('span', { className: 'dsh-hands-v2-agentName' }, handTitle(agent))),
               h('span', { className: 'dsh-hands-v2-agentDot', 'data-tone': tone }),

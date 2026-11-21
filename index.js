@@ -3847,11 +3847,14 @@ export function apply(ctx, config = {}) {
           response: { type: 'string' },
           sessionId: { type: 'string' },
           resumed: { type: 'boolean' },
+          jobId: { type: 'string' },
+          note: { type: 'string' },
+          queue: { type: 'object' },
         },
       },
       render: (_args, value) => asText(value),
     },
-    async execute(args) {
+    async execute(args, ctx) {
       const to = String(args?.to || '')
       const hand = HANDS[to]
       if (!hand) throw new Error(`to 只能是 ${Object.keys(HANDS).join(' / ')}`)
@@ -3877,6 +3880,7 @@ export function apply(ctx, config = {}) {
         model: opts.model,
       })
 
+      const perform = async () => {
       // config.acpHands 点名的手下先走 ACP；没命中 / 失败回退 CLI，argv 仍按老配方 build。
       const acp = useAcp(to)
         ? await runAcpTurn(to, {
@@ -3965,7 +3969,60 @@ export function apply(ctx, config = {}) {
         resumed: acp ? !!acp.resumed : !!known,
         exitCode: acp ? undefined : result.code,
         ms: acp ? acp.ms : result.ms,
+        tokens,
+        cost,
       })
+      }
+
+      // 异步：立刻返回 jobId，跑完把结果投回调用方会话。
+      // （async 这个参数之前只写在 schema 里、execute 里没有分支，2026-11-21 20:37 爸爸抓出来的。）
+      if (args?.async === true && ctx) {
+        const jobId = crypto.randomUUID()
+        const job = {
+          id: jobId,
+          hand: to,
+          tool: 'hands_run',
+          prompt,
+          startedAt: Date.now(),
+          status: 'RUNNING',
+          delivery: 'pending',
+        }
+        beginAsyncJob(job)
+        runQueued(() => perform(), job.id)
+          .then((value) => {
+            if (settleCancelledQueuedJob(ctx, job, null, value)) return job
+            return settleAsyncJob(ctx, job, {
+              status: value.status,
+              ms: Number(value.ms) || 0,
+              exitCode: value.exitCode ?? null,
+              excerpt: value.response,
+              cost: null,
+              error:
+                value.status === 'OK' || value.status === 'SUCCESS'
+                  ? ''
+                  : String(value.response || '').slice(0, 400),
+              jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
+            })
+          })
+          .catch((error) =>
+            settleAsyncJob(ctx, job, {
+              status: 'ERROR',
+              ms: Date.now() - job.startedAt,
+              exitCode: null,
+              excerpt: '',
+              error: String(error?.message ?? error),
+            }),
+          )
+        return clean({
+          status: 'RUNNING',
+          jobId: job.id,
+          hand: to,
+          note: '跑完会把结果投回这个会话，期间你可以接着干别的',
+          queue: asyncQueueStats(),
+        })
+      }
+
+      return await perform()
     },
   })
 }
