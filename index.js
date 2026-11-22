@@ -946,6 +946,29 @@ export function apply(ctx, config = {}) {
       return sameCwd(other.cwd, cwd)
     })
   }
+  const NAME_LEDGER = path.join(os.homedir(), '.dsh', 'hands-session-names.json')
+  const readNameLedger = () => readJson(NAME_LEDGER, {}) || {}
+  const recordSessionName = (hand, name, id, cwd) => {
+    if (!name || !id) return
+    try {
+      const ledger = readNameLedger()
+      ledger[String(name)] = { hand, id: String(id), cwd: cwd || '', at: new Date().toISOString() }
+      writeJson(NAME_LEDGER, ledger)
+    } catch {
+      /* 记账失败不影响派活 */
+    }
+  }
+  // 新会话必须用一个从没用过的名字：名字一旦用过，即使 allowNewSession 也不许再开
+  // （否则面板里会出现两条同名会话，index 只留最新那条，旧的那条就成孤儿）。
+  const assertFreshName = (hand, name, allowNewSession) => {
+    if (!name) return
+    const used = readNameLedger()[String(name)]
+    if (!used) return
+    throw new Error(
+      `${hand}: 会话名「${name}」已经用过（${used.hand} / ${used.cwd || '未知目录'} / ${used.at}）。` +
+        '接着干就 resume 原名；要新开请换一个没出现过的名字（同名会让面板出现两条一样的会话）。',
+    )
+  }
   const resolveSession = (index, name, cwd, args, hand) => {
     const mode = String(args?.sessionMode || 'auto')
     const entry = name && index ? index[name] : null
@@ -970,6 +993,7 @@ export function apply(ctx, config = {}) {
     }
 
     if (mode === 'new') {
+      assertFreshName(hand, name, args?.allowNewSession)
       const others = sameCwdOthers(index, name, cwd)
       if (others.length && args?.allowNewSession !== true) {
         throw new Error(
@@ -997,6 +1021,7 @@ export function apply(ctx, config = {}) {
       const r = resumeEntry(index, name, cwd)
       return { id: r.id, reset: r.reset }
     }
+    assertFreshName(hand, name, args?.allowNewSession)
     const othersAuto = sameCwdOthers(index, name, cwd)
     if (othersAuto.length && args?.allowNewSession !== true) {
       throw new Error(
@@ -3224,6 +3249,7 @@ export function apply(ctx, config = {}) {
 
       if (name && sid) {
         index[name] = { id: sid, cwd: workdir, updated: new Date().toISOString() }
+        recordSessionName('codex', name, sid, workdir)
         saveCodexIndex(index)
       }
 
@@ -3510,6 +3536,7 @@ export function apply(ctx, config = {}) {
         const sid = parsed?.session_id || known || ''
         if (name && sid) {
           index[name] = { id: sid, cwd: args?.cwd || '', updated: new Date().toISOString() }
+        recordSessionName('hand', name, sid, args?.cwd || '')
           writeJson(CLAUDE_INDEX, index)
         }
 
@@ -3757,6 +3784,7 @@ export function apply(ctx, config = {}) {
 
       if (name && sid) {
         index[name] = { id: sid, cwd: args?.cwd || '', updated: new Date().toISOString() }
+        recordSessionName('hand', name, sid, args?.cwd || '')
         writeJson(OPENCODE_INDEX, index)
       }
 
@@ -4207,6 +4235,7 @@ export function apply(ctx, config = {}) {
 
       if (name && sid && sid !== known) {
         index[name] = { id: sid, cwd: args?.cwd || '', updated: new Date().toISOString() }
+        recordSessionName('hand', name, sid, args?.cwd || '')
         writeJson(idxFile, index)
       }
 
