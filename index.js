@@ -938,6 +938,10 @@ export function apply(ctx, config = {}) {
     if (!root) return []
     return Object.keys(index || {}).filter((k) => k !== name && sessionRoot(k) === root)
   }
+  const sameCwdOthers = (index, name, cwd) => {
+    if (!cwd) return []
+    return Object.keys(index || {}).filter((k) => k !== name && sameCwd(index[k] && index[k].cwd, cwd))
+  }
   const resolveSession = (index, name, cwd, args, hand) => {
     const mode = String(args?.sessionMode || 'auto')
     const entry = name && index ? index[name] : null
@@ -962,6 +966,13 @@ export function apply(ctx, config = {}) {
     }
 
     if (mode === 'new') {
+      const others = sameCwdOthers(index, name, cwd)
+      if (others.length && args?.allowNewSession !== true) {
+        throw new Error(
+          `${hand}: 目录 ${cwd} 已经有会话「${others.join('、')}」。` +
+            '接着干请用 sessionMode:"resume" + 原名（上下文都在那条里）；确实要新开一条并行线，再传 allowNewSession:true。',
+        )
+      }
       if (entry) {
         throw new Error(
           `${hand}: 会话「${name}」已经存在。要继续它请传 sessionMode:"resume"；` +
@@ -981,6 +992,13 @@ export function apply(ctx, config = {}) {
     if (entry) {
       const r = resumeEntry(index, name, cwd)
       return { id: r.id, reset: r.reset }
+    }
+    const othersAuto = sameCwdOthers(index, name, cwd)
+    if (othersAuto.length && args?.allowNewSession !== true) {
+      throw new Error(
+        `${hand}: 目录 ${cwd} 已经有会话「${othersAuto.join('、')}」，但这次用的名字「${name}」不在里面。` +
+          '接着干请改成原会话名 + sessionMode:"resume"；确实是新任务再传 allowNewSession:true。',
+      )
     }
     if (near.length && args?.allowNewSession !== true) {
       throw new Error(
