@@ -922,34 +922,73 @@ export function apply(ctx, config = {}) {
     DEFAULT_OPENCODE_BIN,
   ])
   const defaultTimeout = Number(config.timeoutSec) || 900
-  // 同名会话在别的目录建的、或这次 cwd 变了：不要 resume，按新会话跑。
-  // 2026-11-22 踩到：同名的 astra 会话把上一轮的参考文件当成任务目标。
+  // 会话的两个动作必须显式分开：
+  //   sessionMode: "resume" → 只续已有，找不到就报错；
+  //   sessionMode: "new"    → 只新建，重名/近似名就报错（除非 allowNewSession）；
+  //   "auto"（默认）        → 有就续、没有就建，但近似名仍然要求确认。
   const sameCwd = (a, b) => {
-    const norm = (v) => String(v || "").replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase()
+    const norm = (v) => String(v || '').replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase()
     if (!norm(a) || !norm(b)) return true
     return norm(a) === norm(b)
   }
-  // "mv-astra-画面" / "mv-astra-画面2" 这种只差一个数字的名字，多半是手滑/中断后重派，
-  // 默认不允许悄悄新开一个会话，逼调用方显式确认（allowNewSession: true）。
   const sessionRoot = (name) =>
-    String(name || "")
-      .trim()
-      .toLowerCase()
-      .replace(/[\s_\-]*\d+$/, "")
+    String(name || '').trim().toLowerCase().replace(/[\s_\-]*\d+$/, '')
   const findLookalikeSession = (index, name) => {
     const root = sessionRoot(name)
     if (!root) return []
     return Object.keys(index || {}).filter((k) => k !== name && sessionRoot(k) === root)
   }
-  const guardLookalike = (index, name, args, hand) => {
-    if (!name || (index && index[name])) return
-    if (args?.allowNewSession === true) return
-    const near = findLookalikeSession(index, name)
-    if (!near.length) return
-    throw new Error(
-      `${hand}: 会话名「${name}」和已有的「${near.join("、")}」只差一个后缀，` +
-        "像是中断后重派。要继续那个会话就改成已有名字；确实要新开一个就传 allowNewSession: true。",
-    )
+  const resolveSession = (index, name, cwd, args, hand) => {
+    const mode = String(args?.sessionMode || 'auto')
+    const entry = name && index ? index[name] : null
+    const near = name ? findLookalikeSession(index, name) : []
+    const nearHint = near.length ? `（名字相近的已有会话：${near.join('、')}）` : ''
+
+    if (mode === 'resume') {
+      if (!entry) {
+        throw new Error(
+          `${hand}: 会话「${name || '(未填)'}」不存在。` +
+            (nearHint || '') +
+            ' 要继续老会话请用已有的准确名字；要新建请显式传 sessionMode:"new"。',
+        )
+      }
+      if (!sameCwd(entry.cwd, cwd)) {
+        throw new Error(
+          `${hand}: 会话「${name}」是在 ${entry.cwd || '(未知目录)'} 建的，和本次目录 ${cwd || '(未指定)'} 不一致。` +
+            ' 想在这里继续就换个会话名；要新建请传 sessionMode:"new"。',
+        )
+      }
+      return { id: String(entry.id), reset: false }
+    }
+
+    if (mode === 'new') {
+      if (entry) {
+        throw new Error(
+          `${hand}: 会话「${name}」已经存在。要继续它请传 sessionMode:"resume"；` +
+            '要另开一个请换个名字（确实要同名重建再传 allowNewSession:true）。',
+        )
+      }
+      if (near.length && args?.allowNewSession !== true) {
+        throw new Error(
+          `${hand}: 要新建的会话名「${name}」和已有会话 ${near.join('、')} 只差一个后缀，` +
+            '像是手滑或中断后重派。继续老会话请用原名；确定要新开再传 allowNewSession:true。',
+        )
+      }
+      return { id: null, reset: false }
+    }
+
+    // auto
+    if (entry) {
+      const r = resumeEntry(index, name, cwd)
+      return { id: r.id, reset: r.reset }
+    }
+    if (near.length && args?.allowNewSession !== true) {
+      throw new Error(
+        `${hand}: 会话名「${name}」和已有会话 ${near.join('、')} 只差一个后缀。` +
+          '要继续请用原名并传 sessionMode:"resume"；要新开请传 sessionMode:"new" 且换名字（或 allowNewSession:true）。',
+      )
+    }
+    return { id: null, reset: false }
   }
   const resumeEntry = (index, name, cwd) => {
     const entry = name && index ? index[name] : null
@@ -3064,6 +3103,12 @@ export function apply(ctx, config = {}) {
             'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
         },
         timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900); async jobs default to unlimited.' },
+        sessionMode: {
+          type: 'string',
+          enum: ['auto', 'resume', 'new'],
+          description:
+            "auto=有就续没有就建（默认）；resume=只续已有，不存在会报错；new=只新建，重名或近似名会报错（除非 allowNewSession）。",
+        },
         allowNewSession: {
           type: 'boolean',
           description:
@@ -3095,8 +3140,7 @@ export function apply(ctx, config = {}) {
       const name = args?.session ? String(args.session) : ''
       const sandbox = String(args?.sandbox || 'read-only')
       const workdir = resolveRunCwd(args, exec)
-      guardLookalike(index, name, args, 'codex')
-      const resume = resumeEntry(index, name, workdir)
+      const resume = resolveSession(index, name, workdir, args, 'codex')
       const known = resume.id
       const sessionReset = resume.reset
 
@@ -3375,6 +3419,12 @@ export function apply(ctx, config = {}) {
             'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
         },
         timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900); async jobs default to unlimited.' },
+        sessionMode: {
+          type: 'string',
+          enum: ['auto', 'resume', 'new'],
+          description:
+            "auto=有就续没有就建（默认）；resume=只续已有，不存在会报错；new=只新建，重名或近似名会报错（除非 allowNewSession）。",
+        },
         allowNewSession: {
           type: 'boolean',
           description:
@@ -3402,8 +3452,7 @@ export function apply(ctx, config = {}) {
 
       const index = readJson(CLAUDE_INDEX, {}) || {}
       const name = args?.session ? String(args.session) : ''
-      guardLookalike(index, name, args, 'hand')
-      const resume = resumeEntry(index, name, args?.cwd || '')
+      const resume = resolveSession(index, name, args?.cwd || '', args, 'hand')
       const known = resume.id
       const sessionReset = resume.reset
 
@@ -3570,6 +3619,12 @@ export function apply(ctx, config = {}) {
             'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
         },
         timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900); async jobs default to unlimited.' },
+        sessionMode: {
+          type: 'string',
+          enum: ['auto', 'resume', 'new'],
+          description:
+            "auto=有就续没有就建（默认）；resume=只续已有，不存在会报错；new=只新建，重名或近似名会报错（除非 allowNewSession）。",
+        },
         allowNewSession: {
           type: 'boolean',
           description:
@@ -3597,8 +3652,7 @@ export function apply(ctx, config = {}) {
 
       const index = readJson(OPENCODE_INDEX, {}) || {}
       const name = args?.session ? String(args.session) : ''
-      guardLookalike(index, name, args, 'hand')
-      const resume = resumeEntry(index, name, args?.cwd || '')
+      const resume = resolveSession(index, name, args?.cwd || '', args, 'hand')
       const known = resume.id
       const sessionReset = resume.reset
       const runCwd = resolveRunCwd(args, exec)
@@ -3923,7 +3977,7 @@ export function apply(ctx, config = {}) {
     if (!known && name) {
       const index = readJson(handDef.index(), {}) || {}
       guardLookalike(index, name, args, 'agy')
-      const resumeAgy = resumeEntry(index, name, args?.cwd || '')
+      const resumeAgy = resolveSession(index, name, args?.cwd || '', args, 'agy')
       if (resumeAgy.id) known = resumeAgy.id
     }
     const write = !!job.write
@@ -4013,6 +4067,12 @@ export function apply(ctx, config = {}) {
             'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
         },
         timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900); async jobs default to unlimited.' },
+        sessionMode: {
+          type: 'string',
+          enum: ['auto', 'resume', 'new'],
+          description:
+            "auto=有就续没有就建（默认）；resume=只续已有，不存在会报错；new=只新建，重名或近似名会报错（除非 allowNewSession）。",
+        },
         allowNewSession: {
           type: 'boolean',
           description:
@@ -4048,8 +4108,7 @@ export function apply(ctx, config = {}) {
       const idxFile = hand.index()
       const index = readJson(idxFile, {}) || {}
       const name = args?.session ? String(args.session) : ''
-      guardLookalike(index, name, args, 'hand')
-      const resume = resumeEntry(index, name, args?.cwd || '')
+      const resume = resolveSession(index, name, args?.cwd || '', args, 'hand')
       const known = resume.id
       const sessionReset = resume.reset
 
