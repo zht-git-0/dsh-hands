@@ -922,6 +922,12 @@ export function apply(ctx, config = {}) {
     DEFAULT_OPENCODE_BIN,
   ])
   const defaultTimeout = Number(config.timeoutSec) || 900
+  // 异步任务默认不限时：只有显式传 timeoutSec > 0 才限时。
+  // 之前 only agy_run 走了这个逻辑，codex/claude/opencode 的异步照样被 900 秒砍掉。
+  const effTimeout = (args) =>
+    args?.async === true
+      ? (args?.timeoutSec == null ? 0 : Math.max(0, Number(args.timeoutSec) || 0))
+      : Number(args?.timeoutSec) || defaultTimeout
   // 默认跳过权限确认（发布版行为）；要收紧就在配置里写 skipPermissions: false
   const skipPermissions = config.skipPermissions !== false
   // ACP 开关（第 6 步）：默认空 = 四家全走 CLI，和以前完全一样。
@@ -3087,7 +3093,7 @@ export function apply(ctx, config = {}) {
       })
       const result = await runProcess(codexBin, argv, {
         cwd: workdir,
-        timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
+        timeoutSec: effTimeout(args),
         onChunk: run.push,
         onSpawn: (child) => trackProc(run.id, child, run),
       })
@@ -3417,7 +3423,7 @@ export function apply(ctx, config = {}) {
       const spawn = () =>
         runProcess(claudeBin, argv, {
           cwd: resolveRunCwd(args, exec),
-          timeoutSec: Number(args?.timeoutSec) || defaultTimeout,
+          timeoutSec: effTimeout(args),
           onChunk: run.push,
           onSpawn: (child) => trackProc(run.id, child, run),
         })
@@ -3538,7 +3544,7 @@ export function apply(ctx, config = {}) {
       const known = name && index[name] ? index[name].id : null
       const runCwd = resolveRunCwd(args, exec)
       const model = args?.model ? String(args.model) : ''
-      const timeoutSec = Number(args?.timeoutSec) || defaultTimeout
+      const timeoutSec = effTimeout(args)
 
       const run = startDispatch({
         hand: 'opencode',
@@ -3980,7 +3986,7 @@ export function apply(ctx, config = {}) {
 
       const opts = { write: !!args?.write, model: args?.model || '' }
       const runCwd = resolveRunCwd(args, ctx)
-      const timeoutSec = Number(args?.timeoutSec) || defaultTimeout
+      const timeoutSec = effTimeout(args)
       const run = startDispatch({
         hand: to,
         tool: 'hands_run',
