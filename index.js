@@ -922,6 +922,19 @@ export function apply(ctx, config = {}) {
     DEFAULT_OPENCODE_BIN,
   ])
   const defaultTimeout = Number(config.timeoutSec) || 900
+  // 同名会话在别的目录建的、或这次 cwd 变了：不要 resume，按新会话跑。
+  // 2026-11-22 踩到：同名的 astra 会话把上一轮的参考文件当成任务目标。
+  const sameCwd = (a, b) => {
+    const norm = (v) => String(v || "").replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase()
+    if (!norm(a) || !norm(b)) return true
+    return norm(a) === norm(b)
+  }
+  const resumeEntry = (index, name, cwd) => {
+    const entry = name && index ? index[name] : null
+    if (!entry || !entry.id) return { id: null, reset: false }
+    if (!sameCwd(entry.cwd, cwd)) return { id: null, reset: true, previousCwd: entry.cwd }
+    return { id: String(entry.id), reset: false }
+  }
   // 异步任务默认不限时：只有显式传 timeoutSec > 0 才限时。
   // 之前 only agy_run 走了这个逻辑，codex/claude/opencode 的异步照样被 900 秒砍掉。
   const effTimeout = (args) =>
@@ -3053,10 +3066,11 @@ export function apply(ctx, config = {}) {
       const perform = async (runId = '') => {
       const index = loadCodexIndex()
       const name = args?.session ? String(args.session) : ''
-      const known = name && index[name] ? index[name].id : null
-
       const sandbox = String(args?.sandbox || 'read-only')
       const workdir = resolveRunCwd(args, exec)
+      const resume = resumeEntry(index, name, workdir)
+      const known = resume.id
+      const sessionReset = resume.reset
 
       let argv
       let resumed = false
@@ -3355,7 +3369,9 @@ export function apply(ctx, config = {}) {
 
       const index = readJson(CLAUDE_INDEX, {}) || {}
       const name = args?.session ? String(args.session) : ''
-      const known = name && index[name] ? index[name].id : null
+      const resume = resumeEntry(index, name, args?.cwd || '')
+      const known = resume.id
+      const sessionReset = resume.reset
 
       const argv = [
         '-p',
@@ -3413,6 +3429,7 @@ export function apply(ctx, config = {}) {
           response: answer,
           sessionId: sid,
           resumed: !!known,
+          ...(sessionReset ? { sessionReset: true } : {}),
           cost: parsed?.total_cost_usd ?? null,
           cacheRead: usage.cache_read_input_tokens ?? null,
           exitCode: result.code,
@@ -3541,7 +3558,9 @@ export function apply(ctx, config = {}) {
 
       const index = readJson(OPENCODE_INDEX, {}) || {}
       const name = args?.session ? String(args.session) : ''
-      const known = name && index[name] ? index[name].id : null
+      const resume = resumeEntry(index, name, args?.cwd || '')
+      const known = resume.id
+      const sessionReset = resume.reset
       const runCwd = resolveRunCwd(args, exec)
       const model = args?.model ? String(args.model) : ''
       const timeoutSec = effTimeout(args)
@@ -3863,7 +3882,8 @@ export function apply(ctx, config = {}) {
     let known = String(job.conversationId || '')
     if (!known && name) {
       const index = readJson(handDef.index(), {}) || {}
-      if (index[name]?.id) known = String(index[name].id)
+      const resumeAgy = resumeEntry(index, name, args?.cwd || '')
+      if (resumeAgy.id) known = resumeAgy.id
     }
     const write = !!job.write
     const model = String(job.model || '')
@@ -3982,7 +4002,9 @@ export function apply(ctx, config = {}) {
       const idxFile = hand.index()
       const index = readJson(idxFile, {}) || {}
       const name = args?.session ? String(args.session) : ''
-      const known = name && index[name] ? index[name].id : null
+      const resume = resumeEntry(index, name, args?.cwd || '')
+      const known = resume.id
+      const sessionReset = resume.reset
 
       const opts = { write: !!args?.write, model: args?.model || '' }
       const runCwd = resolveRunCwd(args, ctx)
