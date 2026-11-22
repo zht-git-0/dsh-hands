@@ -3452,7 +3452,7 @@ export function apply(ctx, config = {}) {
 
       const index = readJson(CLAUDE_INDEX, {}) || {}
       const name = args?.session ? String(args.session) : ''
-      const resume = resolveSession(index, name, args?.cwd || '', args, 'hand')
+      const resume = resolveSession(index, name, args?.cwd || '', args, 'claude')
       const known = resume.id
       const sessionReset = resume.reset
 
@@ -3652,7 +3652,7 @@ export function apply(ctx, config = {}) {
 
       const index = readJson(OPENCODE_INDEX, {}) || {}
       const name = args?.session ? String(args.session) : ''
-      const resume = resolveSession(index, name, args?.cwd || '', args, 'hand')
+      const resume = resolveSession(index, name, args?.cwd || '', args, 'opencode')
       const known = resume.id
       const sessionReset = resume.reset
       const runCwd = resolveRunCwd(args, exec)
@@ -4108,7 +4108,7 @@ export function apply(ctx, config = {}) {
       const idxFile = hand.index()
       const index = readJson(idxFile, {}) || {}
       const name = args?.session ? String(args.session) : ''
-      const resume = resolveSession(index, name, args?.cwd || '', args, 'hand')
+      const resume = resolveSession(index, name, args?.cwd || '', args, 'hands_run')
       const known = resume.id
       const sessionReset = resume.reset
 
