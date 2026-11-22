@@ -940,7 +940,11 @@ export function apply(ctx, config = {}) {
   }
   const sameCwdOthers = (index, name, cwd) => {
     if (!cwd) return []
-    return Object.keys(index || {}).filter((k) => k !== name && sameCwd(index[k] && index[k].cwd, cwd))
+    return Object.keys(index || {}).filter((k) => {
+      const other = index[k]
+      if (k === name || !other || !String(other.cwd || '').trim()) return false
+      return sameCwd(other.cwd, cwd)
+    })
   }
   const resolveSession = (index, name, cwd, args, hand) => {
     const mode = String(args?.sessionMode || 'auto')
