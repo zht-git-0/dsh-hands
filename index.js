@@ -929,6 +929,28 @@ export function apply(ctx, config = {}) {
     if (!norm(a) || !norm(b)) return true
     return norm(a) === norm(b)
   }
+  // "mv-astra-画面" / "mv-astra-画面2" 这种只差一个数字的名字，多半是手滑/中断后重派，
+  // 默认不允许悄悄新开一个会话，逼调用方显式确认（allowNewSession: true）。
+  const sessionRoot = (name) =>
+    String(name || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[\s_\-]*\d+$/, "")
+  const findLookalikeSession = (index, name) => {
+    const root = sessionRoot(name)
+    if (!root) return []
+    return Object.keys(index || {}).filter((k) => k !== name && sessionRoot(k) === root)
+  }
+  const guardLookalike = (index, name, args, hand) => {
+    if (!name || (index && index[name])) return
+    if (args?.allowNewSession === true) return
+    const near = findLookalikeSession(index, name)
+    if (!near.length) return
+    throw new Error(
+      `${hand}: 会话名「${name}」和已有的「${near.join("、")}」只差一个后缀，` +
+        "像是中断后重派。要继续那个会话就改成已有名字；确实要新开一个就传 allowNewSession: true。",
+    )
+  }
   const resumeEntry = (index, name, cwd) => {
     const entry = name && index ? index[name] : null
     if (!entry || !entry.id) return { id: null, reset: false }
@@ -3041,7 +3063,12 @@ export function apply(ctx, config = {}) {
           description:
             'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
         },
-        timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900).' },
+        timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900); async jobs default to unlimited.' },
+        allowNewSession: {
+          type: 'boolean',
+          description:
+            'true = 允许在已有「只差一个后缀」的会话旁新开一个；不传时遇到相似会话名会直接报错。',
+        },
       },
       required: ['prompt'],
       additionalProperties: false,
@@ -3068,6 +3095,7 @@ export function apply(ctx, config = {}) {
       const name = args?.session ? String(args.session) : ''
       const sandbox = String(args?.sandbox || 'read-only')
       const workdir = resolveRunCwd(args, exec)
+      guardLookalike(index, name, args, 'codex')
       const resume = resumeEntry(index, name, workdir)
       const known = resume.id
       const sessionReset = resume.reset
@@ -3346,7 +3374,12 @@ export function apply(ctx, config = {}) {
           description:
             'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
         },
-        timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900).' },
+        timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900); async jobs default to unlimited.' },
+        allowNewSession: {
+          type: 'boolean',
+          description:
+            'true = 允许在已有「只差一个后缀」的会话旁新开一个；不传时遇到相似会话名会直接报错。',
+        },
       },
       required: ['prompt'],
       additionalProperties: false,
@@ -3369,6 +3402,7 @@ export function apply(ctx, config = {}) {
 
       const index = readJson(CLAUDE_INDEX, {}) || {}
       const name = args?.session ? String(args.session) : ''
+      guardLookalike(index, name, args, 'hand')
       const resume = resumeEntry(index, name, args?.cwd || '')
       const known = resume.id
       const sessionReset = resume.reset
@@ -3535,7 +3569,12 @@ export function apply(ctx, config = {}) {
           description:
             'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
         },
-        timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900).' },
+        timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900); async jobs default to unlimited.' },
+        allowNewSession: {
+          type: 'boolean',
+          description:
+            'true = 允许在已有「只差一个后缀」的会话旁新开一个；不传时遇到相似会话名会直接报错。',
+        },
       },
       required: ['prompt'],
       additionalProperties: false,
@@ -3558,6 +3597,7 @@ export function apply(ctx, config = {}) {
 
       const index = readJson(OPENCODE_INDEX, {}) || {}
       const name = args?.session ? String(args.session) : ''
+      guardLookalike(index, name, args, 'hand')
       const resume = resumeEntry(index, name, args?.cwd || '')
       const known = resume.id
       const sessionReset = resume.reset
@@ -3882,6 +3922,7 @@ export function apply(ctx, config = {}) {
     let known = String(job.conversationId || '')
     if (!known && name) {
       const index = readJson(handDef.index(), {}) || {}
+      guardLookalike(index, name, args, 'agy')
       const resumeAgy = resumeEntry(index, name, args?.cwd || '')
       if (resumeAgy.id) known = resumeAgy.id
     }
@@ -3971,7 +4012,12 @@ export function apply(ctx, config = {}) {
           description:
             'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
         },
-        timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900).' },
+        timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900); async jobs default to unlimited.' },
+        allowNewSession: {
+          type: 'boolean',
+          description:
+            'true = 允许在已有「只差一个后缀」的会话旁新开一个；不传时遇到相似会话名会直接报错。',
+        },
       },
       required: ['to', 'prompt'],
       additionalProperties: false,
@@ -4002,6 +4048,7 @@ export function apply(ctx, config = {}) {
       const idxFile = hand.index()
       const index = readJson(idxFile, {}) || {}
       const name = args?.session ? String(args.session) : ''
+      guardLookalike(index, name, args, 'hand')
       const resume = resumeEntry(index, name, args?.cwd || '')
       const known = resume.id
       const sessionReset = resume.reset
