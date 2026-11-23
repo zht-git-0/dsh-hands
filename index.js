@@ -1113,6 +1113,306 @@ export function agyProviderContext(provider, opts = {}) {
   return { provider: name, env, settingsFile, credentials: cred }
 }
 
+// ── 会话守卫（hoist 到模块顶层，测试直接 import 这些纯逻辑）───────────────────────
+// 守卫语义（sessionMode）：
+//   resume → 只续已有，找不到就报错；
+//   new    → 只新建，重名/近似名就报错（除非 allowNewSession）；
+//   auto（默认） → 有就续、没有就建，但近似名仍然要求确认。
+export function sameCwd(a, b) {
+  const norm = (v) => String(v || '').replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase()
+  if (!norm(a) || !norm(b)) return false // 空不算同目录：先前返回 true，守卫因此失效
+  return norm(a) === norm(b)
+}
+const sessionRoot = (name) => String(name || '').trim().toLowerCase().replace(/[\s_\-]*\d+$/, '')
+const findLookalikeSession = (index, name) => {
+  const root = sessionRoot(name)
+  if (!root) return []
+  return Object.keys(index || {}).filter((k) => k !== name && sessionRoot(k) === root)
+}
+const sameCwdOthers = (index, name, cwd) => {
+  if (!cwd) return []
+  return Object.keys(index || {}).filter((k) => {
+    const other = index[k]
+    if (k === name || !other || !String(other.cwd || '').trim()) return false
+    return sameCwd(other.cwd, cwd)
+  })
+}
+export const NAME_LEDGER = path.join(os.homedir(), '.dsh', 'hands-session-names.json')
+const readNameLedger = () => readJson(NAME_LEDGER, {}) || {}
+export function recordSessionName(hand, name, id, cwd) {
+  if (!name || !id) return
+  try {
+    const ledger = readNameLedger()
+    ledger[String(name)] = { hand, id: String(id), cwd: cwd || '', at: new Date().toISOString() }
+    writeJson(NAME_LEDGER, ledger)
+  } catch {
+    /* 记账失败不影响派活 */
+  }
+}
+// 新会话必须用一个从没用过的名字：名字一旦用过，即使 allowNewSession 也不许再开
+// （否则面板里会出现两条同名会话，index 只留最新那条，旧的那条就成孤儿）。
+function assertFreshName(hand, name, allowNewSession) {
+  if (!name) return
+  const used = readNameLedger()[String(name)]
+  if (!used) return
+  throw new Error(
+    `${hand}: 会话名「${name}」已经用过（${used.hand} / ${used.cwd || '未知目录'} / ${used.at}）。` +
+      '接着干就 resume 原名；要新开请换一个没出现过的名字（同名会让面板出现两条一样的会话）。',
+  )
+}
+// 拒绝新建时给「该目录下所有已有会话」的清单（名字 / 最后活跃时间 / 是否运行中）：
+// 让人能直接挑一个 resume，而不是只报一句拒绝。runningNames 缺省取 RUNNING 里当前在跑的会话名。
+export function sameDirSessionsEntries(index, name, cwd, runningNames) {
+  const running = new Set(
+    Array.isArray(runningNames)
+      ? runningNames.map(String).filter(Boolean)
+      : [...RUNNING.values()].map((r) => String(r?.session || '')).filter(Boolean),
+  )
+  const rows = []
+  for (const key of Object.keys(index || {})) {
+    if (key === name) continue
+    const entry = index[key]
+    if (!entry || !sameCwd(entry.cwd, cwd)) continue
+    rows.push({ name: key, at: String(entry.updated || entry.startedAt || ''), running: running.has(key) })
+  }
+  return rows
+}
+export function sameDirSessionsText(index, name, cwd, runningNames) {
+  const rows = sameDirSessionsEntries(index, name, cwd, runningNames)
+  if (!rows.length) return ''
+  return `该目录已有会话：${rows.map((r) => `「${r.name}」（活跃 ${r.at || '未知'}，${r.running ? '运行中' : '未运行'}）`).join('、')}。`
+}
+export function resolveSession(index, name, cwd, args, hand, requesterSessionId) {
+  const mode = String(args?.sessionMode || 'auto')
+  const entry = name && index ? index[name] : null
+  const near = name ? findLookalikeSession(index, name) : []
+  const nearHint = near.length ? `（名字相近的已有会话：${near.join('、')}）` : ''
+  // allowNewSession 已废弃：改用 issue_new_session_ticket 发票据，传了也不再放行（保留字段避免旧调用方炸裂）
+  const allowHint = args?.allowNewSession
+    ? ' allowNewSession 已废弃，改用 issue_new_session_ticket 发票据；传了也不放行。'
+    : ''
+
+  if (mode === 'resume') {
+    if (!entry) {
+      throw new Error(
+        `${hand}: 会话「${name || '(未填)'}」不存在。` +
+          (nearHint || '') +
+          ' 要继续老会话请用已有的准确名字；要新建请显式传 sessionMode:"new"。',
+      )
+    }
+    if (!sameCwd(entry.cwd, cwd)) {
+      throw new Error(
+        `${hand}: 会话「${name}」是在 ${entry.cwd || '(未知目录)'} 建的，和本次目录 ${cwd || '(未指定)'} 不一致。` +
+          ' 想在这里继续就换个会话名；要新建请传 sessionMode:"new"。',
+      )
+    }
+    return { id: String(entry.id), reset: false }
+  }
+
+  // 新建会话（mode "new"，或 auto 换名新建）：
+  //   目录里有其他会话 / 名字近似已有会话 → 必须带 ticket 并通过校验；
+  //   目录里没有其他会话 → 免票。
+  const creatingNew = !entry
+  const ticketInfo = creatingNew
+    ? validateSessionTicket(args?.ticket, hand, cwd, name, requesterSessionId)
+    : { ok: false, record: null, why: '' }
+  const hasTicket = creatingNew && String(args?.ticket || '').trim() !== ''
+  const others = sameCwdOthers(index, name, cwd)
+  const list = sameDirSessionsText(index, name, cwd)
+  const ticketRequired = () =>
+    ` 新建前请用 issue_new_session_ticket 发一张票据，或 resume 原会话。${allowHint}`
+
+  if (mode === 'new') {
+    assertFreshName(hand, name, args?.allowNewSession)
+    if (entry) {
+      throw new Error(
+        `${hand}: 会话「${name}」已经存在。要继续它请传 sessionMode:"resume"；要另开一个请换个名字。${allowHint}`,
+      )
+    }
+    if (others.length && !ticketInfo.ok) {
+      throw new Error(
+        `${hand}: 目录 ${cwd} 已经有会话「${others.join('、')}」。${list ? `${list} ` : ''}${ticketRequired()}`,
+      )
+    }
+    if (near.length && !ticketInfo.ok) {
+      throw new Error(
+        `${hand}: 要新建的会话名「${name}」和已有会话 ${near.join('、')} 只差一个后缀，像是手滑或中断后重派。` +
+          ` 新建前先用 issue_new_session_ticket 发一张票据${nearHint}，或直接 resume ${near[0]}。${allowHint}`,
+      )
+    }
+    if (hasTicket && !ticketInfo.ok) {
+      throw new Error(`${hand}: 票据校验未通过：${ticketInfo.why}${list ? ` ${list}` : ''}${ticketRequired()}`)
+    }
+    if (ticketInfo.ok) consumeSessionTicket(ticketInfo.record)
+    return { id: null, reset: false }
+  }
+
+  // auto
+  if (entry) {
+    const r = resumeEntry(index, name, cwd)
+    return { id: r.id, reset: r.reset }
+  }
+  assertFreshName(hand, name, args?.allowNewSession)
+  const othersAuto = sameCwdOthers(index, name, cwd)
+  if (othersAuto.length && !ticketInfo.ok) {
+    throw new Error(
+      `${hand}: 这次用的名字「${name}」在目录 ${cwd} 里不存在，但该目录已有会话「${othersAuto.join('、')}」。` +
+        `${list ? `${list} ` : ''}${ticketRequired()}`,
+    )
+  }
+  if (near.length && !ticketInfo.ok) {
+    throw new Error(
+      `${hand}: 会话名「${name}」和已有会话 ${near.join('、')} 只差一个后缀。` +
+        ` 新建前先用 issue_new_session_ticket 发一张票据${nearHint}，或直接 resume ${near[0]}。${allowHint}`,
+    )
+  }
+  if (hasTicket && !ticketInfo.ok) {
+    throw new Error(`${hand}: 票据校验未通过：${ticketInfo.why}${list ? ` ${list}` : ''}${ticketRequired()}`)
+  }
+  if (ticketInfo.ok) consumeSessionTicket(ticketInfo.record)
+  return { id: null, reset: false }
+}
+function resumeEntry(index, name, cwd) {
+  const entry = name && index ? index[name] : null
+  if (!entry || !entry.id) return { id: null, reset: false }
+  if (!sameCwd(entry.cwd, cwd)) return { id: null, reset: true, previousCwd: entry.cwd }
+  return { id: String(entry.id), reset: false }
+}
+
+// ── 新建会话票据（ticket）── 按 claude 评审的设计：没有加密装饰 ───────────────
+// 同目录已有会话时，新建/换名新建必须先拿 ticket，而不是无闸进闸（2026-11-23 起）。
+//   - 票据：一次性随机串，绑 hand + 规范化 cwd + 精确 name + 发起方会话 id；10 分钟过期。
+//   - 存在进程内 Map（插件重启即失效，可重开）；发放 + 核销记录进 ~/.dsh/hands-session-tickets.json
+//     （持久化只存账本，不存票据本体）。
+//   - 同一 cwd 10 分钟内最多发一张票（账本里记了发放时间算），第二张直接拒。
+//   - allowNewSession 已废弃：传了也不再放行（resolveSession 里拒绝信息里会说）。
+export const SESSION_TICKET_TTL_MS = 10 * 60 * 1000
+export const SESSION_TICKET_RATE_MS = 10 * 60 * 1000
+export const SESSION_TICKET_LEDGER_FILE = path.join(os.homedir(), '.dsh', 'hands-session-tickets.json')
+const SESSION_TICKETS = new Map() // ticket -> { ticket, hand, cwd, name, reason, requesterSessionId, issuedAt }
+
+export function readSessionTicketLedger(file = SESSION_TICKET_LEDGER_FILE) {
+  const data = readJson(file, { v: 1, issued: [], redeemed: [] }) || { v: 1, issued: [], redeemed: [] }
+  return {
+    v: 1,
+    issued: Array.isArray(data.issued) ? data.issued : [],
+    redeemed: Array.isArray(data.redeemed) ? data.redeemed : [],
+  }
+}
+
+export function appendSessionTicketLedger(entry, file = SESSION_TICKET_LEDGER_FILE) {
+  try {
+    const ledger = readSessionTicketLedger(file)
+    const list = String(entry?.event || '') === 'redeemed' ? ledger.redeemed : ledger.issued
+    list.push({
+      at: String(entry?.at || ''),
+      event: String(entry?.event || ''),
+      hand: String(entry?.hand || ''),
+      cwd: String(entry?.cwd || ''),
+      name: String(entry?.name || ''),
+      reason: String(entry?.reason || ''),
+      requesterSessionId: String(entry?.requesterSessionId || ''),
+    })
+    writeJson(file, ledger)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// 同一 cwd、在 10 分钟窗口内已发过票（账本的 issued 记录拿时间戳算）
+function sessionTicketsRecentIssued(cwd, now = Date.now(), file = SESSION_TICKET_LEDGER_FILE) {
+  return readSessionTicketLedger(file).issued.filter((e) => {
+    const at = Date.parse(String(e?.at || ''))
+    if (!Number.isFinite(at)) return false
+    return sameCwd(e?.cwd, cwd) && now - at < SESSION_TICKET_RATE_MS
+  })
+}
+
+// 签发票据：返回 { ticket, hand, cwd, name, reason, sessions, hint }。
+// sessions = 该目录现有会话清单（名字 / 最后活跃 / 是否运行中）——提示「先看清单，能 resume 就别新开」。
+export function issueSessionTicket(fields = {}, opts = {}) {
+  const hand = String(fields?.hand || '').trim()
+  const name = String(fields?.name || '').trim()
+  if (!hand) throw new Error('hand is required')
+  if (!name) throw new Error('name is required')
+  const cwd = String(fields?.cwd || '').trim() || resolveRunCwd(fields, {})
+  const reason = String(fields?.reason || '').trim()
+  const requesterSessionId = String(fields?.requesterSessionId || '').trim()
+  const now = Date.now()
+  const busy = sessionTicketsRecentIssued(cwd, now, opts.file)
+  if (busy.length) {
+    throw new Error(
+      `同一目录 ${cwd} 在 ${Math.round(SESSION_TICKET_RATE_MS / 60000)} 分钟内已经发过票据` +
+        `（${busy.map((b) => String(b.name || '')).join('、') || '—'}），最多一张。` +
+        '等窗口过后再发，或先让手下 resume 既有会话。',
+    )
+  }
+  const ticket = `st-${crypto.randomUUID()}`
+  SESSION_TICKETS.set(ticket, { ticket, hand, cwd, name, reason, requesterSessionId, issuedAt: now })
+  appendSessionTicketLedger(
+    { at: new Date(now).toISOString(), event: 'issued', hand, cwd, name, reason, requesterSessionId },
+    opts.file,
+  )
+  return {
+    ticket,
+    hand,
+    cwd,
+    name,
+    reason,
+    sessions: sameDirSessionsEntries(fields?.index || {}, name, cwd),
+    hint: '先看清单，能 resume 就别新开',
+  }
+}
+
+// 校验票据（不消耗）：{ ok, record, why }
+export function validateSessionTicket(ticket, hand, cwd, name, requesterSessionId, opts = {}) {
+  const id = String(ticket || '').trim()
+  const rec = id ? SESSION_TICKETS.get(id) : null
+  const bad = (record, why) => ({ ok: false, record, why })
+  if (!rec) return bad(null, id ? '票据无效或已核销' : '没有票据')
+  if (String(rec.hand || '') !== String(hand || '')) {
+    return bad(rec, `票据绑 hand=${rec.hand || '(未记)'}，本次是 ${hand || '(未填)'}`)
+  }
+  if (!sameCwd(rec.cwd, cwd)) {
+    return bad(rec, `票据绑目录 ${rec.cwd || '(未知目录)'}，不能在 ${cwd || '(未指定)'} 用（跨目录挪用）`)
+  }
+  if (String(rec.name || '') !== String(name || '')) {
+    return bad(rec, `票据绑名字「${rec.name || ''}」，不能在「${name || ''}」上用`)
+  }
+  if (rec.requesterSessionId && requesterSessionId && String(rec.requesterSessionId) !== String(requesterSessionId)) {
+    return bad(rec, '票据是别的会话发的，发起方会话不匹配')
+  }
+  const now = Number.isFinite(opts.now) ? opts.now : Date.now()
+  const ttlMs = Number.isFinite(opts.ttlMs) && opts.ttlMs >= 0 ? opts.ttlMs : SESSION_TICKET_TTL_MS
+  if (now - Number(rec.issuedAt || 0) > ttlMs) {
+    return bad(rec, `票据已过期（有效期 ${Math.round(SESSION_TICKET_TTL_MS / 60000)} 分钟）`)
+  }
+  return { ok: true, record: rec, why: '' }
+}
+
+// 核销：票据只能核销一次 —— 从进程内 Map 里删掉，并记核销事实进账本
+export function consumeSessionTicket(rec, opts = {}) {
+  if (!rec) return false
+  SESSION_TICKETS.delete(String(rec.ticket || ''))
+  appendSessionTicketLedger(
+    {
+      at: new Date().toISOString(),
+      event: 'redeemed',
+      hand: rec.hand,
+      cwd: rec.cwd,
+      name: rec.name,
+      reason: rec.reason,
+      requesterSessionId: rec.requesterSessionId,
+    },
+    opts.file,
+  )
+  return true
+}
+
+// ── 在跑的派活（RUNNING）—— hoist 到模块顶层：sameDirSessionsText（拒绝新建时列清单）要查它 ──
+const RUNNING = new Map()
+
 export function apply(ctx, config = {}) {
   // 四家的二进制：配置 > 本机常用安装位置 > 默认值，取第一个真实存在的。
   // 这样重装 / 目录被清之后不用改配置也能自己找回来。
@@ -1153,127 +1453,8 @@ export function apply(ctx, config = {}) {
     DEFAULT_OPENCODE_BIN,
   ])
   const defaultTimeout = Number(config.timeoutSec) || 900
-  // 会话的两个动作必须显式分开：
-  //   sessionMode: "resume" → 只续已有，找不到就报错；
-  //   sessionMode: "new"    → 只新建，重名/近似名就报错（除非 allowNewSession）；
-  //   "auto"（默认）        → 有就续、没有就建，但近似名仍然要求确认。
-  const sameCwd = (a, b) => {
-    const norm = (v) => String(v || '').replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase()
-    if (!norm(a) || !norm(b)) return true
-    return norm(a) === norm(b)
-  }
-  const sessionRoot = (name) =>
-    String(name || '').trim().toLowerCase().replace(/[\s_\-]*\d+$/, '')
-  const findLookalikeSession = (index, name) => {
-    const root = sessionRoot(name)
-    if (!root) return []
-    return Object.keys(index || {}).filter((k) => k !== name && sessionRoot(k) === root)
-  }
-  const sameCwdOthers = (index, name, cwd) => {
-    if (!cwd) return []
-    return Object.keys(index || {}).filter((k) => {
-      const other = index[k]
-      if (k === name || !other || !String(other.cwd || '').trim()) return false
-      return sameCwd(other.cwd, cwd)
-    })
-  }
-  const NAME_LEDGER = path.join(os.homedir(), '.dsh', 'hands-session-names.json')
-  const readNameLedger = () => readJson(NAME_LEDGER, {}) || {}
-  const recordSessionName = (hand, name, id, cwd) => {
-    if (!name || !id) return
-    try {
-      const ledger = readNameLedger()
-      ledger[String(name)] = { hand, id: String(id), cwd: cwd || '', at: new Date().toISOString() }
-      writeJson(NAME_LEDGER, ledger)
-    } catch {
-      /* 记账失败不影响派活 */
-    }
-  }
-  // 新会话必须用一个从没用过的名字：名字一旦用过，即使 allowNewSession 也不许再开
-  // （否则面板里会出现两条同名会话，index 只留最新那条，旧的那条就成孤儿）。
-  const assertFreshName = (hand, name, allowNewSession) => {
-    if (!name) return
-    const used = readNameLedger()[String(name)]
-    if (!used) return
-    throw new Error(
-      `${hand}: 会话名「${name}」已经用过（${used.hand} / ${used.cwd || '未知目录'} / ${used.at}）。` +
-        '接着干就 resume 原名；要新开请换一个没出现过的名字（同名会让面板出现两条一样的会话）。',
-    )
-  }
-  const resolveSession = (index, name, cwd, args, hand) => {
-    const mode = String(args?.sessionMode || 'auto')
-    const entry = name && index ? index[name] : null
-    const near = name ? findLookalikeSession(index, name) : []
-    const nearHint = near.length ? `（名字相近的已有会话：${near.join('、')}）` : ''
-
-    if (mode === 'resume') {
-      if (!entry) {
-        throw new Error(
-          `${hand}: 会话「${name || '(未填)'}」不存在。` +
-            (nearHint || '') +
-            ' 要继续老会话请用已有的准确名字；要新建请显式传 sessionMode:"new"。',
-        )
-      }
-      if (!sameCwd(entry.cwd, cwd)) {
-        throw new Error(
-          `${hand}: 会话「${name}」是在 ${entry.cwd || '(未知目录)'} 建的，和本次目录 ${cwd || '(未指定)'} 不一致。` +
-            ' 想在这里继续就换个会话名；要新建请传 sessionMode:"new"。',
-        )
-      }
-      return { id: String(entry.id), reset: false }
-    }
-
-    if (mode === 'new') {
-      assertFreshName(hand, name, args?.allowNewSession)
-      const others = sameCwdOthers(index, name, cwd)
-      if (others.length && args?.allowNewSession !== true) {
-        throw new Error(
-          `${hand}: 目录 ${cwd} 已经有会话「${others.join('、')}」。` +
-            '接着干请用 sessionMode:"resume" + 原名（上下文都在那条里）；确实要新开一条并行线，再传 allowNewSession:true。',
-        )
-      }
-      if (entry) {
-        throw new Error(
-          `${hand}: 会话「${name}」已经存在。要继续它请传 sessionMode:"resume"；` +
-            '要另开一个请换个名字（确实要同名重建再传 allowNewSession:true）。',
-        )
-      }
-      if (near.length && args?.allowNewSession !== true) {
-        throw new Error(
-          `${hand}: 要新建的会话名「${name}」和已有会话 ${near.join('、')} 只差一个后缀，` +
-            '像是手滑或中断后重派。继续老会话请用原名；确定要新开再传 allowNewSession:true。',
-        )
-      }
-      return { id: null, reset: false }
-    }
-
-    // auto
-    if (entry) {
-      const r = resumeEntry(index, name, cwd)
-      return { id: r.id, reset: r.reset }
-    }
-    assertFreshName(hand, name, args?.allowNewSession)
-    const othersAuto = sameCwdOthers(index, name, cwd)
-    if (othersAuto.length && args?.allowNewSession !== true) {
-      throw new Error(
-        `${hand}: 目录 ${cwd} 已经有会话「${othersAuto.join('、')}」，但这次用的名字「${name}」不在里面。` +
-          '接着干请改成原会话名 + sessionMode:"resume"；确实是新任务再传 allowNewSession:true。',
-      )
-    }
-    if (near.length && args?.allowNewSession !== true) {
-      throw new Error(
-        `${hand}: 会话名「${name}」和已有会话 ${near.join('、')} 只差一个后缀。` +
-          '要继续请用原名并传 sessionMode:"resume"；要新开请传 sessionMode:"new" 且换名字（或 allowNewSession:true）。',
-      )
-    }
-    return { id: null, reset: false }
-  }
-  const resumeEntry = (index, name, cwd) => {
-    const entry = name && index ? index[name] : null
-    if (!entry || !entry.id) return { id: null, reset: false }
-    if (!sameCwd(entry.cwd, cwd)) return { id: null, reset: true, previousCwd: entry.cwd }
-    return { id: String(entry.id), reset: false }
-  }
+  // 会话守卫（sameCwd / assertFreshName / resolveSession / sameDirSessionsText 等）
+  // 全部 hoist 到模块顶层（下面定义）：测试可以直接 import 这些纯逻辑，不用进 apply。
   // 异步任务默认不限时：只有显式传 timeoutSec > 0 才限时。
   // 之前 only agy_run 走了这个逻辑，codex/claude/opencode 的异步照样被 900 秒砍掉。
   const effTimeout = (args) =>
@@ -1719,7 +1900,6 @@ export function apply(ctx, config = {}) {
     return rest
   }
 
-  const RUNNING = new Map()
   // 在跑的进程句柄：id -> { child, startedAt, run }。单独存一份，绝不塞进 RUNNING：
   // RUNNING 会被 clean() 递归序列化，ChildProcess 有循环引用会直接炸。
   const RUNNING_PROCS = new Map()
@@ -3002,6 +3182,7 @@ export function apply(ctx, config = {}) {
       if (!prompt.trim()) throw new Error('prompt is required')
       // 第三方供应商：缺 key 等问题在跑活前抛清晰错误，别等跑完才报
       const providerCtx = agyProviderContext(args?.provider)
+      const runCwd = resolveRunCwd(args, exec)
 
       // runId：异步派活时由外层预分配，保证 jobId 和日志 id 是同一个
       const perform = async (runId = '') => {
@@ -3010,8 +3191,9 @@ export function apply(ctx, config = {}) {
       // 三种定位会话的方式，优先级：conversationId > session 名字 > continueLast
       const index = loadIndex()
       const label = typeof args?.session === 'string' ? args.session.trim() : ''
-      const byLabel = label && index[label]?.id ? String(index[label].id) : ''
-      const resumeId = args?.conversationId ? String(args.conversationId) : byLabel
+      // 统一走守卫：agy_run 以前自己查 index、没走 resolveSession，同目录守卫在它身上失效了
+      const resume = resolveSession(index, label, runCwd, args, 'agy', sessionIdFromExec(exec))
+      const resumeId = resume.id || (args?.conversationId ? String(args.conversationId) : '')
       if (resumeId) argv.push('--conversation', resumeId)
       else if (args?.continueLast) argv.push('--continue')
       if (args?.model) argv.push('--model', String(args.model))
@@ -3037,11 +3219,11 @@ export function apply(ctx, config = {}) {
         write: skipPermissions,
         session: label,
         conversationId: resumeId,
-        cwd: args?.cwd || '',
+        cwd: runCwd,
         model: args?.model || '',
       })
       const result = await runProcess(bin, argv, {
-        cwd: args?.cwd,
+        cwd: runCwd,
         timeoutSec,
         env: providerCtx.env,
         onChunk: run.push,
@@ -3096,7 +3278,7 @@ export function apply(ctx, config = {}) {
         const idx = loadIndex()
         idx[label] = {
           id: String(out.conversationId),
-          cwd: args?.cwd ?? null,
+          cwd: runCwd,
           updated: new Date().toISOString(),
         }
         saveIndex(idx)
@@ -3418,12 +3600,12 @@ export function apply(ctx, config = {}) {
           type: 'string',
           enum: ['auto', 'resume', 'new'],
           description:
-            "auto=有就续没有就建（默认）；resume=只续已有，不存在会报错；new=只新建，重名或近似名会报错（除非 allowNewSession）。",
+            "auto=有就续没有就建（默认）；resume=只续已有，不存在会报错；new=只新建，重名或近似名会报错（新建需票据：issue_new_session_ticket）。",
         },
         allowNewSession: {
           type: 'boolean',
           description:
-            'true = 允许在已有「只差一个后缀」的会话旁新开一个；不传时遇到相似会话名会直接报错。',
+            '已废弃：新建会话要用 issue_new_session_ticket 发票据；传了也不再放行。',
         },
       },
       required: ['prompt'],
@@ -3735,12 +3917,12 @@ export function apply(ctx, config = {}) {
           type: 'string',
           enum: ['auto', 'resume', 'new'],
           description:
-            "auto=有就续没有就建（默认）；resume=只续已有，不存在会报错；new=只新建，重名或近似名会报错（除非 allowNewSession）。",
+            "auto=有就续没有就建（默认）；resume=只续已有，不存在会报错；new=只新建，重名或近似名会报错（新建需票据：issue_new_session_ticket）。",
         },
         allowNewSession: {
           type: 'boolean',
           description:
-            'true = 允许在已有「只差一个后缀」的会话旁新开一个；不传时遇到相似会话名会直接报错。',
+            '已废弃：新建会话要用 issue_new_session_ticket 发票据；传了也不再放行。',
         },
       },
       required: ['prompt'],
@@ -3764,7 +3946,8 @@ export function apply(ctx, config = {}) {
 
       const index = readJson(CLAUDE_INDEX, {}) || {}
       const name = args?.session ? String(args.session) : ''
-      const resume = resolveSession(index, name, args?.cwd || '', args, 'claude')
+      const runCwd = resolveRunCwd(args, exec)
+      const resume = resolveSession(index, name, runCwd, args, 'claude', sessionIdFromExec(exec))
       const known = resume.id
       const sessionReset = resume.reset
 
@@ -3787,7 +3970,7 @@ export function apply(ctx, config = {}) {
         write: args?.permissionMode === 'acceptEdits' || args?.permissionMode === 'auto',
         session: name,
         conversationId: known || '',
-        cwd: resolveRunCwd(args, exec),
+        cwd: runCwd,
         model: args?.model || '',
       })
 
@@ -3799,8 +3982,8 @@ export function apply(ctx, config = {}) {
 
         const sid = parsed?.session_id || known || ''
         if (name && sid) {
-          index[name] = { id: sid, cwd: args?.cwd || '', updated: new Date().toISOString() }
-        recordSessionName('hand', name, sid, args?.cwd || '')
+          index[name] = { id: sid, cwd: runCwd, updated: new Date().toISOString() }
+          recordSessionName('claude', name, sid, runCwd)
           writeJson(CLAUDE_INDEX, index)
         }
 
@@ -3936,12 +4119,12 @@ export function apply(ctx, config = {}) {
           type: 'string',
           enum: ['auto', 'resume', 'new'],
           description:
-            "auto=有就续没有就建（默认）；resume=只续已有，不存在会报错；new=只新建，重名或近似名会报错（除非 allowNewSession）。",
+            "auto=有就续没有就建（默认）；resume=只续已有，不存在会报错；new=只新建，重名或近似名会报错（新建需票据：issue_new_session_ticket）。",
         },
         allowNewSession: {
           type: 'boolean',
           description:
-            'true = 允许在已有「只差一个后缀」的会话旁新开一个；不传时遇到相似会话名会直接报错。',
+            '已废弃：新建会话要用 issue_new_session_ticket 发票据；传了也不再放行。',
         },
       },
       required: ['prompt'],
@@ -3965,10 +4148,10 @@ export function apply(ctx, config = {}) {
 
       const index = readJson(OPENCODE_INDEX, {}) || {}
       const name = args?.session ? String(args.session) : ''
-      const resume = resolveSession(index, name, args?.cwd || '', args, 'opencode')
+      const runCwd = resolveRunCwd(args, exec)
+      const resume = resolveSession(index, name, runCwd, args, 'opencode', sessionIdFromExec(exec))
       const known = resume.id
       const sessionReset = resume.reset
-      const runCwd = resolveRunCwd(args, exec)
       const model = args?.model ? String(args.model) : ''
       const timeoutSec = effTimeout(args)
 
@@ -4047,8 +4230,8 @@ export function apply(ctx, config = {}) {
       }
 
       if (name && sid) {
-        index[name] = { id: sid, cwd: args?.cwd || '', updated: new Date().toISOString() }
-        recordSessionName('hand', name, sid, args?.cwd || '')
+        index[name] = { id: sid, cwd: runCwd, updated: new Date().toISOString() }
+        recordSessionName('opencode', name, sid, runCwd)
         writeJson(OPENCODE_INDEX, index)
       }
 
@@ -4288,16 +4471,16 @@ export function apply(ctx, config = {}) {
     if (!handDef) return null
 
     const name = String(job.session || '')
+    const runCwd = job.cwd ? path.resolve(String(job.cwd)) : process.cwd()
     let known = String(job.conversationId || '')
     if (!known && name) {
       const index = readJson(handDef.index(), {}) || {}
-      guardLookalike(index, name, args, 'agy')
-      const resumeAgy = resolveSession(index, name, args?.cwd || '', args, 'agy')
-      if (resumeAgy.id) known = resumeAgy.id
+      // 走守卫：有 session 名就按 auto 语义续已有会话（同目录不匹配 → reset，开新的）
+      const resume = resolveSession(index, name, runCwd, { sessionMode: 'auto' }, handKey, '')
+      if (resume.id) known = resume.id
     }
     const write = !!job.write
     const model = String(job.model || '')
-    const runCwd = job.cwd ? path.resolve(String(job.cwd)) : process.cwd()
     const argv = withModel(handKey, handDef.build(prompt, { write, model }, known || null), model)
 
     const run = startDispatch({
@@ -4360,6 +4543,62 @@ export function apply(ctx, config = {}) {
     return run
   }
 
+  // ── 新建会话票据工具：issue_new_session_ticket ────────────────────────────
+  // 按 claude 评审的设计：同目录已有会话时，新建/换名建会话需要 ticket（resolveSession 在建会话前校验）。
+  ctx.tools.register({
+    name: 'issue_new_session_ticket',
+    description:
+      'Issue a one-time ticket that allows opening a NEW session in a directory where other sessions already exist ' +
+      '(the same-directory guard: sessionMode "new" / "auto" creating a new session is rejected otherwise). ' +
+      'The ticket binds the hand + directory + exact session name + the requesting session; valid 10 minutes, ' +
+      'single-use. Same directory: at most one ticket per 10 minutes. Returns the ticket plus the directory\'s ' +
+      'existing sessions (name / last active / running) — check that list before opening a new session.',
+    parameters: {
+      type: 'object',
+      properties: {
+        hand: { type: 'string', description: 'Hand name: opencode / codex / claude / agy. ("to" is accepted as an alias.)' },
+        to: { type: 'string', description: 'Alias of hand (hands_run style).' },
+        cwd: { type: 'string', description: 'Directory where the other sessions live. Omit to use this session directory.' },
+        name: { type: 'string', description: 'The exact session name the new session should take.' },
+        reason: { type: 'string', description: 'Why you need a new session (goes to the ledger).' },
+      },
+      required: ['name'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ticket: { type: 'string' },
+          hand: { type: 'string' },
+          cwd: { type: 'string' },
+          name: { type: 'string' },
+          reason: { type: 'string' },
+          sessions: {
+            type: 'array',
+            items: { type: 'object', properties: { name: { type: 'string' }, at: { type: 'string' }, running: { type: 'boolean' } } },
+          },
+          hint: { type: 'string' },
+        },
+      },
+      render: (_args, value) => asText(value),
+    },
+    async execute(args, exec) {
+      const hand = String(args?.hand || args?.to || '').trim()
+      if (!HANDS[hand]) throw new Error(`to 只能是 ${Object.keys(HANDS).join(' / ')}`)
+      const handDef = HANDS[hand]
+      return issueSessionTicket(
+        {
+          ...args,
+          hand,
+          index: readJson(handDef.index(), {}) || {},
+          requesterSessionId: sessionIdFromExec(exec),
+        },
+        {},
+      )
+    },
+  })
+
   ctx.tools.register({
     name: 'hands_run',
     description:
@@ -4392,12 +4631,12 @@ export function apply(ctx, config = {}) {
           type: 'string',
           enum: ['auto', 'resume', 'new'],
           description:
-            "auto=有就续没有就建（默认）；resume=只续已有，不存在会报错；new=只新建，重名或近似名会报错（除非 allowNewSession）。",
+            "auto=有就续没有就建（默认）；resume=只续已有，不存在会报错；new=只新建，重名或近似名会报错（新建需票据：issue_new_session_ticket）。",
         },
         allowNewSession: {
           type: 'boolean',
           description:
-            'true = 允许在已有「只差一个后缀」的会话旁新开一个；不传时遇到相似会话名会直接报错。',
+            '已废弃：新建会话要用 issue_new_session_ticket 发票据；传了也不再放行。',
         },
       },
       required: ['to', 'prompt'],
@@ -4429,7 +4668,8 @@ export function apply(ctx, config = {}) {
       const idxFile = hand.index()
       const index = readJson(idxFile, {}) || {}
       const name = args?.session ? String(args.session) : ''
-      const resume = resolveSession(index, name, args?.cwd || '', args, 'hands_run')
+      const runCwd = resolveRunCwd(args, ctx)
+      const resume = resolveSession(index, name, runCwd, args, 'hands_run', sessionIdFromExec(ctx))
       const known = resume.id
       const sessionReset = resume.reset
 
@@ -4437,7 +4677,6 @@ export function apply(ctx, config = {}) {
       // 第三方供应商：只对 agy 生效；缺 key 等问题在这里抛清晰错误，跑活前停下
       const providerCtx = to === 'agy' ? agyProviderContext(opts.provider) : null
       if (providerCtx) opts.providerCtx = providerCtx
-      const runCwd = resolveRunCwd(args, ctx)
       const timeoutSec = effTimeout(args)
       const run = startDispatch({
         hand: to,
@@ -4509,8 +4748,8 @@ export function apply(ctx, config = {}) {
       }
 
       if (name && sid && sid !== known) {
-        index[name] = { id: sid, cwd: args?.cwd || '', updated: new Date().toISOString() }
-        recordSessionName('hand', name, sid, args?.cwd || '')
+        index[name] = { id: sid, cwd: runCwd, updated: new Date().toISOString() }
+        recordSessionName(to, name, sid, runCwd)
         writeJson(idxFile, index)
       }
 
