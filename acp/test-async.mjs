@@ -2,7 +2,8 @@
 // 只测「会话 id 怎么取 / 回传正文长什么样 / 时长怎么算」，
 // 真跑一个手下要走模型，不放在这里。
 import assert from 'node:assert/strict'
-import { asyncReportText, createAsyncQueue, findAgentFor, formatDuration, pickBin, planAsyncRecovery, readAsyncState, sessionIdFromExec, writeAsyncState } from '../index.js'
+import { spawn } from 'node:child_process'
+import { asyncReportText, createAsyncQueue, findAgentFor, formatDuration, isProcessAlive, pickBin, planAsyncRecovery, readAsyncState, sessionIdFromExec, writeAsyncState } from '../index.js'
 
 // ── 0) 二进制路径：按顺序找第一个真实存在的 ──────────────────────────────────
 {
@@ -144,6 +145,7 @@ import { asyncReportText, createAsyncQueue, findAgentFor, formatDuration, pickBi
   const plan = planAsyncRecovery(back)
   assert.deepEqual(plan.deliver, ['b-done'], `该补投的只有 b-done，实际 ${JSON.stringify(plan.deliver)}`)
   assert.deepEqual(plan.orphan, ['c-running'], `没跑完的是 c-running，实际 ${JSON.stringify(plan.orphan)}`)
+  assert.deepEqual(plan.running, [], `没记 pid 的不算 running（按不在处理），实际 ${JSON.stringify(plan.running)}`)
   assert.ok(!plan.deliver.includes('a-sent'), '投过的不再投')
   assert.ok(!plan.deliver.includes('d-done-no-report'), '没正文的没法补投，不硬投')
 
@@ -162,6 +164,51 @@ import { asyncReportText, createAsyncQueue, findAgentFor, formatDuration, pickBi
 
   fs.rmSync(dir, { recursive: true, force: true })
   console.log('5) 落盘状态 + 重启补投计划 ok')
+}
+
+// ── 7) 重启对账：还在跑的→running，死了的→orphan，跑完没投的→deliver ───────
+{
+  const alivePid = 4321
+  const state = {
+    v: 1,
+    jobs: {
+      'j-alive': { id: 'j-alive', hand: 'opencode', tool: 'opencode_run', delivery: 'pending', pid: alivePid, status: 'RUNNING' },
+      'j-dead': { id: 'j-dead', hand: 'opencode', tool: 'opencode_run', delivery: 'pending', pid: 999999 },
+      'j-nopid': { id: 'j-nopid', hand: 'opencode', tool: 'opencode_run', delivery: 'pending' },
+      'j-done': { id: 'j-done', hand: 'opencode', tool: 'opencode_run', delivery: 'pending', endedAt: '2026-11-23T10:00:00Z', report: '报告正文' },
+      'j-sent': { id: 'j-sent', hand: 'claude', tool: 'claude_run', delivery: 'sent', endedAt: '2026-11-23T10:00:00Z', report: '报告正文' },
+    },
+  }
+  const plan = planAsyncRecovery(state, { isAlive: (pid) => Number(pid) === alivePid })
+  assert.deepEqual(plan.running, ['j-alive'], `还在跑的应在 running，实际 ${JSON.stringify(plan.running)}`)
+  assert.deepEqual(plan.orphan.sort(), ['j-dead', 'j-nopid'], `死了的在 orphan，实际 ${JSON.stringify(plan.orphan)}`)
+  assert.deepEqual(plan.deliver, ['j-done'], `跑完没投的在 deliver，实际 ${JSON.stringify(plan.deliver)}`)
+
+  // 默认用真实 isProcessAlive：自己的 pid 必在、0/-5/非法/空按不在
+  assert.equal(isProcessAlive(process.pid), true, '自己的 pid 必在')
+  assert.equal(isProcessAlive(0), false)
+  assert.equal(isProcessAlive(-5), false)
+  assert.equal(isProcessAlive('abc'), false)
+  assert.equal(isProcessAlive(undefined), false)
+  assert.equal(isProcessAlive(null), false)
+  assert.deepEqual(planAsyncRecovery({ jobs: { live: { id: 'live', delivery: 'pending', pid: process.pid } } }).running, ['live'], '默认探测下自己的 pid 应判在跑')
+  assert.deepEqual(planAsyncRecovery({ jobs: { dead: { id: 'dead', delivery: 'pending' } } }).orphan, ['dead'], '没记 pid 的按不在处理（遗留数据维持旧行为）')
+  console.log('7) 重启对账 planAsyncRecovery ok')
+}
+
+// ── 8) isProcessAlive 真实进程：起了就在，杀了就不在 ───────────────────────
+{
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 3000)'], { stdio: 'ignore' })
+  await new Promise((resolve) => { child.once('spawn', resolve); child.once('error', resolve) })
+  assert.ok(child.pid, '子进程应已起')
+  assert.equal(isProcessAlive(child.pid), true, '刚起的 node 应在')
+  child.kill()
+  await new Promise((resolve) => { child.once('exit', resolve); child.once('error', resolve) })
+  for (let i = 0; i < 40 && isProcessAlive(child.pid); i += 1) {
+    await new Promise((r) => setTimeout(r, 50))
+  }
+  assert.equal(isProcessAlive(child.pid), false, '杀了之后应判不在')
+  console.log('8) isProcessAlive 真实进程 ok')
 }
 
 // ── 6) 并发闸门：上限、排队顺序、失败不卡队列 ───────────────────────────────

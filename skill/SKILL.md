@@ -2,8 +2,8 @@
 name: dsh-hands
 description: 把活派给别的 agent（claude / codex / agy / opencode）时读这个。核心设计：专业的事交给专业的人——调度方只拆活、派活、验收，不亲自下场写代码/查日志。包含异步派活的正确姿势（派完立刻返回、跑完自动回传）、四个手怎么选和各自的价格、任务书怎么写、以及验收子代理产出的四道关卡。只要你要调用 claude_run / codex_run / agy_run / opencode_run / hands_run，或者要「派活出去等结果」，就先读它。
 metadata:
-  version: "1.2.0"
-  date: "2026-11-22"
+  version: "1.4.0"
+  date: "2026-11-23"
 ---
 
 # dsh-hands
@@ -48,6 +48,17 @@ metadata:
 
 **别跑 `acp/four-agents.mjs` 这类探活脚本**：它每跑一次就真起一轮 sonnet 会话（一句「收到」≈ $0.05），面板里会堆一串「未命名」。健康检查看 `/dsh-hands/health` 就够，那个只跑 `--version`。
 
+## agy 用第三方模型（可选，2026-11-23）
+
+agy 默认走官方（免费的 gemini-3.8-flash）。要切第三方（如 znbcode）：
+
+- **传 `provider`**：`agy_run` / `hands_run(to=agy)` 传 `provider: "znbcode"`。不传或 `"official"` = 官方，官方路径不变：不注入 env、不写 settings、不传 `--settings`。
+- **配置文件**：`~/.dsh/hands-providers.json`（缺文件自动补示例），结构同：
+  `{"official":{},"znbcode":{"baseUrl":"https://znbcode.com","apiKeyEnv":"GEMINI_API_KEY","model":"Gemini 4 Neon (XHigh)"}}` —— `apiKeyEnv` 是读 key 时优先取的环境变量名。
+- **密钥不写明文**：优先环境变量 `apiKeyEnv`；找不到再从 cc-switch 的 sqlite 里读（`~/.cc-switch/cc-switch.db`，`providers` 表 `app_type='agy'`，`settings_config.env` 里的 `GEMINI_API_KEY`；现在电脑上那行 name=znbcode）。
+- **怎么生效**：第三方调用时插件把 `GOOGLE_GEMINI_BASE_URL` / `GEMINI_API_KEY` 注入 agy 子进程，并在 `~/.dsh/agy-profiles/znbcode/settings.json` 写 `{"modelProvider":"gemini","model":"Gemini 4 Neon (XHigh)"}`，通过 agy 的 `--settings` 只对这次会话生效——**不污染用户默认 `~/.gemini`**。
+- **缺 key 报错**：`agy 供应商「znbcode」缺 API key：请设置环境变量 GEMINI_API_KEY…` —— 传了 provider 但没找到 key 时别默默跑官方。
+
 ## 会话：续接优先，新开必须显式（2026-11-22 用户定死）
 
 **默认动作是「续接」，不是「新开」。** 派活时先想：这件事是不是接着之前那条线干的？
@@ -89,6 +100,8 @@ metadata:
 - **验收方式**：它要跑什么命令、交什么证据。
 - **不要做什么**：明确写「只出设计不写代码」这类边界，否则它会自己加戏。
 
+- **多行任务书**（2026-11-23）：任务书本来就多行——第一行动作，`结果标准：`，然后编号步骤。多行 prompt 已验证能原样送达 opencode（此前 Windows 上 opencode 的 cmd 包装器把多行 prompt 截成第一行，丢了列表）。结构建议：**第一行是完整目标句**，`结果标准：` 说怎么算通过，步骤列表每一步都要能独立落地。
+
 ## 验收：只要证据，不要结论
 
 它说「做完了」是零信息。我要的是：
@@ -106,7 +119,13 @@ metadata:
 - `GET /dsh-hands/async?n=50` 一次看到在跑的（`live`）和落盘的（`persisted`），
   每条带 `delivery` / `deliveryError` / `deliveredAt` —— 排查「投没投出去、是不是孤儿」看这里，不用翻日志。
 - 回传正文是契约格式：状态、用时、退出码、花费、派活原文、结果、完整日志路径。
-- DSH 重启后：没跑完的标 `ORPHAN`，跑完没投的补投一次，投过的绝不重投。
+- DSH 重启后（2026-11-23）：
+  - `~/.dsh/hands-async.json` 里每条 job 的 `status` / `delivery` / `pid` / `recoverNote` 说清三种状态：
+    - `ORPHAN` = 进程已经不在了（没了结果在原会话记录里，不会自动回传）；
+    - `RUNNING` + `recoverNote` 带 `pid` = 还在跑（`tasklist /FI "PID eq N"` 或 `ps -p N` 可核对），跑完由插件补传；
+    - `delivery: retrying` + `nextRetryAt` = 投递退避中。
+  - 进程到底完没完，别只看插件状态——`tasklist /FI "PID eq N"` / `ps -p N` 查真实进程。
+  - 没了结果的 ORPHAN 不要硬投：去 opencode 会话里找那次回复，或重派一次。
 
 ## 踩过的坑
 

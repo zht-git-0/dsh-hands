@@ -2,6 +2,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { createRequire } from 'node:module'
 import { StringDecoder } from 'node:string_decoder'
 import {
   collectAgy,
@@ -461,8 +462,41 @@ async function healthPayload(bins) {
   return { checkedAt: new Date().toISOString(), agents }
 }
 
-// 跑一次 agy。不经过 shell，参数数组直接交给 spawn，中文和空格都不会被拆坏。
-function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk, onSpawn } = {}) {
+// Windows 上 .cmd/.bat 包装器经 cmd.exe 解析：带换行的参数会被截断（实测 opencode 的
+// 包装器收到的只有第一行，见 acp/test-prompt-transport.mjs 第 3 节）。能抠出包装器里
+// 真正的 .exe 就直接 spawn 它——参数不过 cmd 解析，多行 prompt 原样进 argv；抠不出就
+// 返回 ''，调用方按旧路径走。
+export function winCmdExeOf(bin) {
+  const target = String(bin || '').trim()
+  if (!target || process.platform !== 'win32') return ''
+  if (!/\.(cmd|bat)$/i.test(target)) return ''
+  try {
+    if (!fs.existsSync(target)) return ''
+    const dir = path.dirname(path.resolve(target))
+    const body = fs.readFileSync(target, 'utf8')
+    // 包装器形如：  "%dp0%\node_modules\@opencode\cli\bin\opencode.exe" %*
+    const candidates = [
+      ...body.matchAll(/"([^"]+)"/g),
+      ...body.matchAll(/(?:^|\s)([^\s"']+\.exe)(?=\s|$)/gi),
+    ]
+    for (const m of candidates) {
+      const raw = String((m && m[1]) || '').trim()
+      const expanded = raw
+        .replace(/%~dp0%/gi, `${dir}\\`)
+        .replace(/%dp0%/gi, `${dir}\\`)
+      const exe = path.resolve(expanded)
+      if (/\.exe$/i.test(exe) && fs.existsSync(exe)) return exe
+    }
+    // 兜底：同目录同名 .exe（opencode.cmd → opencode.exe）
+    const sibling = path.join(dir, path.basename(target).replace(/\.(cmd|bat)$/i, '.exe'))
+    return fs.existsSync(sibling) ? sibling : ''
+  } catch {
+    return ''
+  }
+}
+
+// 跑一次进程。不经过 shell，参数数组直接交给 spawn，中文和空格都不会被拆坏。
+export function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk, onSpawn, env } = {}) {
   return new Promise((resolve) => {
     const started = Date.now()
     let child
@@ -474,16 +508,18 @@ function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk, onSpawn 
     try {
       // stdin 必须显式给个已关闭的管道：codex 在非 TTY 下会等 stdin EOF，
       // 继承父进程的 stdin 会一直挂着（踩过，表现为「Reading additional input from stdin...」然后超时）
-      // Windows 上 .cmd 不能直接 spawn（会报 ENOENT），必须走 shell；
-      // 走 shell 时参数要自己加引号，否则带空格的 prompt 会被拆开。
-      const needsShell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(bin)
+      // Windows 上 .cmd/.bat 包装器能不解就走 shell：cmd 把带换行的参数截断（实测只到第一行），
+      // 能解出里面真正的 .exe 就直接 spawn 它——参数不过 cmd 解析，多行 prompt 原样进 argv。
+      const exe = winCmdExeOf(bin)
+      const needsShell = process.platform === 'win32' && !exe && /\.(cmd|bat)$/i.test(bin)
+      const spawnBin = exe || bin
       const spawnArgs = needsShell
         ? args.map((a) => (/[\s"&|<>^]/.test(a) ? `"${String(a).replace(/"/g, '""')}"` : a))
         : args
-      child = spawn(bin, spawnArgs, {
+      child = spawn(spawnBin, spawnArgs, {
         cwd: cwd || undefined,
         windowsHide: true,
-        env: process.env,
+        env: env || process.env,
         stdio: ['pipe', 'pipe', 'pipe'],
         shell: needsShell,
       })
@@ -772,22 +808,40 @@ export function writeAsyncState(state, file = ASYNC_STATE_FILE) {
   }
 }
 
-// 重启后该做什么：没跑完的标 ORPHAN（进程已经没了），跑完但没投的补投一次。
+// 进程在不在：pid 合法且存活。用 signal 0 探测（Windows/POSIX 都支持）：
+// 存在但无权叫活的（EPERM）算在——那进程还活着。
+export function isProcessAlive(pid) {
+  const target = Number(pid)
+  if (!Number.isInteger(target) || target <= 0) return false
+  try {
+    process.kill(target, 0)
+    return true
+  } catch (error) {
+    return String(error?.code || '') === 'EPERM'
+  }
+}
+
+// 重启后该做什么：没跑完的里真死了才标 ORPHAN（进程已经没了），跑完但没投的补投一次。
+// 「没跑完」只有在进程确认不在时才算（见 isProcessAlive）：进程还活着的留 running——
+// 诚实标签，别把「可能还在跑」宣成「已死无结果」。
 // 纯函数，只决定「要不要投 / 标什么」，真投递在外面做 —— 这样能单测。
-export function planAsyncRecovery(state) {
+export function planAsyncRecovery(state, { isAlive } = {}) {
+  const alive = typeof isAlive === 'function' ? isAlive : isProcessAlive
   const jobs = Object.values(state?.jobs || {})
   const deliver = []
   const orphan = []
+  const running = []
   for (const record of jobs) {
     if (!record || !record.id) continue
     if (record.delivery === 'sent') continue
     if (!record.endedAt) {
-      orphan.push(record.id)
+      if (alive(record.pid)) running.push(record.id)
+      else orphan.push(record.id)
       continue
     }
     if (record.report) deliver.push(record.id)
   }
-  return { deliver, orphan }
+  return { deliver, orphan, running }
 }
 
 // ── 回传重试：投不进去就退避重试，别把一次「会话正忙」当成永久失败 ──────────
@@ -880,6 +934,183 @@ export function resolveOpenFolder(knownCwds, wanted) {
     if (item) known.add(norm(path.resolve(item)))
   }
   return known.has(norm(target)) ? target : ''
+}
+
+// ── agy 的第三方供应商（provider） ─────────────────────────────────────────────
+//
+// 用法：
+//   - 不传 provider（或 'official'）= 官方：不注入任何 env、不写 settings.json、不传
+//     --settings，子进程环境与用户默认一致。
+//   - 传 provider=<name> = 读 ~/.dsh/hands-providers.json 里的条目：注入
+//     GOOGLE_GEMINI_BASE_URL / GEMINI_API_KEY，并在 ~/.dsh/agy-profiles/<name>/ 写
+//     settings.json（{model, modelProvider:'gemini'}），再传 --settings 指给 agy ——
+//     agy 在这次会话里认这个第三方模型名，不污染用户默认 ~/.gemini。
+//   - 密钥不写明文：优先环境变量 apiKeyEnv；再从 cc-switch 的 sqlite 读
+//     （providers 表 app_type='agy'，settings_config.env 里的 GOOGLE_GEMINI_BASE_URL /
+//     GEMINI_API_KEY / GEMINI_MODEL）。
+
+export const AGY_PROVIDERS_FILE = path.join(os.homedir(), '.dsh', 'hands-providers.json')
+export const AGY_PROFILES_ROOT = path.join(os.homedir(), '.dsh', 'agy-profiles')
+export const CC_SWITCH_DB = path.join(os.homedir(), '.cc-switch', 'cc-switch.db')
+
+// node:sqlite 在 Node 22.5+ 才有；老版本或被禁时给 null，cc-switch 兜底就是空。
+let sqliteDbSync = undefined
+function loadDatabaseSync() {
+  if (sqliteDbSync !== undefined) return sqliteDbSync
+  try {
+    sqliteDbSync = createRequire(import.meta.url)('node:sqlite').DatabaseSync
+  } catch {
+    sqliteDbSync = null
+  }
+  return sqliteDbSync
+}
+
+function agyClean(value) {
+  return String(value ?? '').trim()
+}
+
+function normalizeAgyProvider(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null
+  return {
+    baseUrl: agyClean(entry.baseUrl),
+    model: agyClean(entry.model),
+    apiKeyEnv: agyClean(entry.apiKeyEnv) || 'GEMINI_API_KEY',
+  }
+}
+
+// 供应商配置读取：文件缺 / 文件坏 / 没有条目 → 只留 official，不影响插件启动。
+export function readAgyProviders(file = AGY_PROVIDERS_FILE) {
+  const providers = { official: normalizeAgyProvider({}) }
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      for (const [name, entry] of Object.entries(raw)) {
+        const norm = normalizeAgyProvider(entry)
+        if (norm && agyClean(name)) providers[agyClean(name)] = norm
+      }
+    }
+  } catch {
+    /* 没有文件 / 坏文件：只留 official */
+  }
+  return providers
+}
+
+// 供应商配置文件不存在时写一份示例（结构同用户给的示例）；已存在不覆盖。
+export function ensureAgyProvidersFile(file = AGY_PROVIDERS_FILE) {
+  if (fs.existsSync(file)) return file
+  const example = {
+    official: {},
+    znbcode: { baseUrl: 'https://znbcode.com', apiKeyEnv: 'GEMINI_API_KEY', model: 'Gemini 4 Neon (XHigh)' },
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, JSON.stringify(example, null, 2) + '\n', 'utf8')
+  return file
+}
+
+// cc-switch（Windows 上换模型的常用工具）里 app_type='agy' 的那条 settings_config：
+// 返回 { GOOGLE_GEMINI_BASE_URL, GEMINI_API_KEY, GEMINI_MODEL }；读不到就是空串。
+export function readCcSwitchAgyEnv(file = CC_SWITCH_DB, preferredName = '') {
+  const out = { GOOGLE_GEMINI_BASE_URL: '', GEMINI_API_KEY: '', GEMINI_MODEL: '' }
+  const DatabaseSync = loadDatabaseSync()
+  if (!DatabaseSync) return out
+  try {
+    const db = new DatabaseSync(file, { readOnly: true })
+    let rows = []
+    try {
+      rows = db.prepare("SELECT * FROM providers WHERE app_type = 'agy'").all()
+    } catch {
+      rows = []
+    } finally {
+      try {
+        db.close()
+      } catch {
+        /* ignore */
+      }
+    }
+    const envOf = (row) => {
+      let sc = row && row.settings_config
+      if (typeof sc === 'string') {
+        try {
+          sc = JSON.parse(sc)
+        } catch {
+          sc = null
+        }
+      }
+      if (!sc || typeof sc !== 'object') return {}
+      const env = sc.env
+      return env && typeof env === 'object' ? env : sc
+    }
+    const pick =
+      rows.find((row) => agyClean(row && row.name) === agyClean(preferredName)) ||
+      rows.find((row) => agyClean(envOf(row).GEMINI_API_KEY)) ||
+      rows[0]
+    if (pick) {
+      const env = envOf(pick)
+      out.GOOGLE_GEMINI_BASE_URL = agyClean(env.GOOGLE_GEMINI_BASE_URL)
+      out.GEMINI_API_KEY = agyClean(env.GEMINI_API_KEY)
+      out.GEMINI_MODEL = agyClean(env.GEMINI_MODEL)
+    }
+  } catch {
+    /* db 不存在 / 无法读：返回空 */
+  }
+  return out
+}
+
+// 第三方供应商的凭证：{ name, baseUrl, apiKey, model }
+// 缺 key → 抛清晰错误（别静默跑官方）；不认识的 provider → 抛错。
+export function resolveAgyProviderCredentials(provider, providers = readAgyProviders(), ccSwitchEnv = {}) {
+  const name = agyClean(provider) || 'official'
+  const entry = (providers && providers[name]) || null
+  if (!entry) throw new Error(`未知 agy 供应商「${name}」：请先在 ${AGY_PROVIDERS_FILE} 里添加`)
+  if (name === 'official') return { name, baseUrl: '', apiKey: '', model: '' }
+  const apiKeyEnv = entry.apiKeyEnv || 'GEMINI_API_KEY'
+  const apiKey =
+    agyClean(process.env[apiKeyEnv]) ||
+    agyClean(ccSwitchEnv[apiKeyEnv]) ||
+    agyClean(ccSwitchEnv.GEMINI_API_KEY)
+  if (!apiKey) {
+    throw new Error(
+      `agy 供应商「${name}」缺 API key：请设置环境变量 ${apiKeyEnv}，或在 cc-switch 的 app_type='agy' 提供商里填 GEMINI_API_KEY`,
+    )
+  }
+  return {
+    name,
+    baseUrl: entry.baseUrl || ccSwitchEnv.GOOGLE_GEMINI_BASE_URL,
+    apiKey,
+    model: entry.model || ccSwitchEnv.GEMINI_MODEL,
+  }
+}
+
+export function agyProviderSettingsFile(provider, profilesRoot = AGY_PROFILES_ROOT) {
+  const name = agyClean(provider).replace(/[^\w.-]+/g, '_') || 'provider'
+  return path.join(profilesRoot, name, 'settings.json')
+}
+
+// 独立 settings.json：{model, modelProvider:'gemini'}（没有 model 时不写 model 键），返回路径。
+export function writeAgyProviderSettings(provider, model, profilesRoot = AGY_PROFILES_ROOT) {
+  const file = agyProviderSettingsFile(provider, profilesRoot)
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const settings = { modelProvider: 'gemini' }
+  if (agyClean(model)) settings.model = agyClean(model)
+  fs.writeFileSync(file, JSON.stringify(settings, null, 2) + '\n', 'utf8')
+  return file
+}
+
+// 派活前的供应商准备：
+//   { provider:'official', env:null, settingsFile:null } → 官方，什么都不动；
+//   { provider, env, settingsFile, credentials }         → 注入 env + 写 settings.json。
+export function agyProviderContext(provider, opts = {}) {
+  ensureAgyProvidersFile(opts.providersFile)
+  const providers = readAgyProviders(opts.providersFile)
+  const name = agyClean(provider) || 'official'
+  if (name === 'official') return { provider: 'official', env: null, settingsFile: null }
+  const ccSwitch = readCcSwitchAgyEnv(opts.ccSwitchFile, providers[name] ? name : '')
+  const cred = resolveAgyProviderCredentials(name, providers, ccSwitch)
+  const settingsFile = writeAgyProviderSettings(name, cred.model, opts.profilesRoot)
+  const env = {}
+  if (cred.baseUrl) env.GOOGLE_GEMINI_BASE_URL = cred.baseUrl
+  env.GEMINI_API_KEY = cred.apiKey
+  return { provider: name, env, settingsFile, credentials: cred }
 }
 
 export function apply(ctx, config = {}) {
@@ -1497,6 +1728,17 @@ export function apply(ctx, config = {}) {
   function trackProc(id, child, run) {
     if (!id) return
     RUNNING_PROCS.set(String(id), { child, startedAt: Date.now(), run })
+    // 把 pid 落盘：重启对账用它判「进程还在不在」，比凭无 endedAt 就宣告 ORPHAN 诚实。
+    // 只有异步 job 有对应记录；同步派活不进 asyncState。
+    try {
+      const record = asyncState.jobs[String(id)]
+      if (record && child?.pid) {
+        record.pid = child.pid
+        saveAsyncState()
+      }
+    } catch {
+      /* 落盘失败只影响重启后的兜底判断，不影响跑活 */
+    }
   }
 
   function startDispatch(fields = {}) {
@@ -1797,7 +2039,8 @@ export function apply(ctx, config = {}) {
     asyncDeliveryTimers.clear()
   }, 'dsh-hands: async delivery timers')
 
-  // 启动时对账：上次没跑完的标 ORPHAN，跑完但没投出去的补投一次
+  // 启动时对账：进程真死了的标 ORPHAN（还在跑的诚实留 RUNNING，跑完后补投），
+  // 跑完但没投出去的补投一次。
   async function recoverAsyncJobs() {
     const plan = planAsyncRecovery(asyncState)
     for (const id of plan.orphan) {
@@ -1807,6 +2050,16 @@ export function apply(ctx, config = {}) {
       record.endedAt = record.endedAt || new Date().toISOString()
       record.delivery = record.delivery === 'sent' ? 'sent' : 'skipped'
       record.deliveryError = 'DSH 重启时这个任务还在跑，进程已经没了'
+    }
+    for (const id of plan.running) {
+      const record = asyncState.jobs[id]
+      if (!record) continue
+      // 诚实标签：进程仍在跑（pid N）——别因为没 endedAt 就说它死了、跳过结果。
+      record.status = 'RUNNING'
+      record.delivery = record.delivery === 'sent' ? 'sent' : 'pending'
+      record.recoverNote = record.pid
+        ? `DSH 重启时进程仍在跑（pid ${record.pid}）`
+        : 'DSH 重启时进程仍在跑'
     }
     let delivered = 0
     for (const id of plan.deliver) {
@@ -1830,7 +2083,7 @@ export function apply(ctx, config = {}) {
       }
     }
     saveAsyncState()
-    return { delivered, orphans: plan.orphan.length }
+    return { delivered, orphans: plan.orphan.length, running: plan.running.length }
   }
 
   // 启动后等 agents 服务就绪，再补投上一次没投出去的回传。
@@ -2705,6 +2958,12 @@ export function apply(ctx, config = {}) {
           description: 'Continue the most recent agy conversation instead of starting a new one.',
         },
         model: { type: 'string', description: 'Model id for this run, e.g. "claude-sonnet-4.6". Omit for the default.' },
+        provider: {
+          type: 'string',
+          description:
+            'Third-party agy provider name from ~/.dsh/hands-providers.json (e.g. "znbcode"). ' +
+            'Omit or pass "official" for the default model.',
+        },
         effort: {
           type: 'string',
           enum: ['low', 'medium', 'high', 'xhigh', 'max'],
@@ -2741,6 +3000,8 @@ export function apply(ctx, config = {}) {
     async execute(args, exec) {
       const prompt = String(args?.prompt ?? '')
       if (!prompt.trim()) throw new Error('prompt is required')
+      // 第三方供应商：缺 key 等问题在跑活前抛清晰错误，别等跑完才报
+      const providerCtx = agyProviderContext(args?.provider)
 
       // runId：异步派活时由外层预分配，保证 jobId 和日志 id 是同一个
       const perform = async (runId = '') => {
@@ -2761,6 +3022,8 @@ export function apply(ctx, config = {}) {
         if (dir) argv.push('--add-dir', String(dir))
       }
       if (skipPermissions) argv.push('--dangerously-skip-permissions')
+      // 第三方供应商：传 --settings 指到独立 settings.json（官方路径不传，不变）
+      if (providerCtx.settingsFile) argv.push('--settings', providerCtx.settingsFile)
 
       // 异步任务默认不限时：跑长活被 15 分钟砍掉过一次（fatal-lock），
       // 要限时就在调用时显式传 timeoutSec。
@@ -2780,6 +3043,7 @@ export function apply(ctx, config = {}) {
       const result = await runProcess(bin, argv, {
         cwd: args?.cwd,
         timeoutSec,
+        env: providerCtx.env,
         onChunk: run.push,
         onSpawn: (child) => trackProc(run.id, child, run),
       })
@@ -3887,6 +4151,7 @@ export function apply(ctx, config = {}) {
         const argv = ['-p', prompt, '--output-format', 'stream-json']
         if (known) argv.push('--conversation', known)
         if (opts.write) argv.push('--dangerously-skip-permissions')
+        if (opts.providerCtx?.settingsFile) argv.push('--settings', opts.providerCtx.settingsFile)
         return argv
       },
       index: () => path.join(os.homedir(), '.dsh', 'agy-sessions.json'),
@@ -4111,6 +4376,12 @@ export function apply(ctx, config = {}) {
         session: { type: 'string', description: 'Stable name for this line of work; the same name resumes the same conversation.' },
         write: { type: 'boolean', description: 'Allow file edits. Default false (read-only).' },
         model: { type: 'string', description: 'Model override where supported (codex / claude).' },
+        provider: {
+          type: 'string',
+          description:
+            'agy only: third-party provider name from ~/.dsh/hands-providers.json (e.g. "znbcode"). ' +
+            'Other hands ignore it. Omit for the default model.',
+        },
         async: {
           type: 'boolean',
           description:
@@ -4162,7 +4433,10 @@ export function apply(ctx, config = {}) {
       const known = resume.id
       const sessionReset = resume.reset
 
-      const opts = { write: !!args?.write, model: args?.model || '' }
+      const opts = { write: !!args?.write, model: args?.model || '', provider: args?.provider || '' }
+      // 第三方供应商：只对 agy 生效；缺 key 等问题在这里抛清晰错误，跑活前停下
+      const providerCtx = to === 'agy' ? agyProviderContext(opts.provider) : null
+      if (providerCtx) opts.providerCtx = providerCtx
       const runCwd = resolveRunCwd(args, ctx)
       const timeoutSec = effTimeout(args)
       const run = startDispatch({
@@ -4215,6 +4489,7 @@ export function apply(ctx, config = {}) {
         result = await runProcess(hand.bin(), argv, {
           cwd: runCwd,
           timeoutSec,
+          env: providerCtx?.env,
           onChunk: run.push,
           onSpawn: (child) => trackProc(run.id, child, run),
         })
