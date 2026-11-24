@@ -29,7 +29,7 @@ metadata:
 1. **首选 DSH 原生子代理**（`subagent`）：它本来就是异步的，跑完由运行时把完成通知投给我。
    子代理不继承我们这段对话，所以任务书必须**自包含**（目标、约束、要读哪些文件、怎么证明做完了）。
 2. **需要指定别家的模型或工具时**，用 dsh-hands 的 `*_run` 带 `async: true`：
-   立刻拿到 `{status:'RUNNING', jobId, sessionId}`，跑完它自己把结果投回这间会话，把我叫起来。
+   立刻拿到 `{status:'RUNNING'|'QUEUED', jobId, sessionId, queuePosition}`；同一目标会话已有任务在跑时，它会如实说「已排队，前面还有 N 个」，跑完自己把结果投回这间会话，把我叫起来。
 3. **两者可以叠**：子代理负责「起 claude 设计 → 交 opencode 实现 → 自己先验一遍」，
    调用方只收一条汇报。一次派活只有一条回传，不会把会话塞满。
 
@@ -85,7 +85,7 @@ agy 默认走官方（免费的 gemini-3.8-flash）。要切第三方（如 znbc
 
 ## hands_run 的异步是真的异步（2.6.3 起）
 
-- `async: true` → 立刻返回 `{status:'RUNNING', jobId}`，**这一轮不被钉住**；跑完由插件把结果投回当前会话。
+- `async: true` → 立刻返回 `{status:'RUNNING'|'QUEUED', jobId, queuePosition}`，**这一轮不被钉住**；同一目标会话串行，跑完由插件把结果投回当前会话。
 - 异步任务默认**不限时**（`timeoutSec` 传 0）；要限时就在调用时显式传秒数。
 - 投递依赖「调用方 DSH 会话 id」：job 里拿不到 id 时会标 `no-agent`，任务本身可能已经跑完，去 `~/.dsh/hands-async.json` 或 `GET /dsh-hands/async` 看 `delivery` / `deliveryError`。
 - 老会话里工具实例不会热更：插件发版后要重启 DSH 或新开会话，异步修复才生效。
@@ -115,7 +115,10 @@ agy 默认走官方（免费的 gemini-3.8-flash）。要切第三方（如 znbc
 
 ## 并发与观测
 
-- 异步活同时最多跑 3 个（`config.maxAsync` 可调），多的先进先出排队，进程是排队之后才起的。
+- 异步活全局同时最多跑 3 个（`config.maxAsync` 可调）；同一目标会话最多再排 3 个（`config.maxSessionQueue` 可调），
+  第 4 个驳回。锁键是 `hand + conversationId`，新会话退回 `hand + session 名 + 规范化 cwd`。进程是排队之后才起的。
+- 同步调用不进异步队列：它本身会阻塞当前调用到结束，由调用方自己等待，不会在后台偷偷并发。
+- `QUEUED` 不是 RUNNING；`queuePosition` 表示前面还有几个。取消前一个后，队首自动接棒。
 - `GET /dsh-hands/async?n=50` 一次看到在跑的（`live`）和落盘的（`persisted`），
   每条带 `delivery` / `deliveryError` / `deliveredAt` —— 排查「投没投出去、是不是孤儿」看这里，不用翻日志。
 - 回传正文是契约格式：状态、用时、退出码、花费、派活原文、结果、完整日志路径。
@@ -124,6 +127,8 @@ agy 默认走官方（免费的 gemini-3.8-flash）。要切第三方（如 znbc
     - `ORPHAN` = 进程已经不在了（没了结果在原会话记录里，不会自动回传）；
     - `RUNNING` + `recoverNote` 带 `pid` = 还在跑（`tasklist /FI "PID eq N"` 或 `ps -p N` 可核对），跑完由插件补传；
     - `delivery: retrying` + `nextRetryAt` = 投递退避中。
+   - `QUEUED` 队列不跨重启重放：从未启动的任务标 `CANCELLED` / `delivery: skipped`，日志写明安全丢弃；
+     仍存活的恢复 pid 继续占目标会话锁，直到进程退出。
   - 进程到底完没完，别只看插件状态——`tasklist /FI "PID eq N"` / `ps -p N` 查真实进程。
   - 没了结果的 ORPHAN 不要硬投：去 opencode 会话里找那次回复，或重派一次。
 

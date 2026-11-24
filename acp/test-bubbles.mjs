@@ -1,6 +1,7 @@
 // 气泡纯函数 + 纯展示组件测试：node acp/test-bubbles.mjs
 // 不挂真 React：用最小 stub 让 h()/hooks 能跑，自己递归把函数组件展开成树。
 import assert from 'node:assert/strict'
+import { RICH_MARKDOWN, STREAM_PARTIAL_FENCE, STREAM_PARTIAL_TABLE, STREAM_PARTIAL_INLINE } from './markdown-fixture.mjs'
 
 globalThis.window = {
   __ModuleLoader__: {
@@ -42,7 +43,24 @@ const mod = def.factory((name) => {
   if (name === 'react') return ReactStub
   throw new Error(`unexpected require: ${name}`)
 })
-const { resolveTurnBody, formatTurnMeta, formatTokens, formatCost, BubbleUser, BubbleAgent, MarkdownLite } = mod
+const {
+  resolveTurnBody,
+  formatTurnMeta,
+  formatTokens,
+  formatCost,
+  isQueued,
+  queuePositionOf,
+  toneOf,
+  statusLabel,
+  statusLabelWithQueue,
+  turnIsRunning,
+  asyncBarState,
+  BubbleUser,
+  BubbleAgent,
+  MarkdownLite,
+  MarkdownBlock,
+  Turn,
+} = mod
 
 assert.equal(typeof resolveTurnBody, 'function', '导出了 resolveTurnBody')
 assert.equal(typeof formatTurnMeta, 'function', '导出了 formatTurnMeta')
@@ -97,6 +115,8 @@ const t = (key, vars) => {
   if (key === 'v2Expand') return 'expand'
   if (key === 'v2Collapse') return 'collapse'
   if (key === 'v2LoadFull') return 'loadFull'
+  if (key === 'asyncQueued') return 'QUEUED'
+  if (key === 'queueAhead') return `${vars?.n ?? 0} ahead`
   if (key === 'durationMinSec') return `${vars.m}m ${vars.s}s`
   if (key === 'durationMin') return `${vars.m}m`
   return key
@@ -145,6 +165,117 @@ const t = (key, vars) => {
   // 状态 RUNNING 但没 running 字段也要算在跑
   assert.equal(resolveTurnBody({ status: 'RUNNING' }, 'x', '').cursor, true)
   console.log('2) running 光标 ok')
+}
+
+// ── 2b. QUEUED 压过陈旧 running：无光标、无运行计数、带安全队列位置 ────────
+{
+  const queuedTurn = {
+    id: 'q1',
+    hand: 'opencode',
+    status: 'QUEUED',
+    running: true,
+    queued: true,
+    queuePosition: 2,
+    queueLimit: 4,
+    sessionLockKey: 'opencode/sid:q1',
+    excerpt: 'queued excerpt',
+  }
+
+  assert.equal(isQueued(queuedTurn), true)
+  assert.equal(toneOf(queuedTurn), 'queued', 'queued 用非运行 tone')
+  assert.equal(turnIsRunning(queuedTurn), false, 'QUEUED 压过 stale running=true')
+  assert.equal(statusLabel(queuedTurn, t), 'QUEUED')
+  assert.equal(statusLabelWithQueue(queuedTurn, t), 'QUEUED · 2 ahead')
+
+  // queued 标记也优先，兼容状态字段还没更新完的快照。
+  assert.equal(turnIsRunning({ status: 'RUNNING', running: true, queued: true }), false)
+  assert.equal(toneOf({ status: 'RUNNING', running: true, queued: true }), 'queued')
+
+  for (const view of [
+    resolveTurnBody(queuedTurn, 'stale live', 'fetched'),
+    resolveTurnBody(queuedTurn, '', 'fetched'),
+    resolveTurnBody(queuedTurn, '', ''),
+  ]) {
+    assert.equal(view.cursor, false, 'QUEUED 的正文来源一律不显示流式光标')
+  }
+  const queuedTree = render(
+    h(BubbleAgent, { t, turn: queuedTurn, view: resolveTurnBody(queuedTurn, 'stale live', '') }),
+  )
+  assert.equal(hasClass(queuedTree, 'dsh-hands-cursor'), false)
+  const queuedBlocksTree = render(
+    h(BubbleAgent, {
+      t,
+      turn: { ...queuedTurn, blocks: [{ kind: 'text', text: 'stale block' }] },
+      view: resolveTurnBody(queuedTurn, '', ''),
+    }),
+  )
+  assert.equal(hasClass(queuedBlocksTree, 'dsh-hands-cursor'), false, '分块正文也不显示光标')
+
+  // 同步/真正 RUNNING 的判断保持不变。
+  assert.equal(turnIsRunning({ status: 'RUNNING', running: false }), true)
+  assert.equal(toneOf({ status: 'RUNNING', running: false }), 'running')
+  assert.equal(turnIsRunning({ status: 'OK', running: false }), false)
+
+  for (const value of [undefined, null, '', Number.NaN, Number.POSITIVE_INFINITY, -3]) {
+    assert.equal(queuePositionOf({ queuePosition: value }), 0, `非法队列位置 ${value} 回落 0`)
+  }
+  assert.equal(queuePositionOf({ queuePosition: '2.9' }), 2)
+  assert.equal(statusLabelWithQueue({ status: 'QUEUED' }, t), 'QUEUED · 0 ahead')
+
+  const queuedMeta = formatTurnMeta({ ...queuedTurn, ms: 1234 }, t)
+  assert.equal(queuedMeta[0].key, 'queue')
+  assert.equal(queuedMeta[0].text, '2 ahead')
+  assert.equal(formatTurnMeta({ status: 'QUEUED' }, t)[0].text, '0 ahead')
+  assert.equal(
+    formatTurnMeta({ status: 'RUNNING', ms: 1234 }, t).some((part) => part.key === 'queue'),
+    false,
+    '同步轮次不混入队列元信息',
+  )
+
+  const store = {
+    getSnapshot() {
+      return { liveByTurn: {} }
+    },
+    ensureTurnBody() {},
+    selectTurn() {},
+  }
+  const turnTree = render(h(Turn, { store, t, turn: queuedTurn, active: true, autoBody: true }))
+  assert.match(allText(turnTree), /QUEUED/)
+  assert.match(allText(turnTree), /2 ahead/)
+  assert.equal(hasClass(turnTree, 'dsh-hands-cursor'), false)
+
+  const liveQueued = { ...queuedTurn, id: 'q-live', delivery: 'pending' }
+  const persistedQueued = {
+    ...queuedTurn,
+    id: 'q-persisted',
+    running: false,
+    queuePosition: 3,
+    delivery: 'pending',
+  }
+  const queuedOnly = asyncBarState({
+    live: [liveQueued],
+    persisted: [persistedQueued, { ...persistedQueued, queuePosition: 99 }],
+  })
+  assert.equal(queuedOnly.visible, true, '只有排队任务时状态条也显示')
+  assert.equal(queuedOnly.running, 0, 'stale running 不计入运行数')
+  assert.equal(queuedOnly.queued, 2, 'live/persisted 去重后按任务计数')
+  assert.equal(queuedOnly.failed, 0)
+  assert.equal(queuedOnly.rows.length, 2)
+  assert.equal(queuedOnly.rows[0], liveQueued, '汇总不重建/丢失 live 行字段')
+  assert.equal(queuedOnly.rows[1], persistedQueued, '重复行保留首条原始数据')
+  assert.equal(queuedOnly.rows[1].queueLimit, 4)
+  assert.equal(queuedOnly.rows[1].sessionLockKey, 'opencode/sid:q1')
+  assert.equal(asyncBarState({ live: [], persisted: [] }).visible, false, '纯空闲仍收起')
+  const mixed = asyncBarState({
+    live: [{ id: 'r1', status: 'RUNNING', running: true }],
+    persisted: [{ id: 'f1', status: 'FAILED', delivery: 'failed' }],
+  })
+  assert.equal(mixed.visible, true)
+  assert.equal(mixed.running, 1, '真正 RUNNING 仍计数')
+  assert.equal(mixed.queued, 0)
+  assert.equal(mixed.failed, 1, '回传失败仍计数')
+
+  console.log('2b) QUEUED 优先级 / 元信息 / 光标 / 异步汇总 ok')
 }
 
 // ── 3. 元信息：耗时 / tokens / cost / exitCode / model ──────────────────────
@@ -243,30 +374,98 @@ const t = (key, vars) => {
   }
   const texts = (tree) => collect(tree).map((n) => (n.children || []).map((c) => c.text || '').join('')).join(' | ')
 
-  // 围栏代码块 → pre.dsh-hands-mdCode
+  // 围栏代码块 → 带语言/复制按钮的卡片，正文在独立横向滚动区。
   const fence = render(h(MarkdownLite, { text: '说明\n```js\nconst a = 1\n```\n结尾' }))
-  const pres = collect(fence).filter((n) => n.type === 'pre')
-  assert.equal(pres.length, 1, '一个围栏块')
-  assert.ok(pres[0].props.className.includes('dsh-hands-mdCode'), '代码块类名')
-  assert.equal(pres[0].props['data-lang'], 'js', '记住语言')
+  const codeCards = collect(fence).filter((n) => n.props?.className === 'dsh-hands-mdCode')
+  assert.equal(codeCards.length, 1, '一个围栏块')
+  assert.equal(codeCards[0].props['data-lang'], 'js', '记住语言')
+  const fencePre = collect(fence).find((n) => n.type === 'pre')
+  assert.equal(fencePre.props.className, 'dsh-hands-mdCodeBody', '代码正文使用独立滚动容器')
   assert.ok(texts(fence).includes('const a = 1'), '代码正文在')
+  const fenceButton = collect(fence).find((n) => n.type === 'button')
+  assert.equal(fenceButton.props.className, 'dsh-hands-mdCopy', '代码块带复制按钮')
+  assert.equal(typeof fenceButton.props.onClick, 'function', '复制按钮可点击')
 
-  // 标题 / 列表 / 引用
-  const rich = render(h(MarkdownLite, { text: '# 标题\n- 第一\n- 第二\n> 引用' }))
-  assert.ok(collect(rich).some((n) => n.props?.className === 'dsh-hands-mdHeading'), '标题')
-  assert.ok(collect(rich).some((n) => n.type === 'ul'), '列表')
-  assert.ok(collect(rich).some((n) => n.type === 'blockquote'), '引用')
+  // 复制调用剪贴板；失败不抛，界面仍可继续用。
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  const originalSetTimeout = globalThis.setTimeout
+  const originalClearTimeout = globalThis.clearTimeout
+  let copiedText = ''
+  try {
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { clipboard: { writeText: async (value) => { copiedText = value } } },
+    })
+    globalThis.setTimeout = () => 1
+    globalThis.clearTimeout = () => {}
+    await fenceButton.props.onClick()
+    assert.equal(copiedText, 'const a = 1', '复制的是代码正文')
+  } finally {
+    if (navigatorDescriptor) Object.defineProperty(globalThis, 'navigator', navigatorDescriptor)
+    else delete globalThis.navigator
+    globalThis.setTimeout = originalSetTimeout
+    globalThis.clearTimeout = originalClearTimeout
+  }
 
-  // 行内三种标记
-  const inline = render(h(MarkdownLite, { text: 'a `code` **粗** *斜*' }))
-  const kinds = collect(inline).map((n) => n.type)
-  assert.ok(kinds.includes('code'), '行内代码')
-  assert.ok(kinds.includes('strong'), '加粗')
-  assert.ok(kinds.includes('em'), '斜体')
+  // 完整 fixture：标题、两类列表、引用、表格、行内标记、链接、空行与硬换行。
+  const rich = render(h(MarkdownLite, { text: RICH_MARKDOWN }))
+  const nodes = collect(rich)
+  assert.ok(nodes.some((n) => n.type === 'h1' && n.props.className === 'dsh-hands-mdHeading'), '一级标题')
+  assert.ok(nodes.some((n) => n.type === 'h2'), '二级标题')
+  assert.ok(nodes.some((n) => n.type === 'ul'), '无序列表')
+  assert.ok(nodes.some((n) => n.type === 'ol'), '有序列表')
+  assert.ok(nodes.some((n) => n.type === 'blockquote'), '引用')
+  assert.ok(nodes.some((n) => n.type === 'table'), '表格')
+  assert.ok(nodes.some((n) => n.type === 'strong'), '加粗')
+  assert.ok(nodes.some((n) => n.type === 'em'), '斜体')
+  assert.ok(nodes.some((n) => n.type === 'code'), '行内代码')
+  const link = nodes.find((n) => n.type === 'a')
+  assert.equal(link.props.href, 'https://example.com', '链接地址')
+  assert.equal(link.props.target, '_blank', '链接新开')
+  assert.ok(nodes.some((n) => n.props?.className === 'dsh-hands-mdGap'), '保留空行间距')
+  assert.ok(allText(rich).includes('这一行后面有两个空格。  '), '行尾两个空格原样保留')
+  const table = nodes.find((n) => n.type === 'table')
+  const tableNodes = collect(table)
+  const rightHeader = tableNodes.find((n) => n.type === 'th' && allText(n) === '值')
+  assert.equal(rightHeader.props.style.textAlign, 'right', '表格列对齐')
+  assert.equal(tableNodes.filter((n) => n.type === 'td').length, 6, '表格三行数据')
+
+  // 流式半成品：未闭合围栏、仅表头、未闭合行内标记都不炸。
+  const partialFence = render(h(MarkdownLite, { text: STREAM_PARTIAL_FENCE, streaming: true }))
+  const partialCard = collect(partialFence).find((n) => n.props?.className === 'dsh-hands-mdCode')
+  assert.equal(partialCard.props['data-streaming'], 'true', '未闭合围栏按流式代码渲染')
+  assert.ok(texts(partialFence).includes('const a = 1;'), '流式代码正文在')
+  const partialTable = render(h(MarkdownLite, { text: STREAM_PARTIAL_TABLE, streaming: true }))
+  assert.ok(collect(partialTable).some((n) => n.type === 'table'), '半成品表头也渲染表格')
+  const partialInline = render(h(MarkdownLite, { text: STREAM_PARTIAL_INLINE, streaming: true }))
+  assert.ok(allText(partialInline).includes('这是**粗体'), '未闭合行内标记不吞字')
+
+  // 只有行内反引号时不能误开围栏；波浪号围栏同样支持。
+  const inlineFence = render(h(MarkdownLite, { text: '这是 ``` 不是围栏' }))
+  assert.equal(collect(inlineFence).filter((n) => n.props?.className === 'dsh-hands-mdCode').length, 0, '行内反引号不误判')
+  const tildeFence = render(h(MarkdownLite, { text: '~~~txt\nhello\n~~~' }))
+  assert.ok(collect(tildeFence).some((n) => n.props?.['data-lang'] === 'txt'), '波浪号围栏')
+
+  // 原生路径必须收到本地化 labels，并且同一语言下引用稳定。
+  const NativeMarkdownText = () => null
+  const nativeMod = def.factory((name) => {
+    if (name === 'react') return ReactStub
+    if (name === '@deepseek-ai/dsh-client-ui-primitives') return { MarkdownText: NativeMarkdownText }
+    throw new Error(`unexpected require: ${name}`)
+  })
+  const t = (key) => ({ copy: '复制', copied: '已复制', codeBlockTitle: '代码', codeBlockWrap: '换行', codeBlockUnwrap: '不换行', markdownFootnotes: '脚注' })[key] || key
+  const nativeFirst = nativeMod.MarkdownBlock({ text: '# 标题', t })
+  const nativeSecond = nativeMod.MarkdownBlock({ text: '# 标题\n正文', streaming: true, t })
+  assert.equal(nativeFirst.type, NativeMarkdownText, '优先使用原生 MarkdownText')
+  assert.equal(nativeFirst.props.labels.code.copyLabel, '复制', '原生复制文案本地化')
+  assert.equal(nativeFirst.props.labels, nativeSecond.props.labels, '流式 labels 引用稳定')
+  const fallback = mod.MarkdownBlock({ text: '```\nx\n```', t })
+  assert.equal(fallback.type, MarkdownLite, '没有原生组件时回落')
+  assert.equal(fallback.props.labels.code.copyLabel, '复制', '兜底复制文案同样本地化')
 
   // 空文本不炸
   assert.ok(render(h(MarkdownLite, { text: '' })), '空文本也有容器')
-  console.log('6) 极简 markdown 兜底 ok')
+  console.log('6) markdown 原生/兜底渲染 ok')
 }
 
 console.log('ok')

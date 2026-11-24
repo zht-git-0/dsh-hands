@@ -472,4 +472,85 @@ async function until(check, label, tries = 200) {
   console.log('9) archiveSession POST + 立即刷新 ok')
 }
 
+// ── 10. QUEUED 轮次：REST/SSE 原样保留，选轮/补正文都不请求 /turn ──────────
+{
+  FakeEventSource.instances.length = 0
+  const calls = []
+  const key = 'opencode/queued'
+  const queuedTurn = {
+    id: 'q1',
+    hand: 'opencode',
+    tool: 'opencode_run',
+    startedAt: '2026-11-18T13:00:00.000Z',
+    at: '2026-11-18T13:00:00.000Z',
+    status: 'QUEUED',
+    ok: false,
+    ms: 0,
+    prompt: 'queued brief',
+    excerpt: '',
+    tokens: null,
+    cost: null,
+    model: 'm-queued',
+    write: true,
+    running: false,
+    queued: true,
+    queuePosition: 2,
+    queueLimit: 4,
+    sessionLockKey: 'opencode/sid:queued',
+  }
+  const fetchImpl = async (url) => {
+    const u = new URL(String(url))
+    calls.push(`${u.pathname}${u.search}`)
+    if (u.pathname === '/dsh-hands/agents') {
+      return { ok: true, status: 200, json: async () => ({ checkedAt: '', agents: [{ hand: 'opencode' }] }) }
+    }
+    if (u.pathname === '/dsh-hands/sessions') {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          hand: 'opencode',
+          sessions: [{ key, hand: 'opencode', name: 'queued', lastAt: queuedTurn.startedAt }],
+        }),
+      }
+    }
+    if (u.pathname === '/dsh-hands/turns') {
+      return { ok: true, status: 200, json: async () => ({ key, turns: [queuedTurn] }) }
+    }
+    if (u.pathname === '/dsh-hands/turn') {
+      return { ok: true, status: 200, json: async () => ({ id: 'q1', from: 0, next: 0, eof: true, delta: '' }) }
+    }
+    return { ok: false, status: 404, json: async () => ({}) }
+  }
+  const storage = makeStorage({
+    'dsh.hands.sel': JSON.stringify({
+      hand: 'opencode',
+      key,
+      turnId: 'q1',
+      at: '2026-11-18T00:00:00.000Z',
+    }),
+  })
+  const store = createHandsStore({ fetchImpl, storage, EventSourceImpl: FakeEventSource })
+  store.start()
+  await until(
+    () => store.getSnapshot().selection.key === key && store.getSnapshot().turnsByKey[key] !== undefined,
+    'queued REST turns',
+  )
+
+  assert.deepEqual(store.snapshotSlice('turns').turns[0], queuedTurn, 'REST 队列字段原样进 store')
+  const es = FakeEventSource.instances.at(-1)
+  assert.ok(es, 'SSE 实例存在')
+  const sseQueued = { ...queuedTurn, running: true, queuePosition: 1 }
+  es.emit('turns', { revision: 2, key, turns: [sseQueued] })
+  assert.deepEqual(store.snapshotSlice('turns').turns[0], sseQueued, 'SSE 队列字段和 stale running 原样保留')
+
+  await store.selectTurn('q1')
+  assert.equal(await store.ensureTurnBody('q1'), null, '排队轮不排正文补齐任务')
+  assert.equal(await store.loadTurnBody('q1'), null, '排队轮直接补正文也被挡住')
+  assert.equal(calls.some((call) => call.startsWith('/dsh-hands/turn?')), false, 'QUEUED 不请求正文')
+
+  store.stop()
+  console.log('10) QUEUED REST/SSE 保真 + 不拉正文 ok')
+}
+
 console.log('ok')

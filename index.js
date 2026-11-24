@@ -170,10 +170,65 @@ function localDateKey(ms = Date.now()) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
 }
 
-// 会话 key：hand/名字；没名字的归到当天的「临时-日期」。
-function sessionKeyOf(hand, session, startedMs = Date.now()) {
+// 会话 key：hand/名字。没名字时用目标 sid（或派发 id）的短码，
+// 不再把所有无名任务塞进「临时-日期」——那会把不同会话误并成一行。
+export function fallbackSessionName(id) {
+  const sid = String(id || '').trim()
+  return sid ? `未命名会话（${sid.slice(0, 8)}）` : '未命名会话'
+}
+
+function isFallbackSessionName(name) {
+  return /^未命名会话（.{1,8}）$/.test(String(name || '')) || name === '未命名会话'
+}
+
+function sessionKeyOf(hand, session, startedMs = Date.now(), fallbackId = '') {
   const name = String(session || '').trim()
-  return `${hand}/${name || `临时-${localDateKey(startedMs)}`}`
+  return `${hand}/${name || fallbackSessionName(fallbackId)}`
+}
+
+// 按目标会话 id 反查名字索引。sessionId 是 DSH 调用方 id，绝不能拿来当手下会话 id。
+export function sessionMetadataFromIndex(index, conversationId) {
+  const wanted = String(conversationId || '').trim()
+  if (!wanted || !index || typeof index !== 'object') return null
+  let latest = null
+  let cwd = ''
+  let cwdUpdated = ''
+  for (const [name, value] of Object.entries(index)) {
+    if (!value || typeof value !== 'object' || String(value.id || '') !== wanted) continue
+    const entry = { name, cwd: String(value.cwd || ''), updated: String(value.updated || '') }
+    if (!latest || entry.updated > latest.updated) latest = entry
+    if (entry.cwd && (!cwd || entry.updated > cwdUpdated)) {
+      cwd = entry.cwd
+      cwdUpdated = entry.updated
+    }
+  }
+  return latest ? { ...latest, cwd: cwd || latest.cwd } : null
+}
+
+// 恢复任务/老日志缺 name 或 cwd 时，用目标 conversationId 补元数据。
+// 查不到就显示「未命名会话（sid 前 8 位）」，仍保留原 hand，不制造未分组。
+export function recoverSessionMetadata(entry, sessionIndexes = {}) {
+  const hand = String(entry?.hand || '')
+  const conversationId = String(entry?.conversationId || '')
+  const indexed = sessionMetadataFromIndex(sessionIndexes?.[hand], conversationId)
+  const fallbackId = conversationId || String(entry?.dispatchId || entry?.id || '')
+  const currentName = String(entry?.session || entry?.name || '').trim()
+  const name = currentName && !isFallbackSessionName(currentName)
+    ? currentName
+    : indexed?.name || currentName || fallbackSessionName(fallbackId)
+  const cwd = String(entry?.cwd || '').trim() || indexed?.cwd || ''
+  const oldKey = String(entry?.sessionKey || '')
+  const fallbackKey = `${hand}/${fallbackSessionName(fallbackId)}`
+  const sessionKey = !oldKey || /\/临时-\d{4}-\d{2}-\d{2}$/.test(oldKey) || oldKey === fallbackKey
+    ? `${hand}/${name}`
+    : oldKey
+  return {
+    ...entry,
+    session: name,
+    name,
+    sessionKey,
+    cwd,
+  }
 }
 
 // 一条记录属于哪个会话 key。算法和 listSessions 保持一致：
@@ -181,7 +236,11 @@ function sessionKeyOf(hand, session, startedMs = Date.now()) {
 export function turnKeyOf(entry) {
   const hand = String(entry?.hand || '')
   const startedMs = Date.parse(entry?.startedAt || entry?.at) || 0
-  const sessionKey = String(entry?.sessionKey || sessionKeyOf(hand, entry?.session, startedMs))
+  const sid = String(entry?.conversationId || entry?.id || '')
+  const oldKey = String(entry?.sessionKey || '')
+  const sessionKey = !oldKey || /\/临时-\d{4}-\d{2}-\d{2}$/.test(oldKey)
+    ? sessionKeyOf(hand, entry?.session, startedMs, sid)
+    : oldKey
   const conversationId = String(entry?.conversationId || '')
   return conversationId ? `${hand}/sid:${conversationId}` : sessionKey
 }
@@ -245,6 +304,10 @@ export function turnsFor(jobs, running, key, opts = {}) {
       model: String(entry.model || ''),
       write: !!entry.write,
       running: !!isRunning,
+      queued: !isRunning && String(entry.status || '').toUpperCase() === 'QUEUED',
+      queuePosition: Number(entry.queuePosition) || 0,
+      queueLimit: Number(entry.queueLimit) || 0,
+      sessionLockKey: String(entry.sessionLockKey || ''),
     })
   }
   rows.sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))
@@ -873,10 +936,51 @@ export function isProcessAlive(pid) {
 // 没 pid 的旧记录才退回 status=RUNNING（无法确认死亡，不能贸然标中断）。
 export function isAsyncJobActive(record, { isAlive } = {}) {
   if (!record?.id || record.endedAt) return false
+  // QUEUED 明确表示进程从未启动，不能因为旧版本没有 pid 就误判成 RUNNING。
+  if (String(record.status || '').toUpperCase() === 'QUEUED') return false
   const alive = typeof isAlive === 'function' ? isAlive : isProcessAlive
   const pid = Number(record.pid)
   if (Number.isInteger(pid) && pid > 0) return alive(pid)
   return String(record.status || '').toUpperCase() === 'RUNNING'
+}
+
+// async jobId 与派发日志 id 的关联：
+// 1) 新记录显式写 dispatchId；2) 两者本来就同 id；
+// 3) 修复前 hands_run 先派发、后生成 UUID，只能按 hand/tool、完整 prompt、时间唯一匹配。
+// 第 3 条只接受 10 秒内唯一候选，绝不凭时间接近就硬合并。
+export const ASYNC_DISPATCH_MATCH_WINDOW_MS = 10_000
+
+export function findAsyncDispatchStart(record, recordsOrStarts) {
+  if (!record) return null
+  const starts = recordsOrStarts instanceof Map
+    ? recordsOrStarts
+    : new Map(
+        (Array.isArray(recordsOrStarts) ? recordsOrStarts : [])
+          .filter((entry) => entry?.phase === 'start' && entry?.id)
+          .map((entry) => [String(entry.id), entry]),
+      )
+  const explicit = String(record.dispatchId || '')
+  if (explicit) return starts.get(explicit) || null
+  const direct = String(record.id || '')
+  if (direct && starts.has(direct)) return starts.get(direct)
+  const rawStarted = record.startedAt
+  const numericStarted = Number(rawStarted)
+  const startedMs = Number.isFinite(numericStarted) ? numericStarted : Date.parse(String(rawStarted || ''))
+  const prompt = String(record.prompt || '')
+  if (!Number.isFinite(startedMs) || !prompt) return null
+  const candidates = []
+  for (const start of starts.values()) {
+    if (String(start.hand || '') !== String(record.hand || '')) continue
+    if (record.tool && start.tool && String(record.tool) !== String(start.tool)) continue
+    const at = Date.parse(String(start.startedAt || start.at || ''))
+    if (!Number.isFinite(at) || Math.abs(at - startedMs) > ASYNC_DISPATCH_MATCH_WINDOW_MS) continue
+    const startPrompt = String(start.prompt || '')
+    if (!startPrompt) continue
+    // startDispatch 会把 prompt 截到 4000；只认完整一致或精确的截断前缀。
+    if (startPrompt !== prompt && !(startPrompt.length === 4000 && prompt.startsWith(startPrompt))) continue
+    candidates.push({ start, distance: Math.abs(at - startedMs) })
+  }
+  return candidates.length === 1 ? candidates[0].start : null
 }
 
 // 启动对账计划：有 start 没 end，但 asyncState 仍 RUNNING / pid 仍活着的，不收尸。
@@ -892,7 +996,9 @@ export function planLogReconciliation(records, asyncJobs = {}, { isAlive, runnin
   }
   const active = new Set((Array.isArray(runningIds) ? runningIds : []).map(String).filter(Boolean))
   for (const record of Object.values(asyncJobs || {})) {
-    if (isAsyncJobActive(record, { isAlive })) active.add(String(record.id))
+    if (!isAsyncJobActive(record, { isAlive })) continue
+    const start = findAsyncDispatchStart(record, starts)
+    active.add(String(start?.id || record.dispatchId || record.id || ''))
   }
   const interrupt = []
   for (const [id, start] of starts) {
@@ -911,9 +1017,14 @@ export function planAsyncRecovery(state, { isAlive } = {}) {
   const deliver = []
   const orphan = []
   const running = []
+  const queued = []
   for (const record of jobs) {
     if (!record || !record.id) continue
     if (record.delivery === 'sent') continue
+    if (!record.endedAt && String(record.status || '').toUpperCase() === 'QUEUED') {
+      queued.push(record.id)
+      continue
+    }
     if (!record.endedAt) {
       if (isAsyncJobActive(record, { isAlive })) running.push(record.id)
       else orphan.push(record.id)
@@ -921,7 +1032,7 @@ export function planAsyncRecovery(state, { isAlive } = {}) {
     }
     if (record.report) deliver.push(record.id)
   }
-  return { deliver, orphan, running }
+  return { deliver, orphan, running, queued }
 }
 
 // ── 回传重试：投不进去就退避重试，别把一次「会话正忙」当成永久失败 ──────────
@@ -996,6 +1107,188 @@ export function createAsyncQueue(limit = 3) {
     },
     stats() {
       return { limit: max, active, waiting: waiting.length }
+    },
+  }
+}
+
+// 每个目标会话的等待上限：默认 3 个「排在正在跑的任务后面」的任务，第 4 个驳回。
+// 与全局 maxAsync（同时最多跑几个）是两层不同的闸门。
+export function normalizeSessionQueueLimit(limit) {
+  const raw = limit === undefined || limit === null || limit === '' ? NaN : Math.trunc(Number(limit))
+  return Number.isFinite(raw) ? Math.max(1, Math.min(16, raw)) : 3
+}
+
+export function normalizeAsyncSessionCwd(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  try {
+    const resolved = path.resolve(raw).replace(/\\/g, '/')
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+  } catch {
+    return raw.replace(/\\/g, '/')
+  }
+}
+
+// 锁的是「手下自己的目标会话」，不是调用方 DSH 会话（job.sessionId 只用于回传）。
+// 已知 conversationId 时优先用它；同时保留 session+cwd 别名，供新会话在拿到 id 后合并。
+export function asyncSessionLockKeys(job = {}) {
+  const hand = String(job.hand || '').trim().toLowerCase()
+  const conversationId = String(job.conversationId || '').trim()
+  const session = String(job.session || '').trim()
+  const cwd = normalizeAsyncSessionCwd(job.cwd)
+  const keys = []
+  if (conversationId) keys.push(`v1:${hand}:id:${conversationId}`)
+  keys.push(`v1:${hand}:name:${session}:cwd:${cwd}`)
+  return [...new Set(keys)]
+}
+
+// 目标会话级串行队列：每个 lane 同时只允许一个任务进入全局并发闸门。
+// 位置是 1-based 的「前面还有几个」；lane 为空时连别名一起清理，不会留死锁。
+export function createSessionQueue(limit = 3) {
+  const max = normalizeSessionQueueLimit(limit)
+  const lanes = new Map()
+
+  const findLane = (keys) => {
+    for (const key of keys) {
+      const lane = lanes.get(key)
+      if (lane) return lane
+    }
+    return null
+  }
+  const registerKeys = (lane, keys) => {
+    for (const key of keys) {
+      if (!key) continue
+      lanes.set(key, lane)
+      lane.keys.add(key)
+    }
+  }
+  const cleanup = (lane) => {
+    for (const key of lane.keys) {
+      if (lanes.get(key) === lane) lanes.delete(key)
+    }
+    lane.keys.clear()
+  }
+  const notifyWaiting = (lane) => {
+    lane.waiting.forEach((task, index) => {
+      task.onQueue?.({ status: 'QUEUED', position: index + (lane.active ? 1 : 0) })
+    })
+  }
+  const startTask = (lane, task) => {
+    lane.active = task
+    try {
+      task.onStart?.({ status: 'RUNNING', position: 0 })
+    } catch (error) {
+      lane.active = null
+      task.reject(error)
+      pump(lane)
+      return
+    }
+    Promise.resolve()
+      .then(task.start)
+      .then(task.resolve, task.reject)
+      .finally(() => {
+        if (lane.active === task) lane.active = null
+        pump(lane)
+      })
+  }
+  const pump = (lane) => {
+    if (lane.active) return
+    const next = lane.waiting.shift()
+    if (!next) {
+      cleanup(lane)
+      return
+    }
+    startTask(lane, next)
+    notifyWaiting(lane)
+  }
+
+  return {
+    enqueue({ key, keys = [], start, onStart, onQueue } = {}) {
+      const id = String(key ?? '')
+      const allKeys = [...new Set([id, ...(Array.isArray(keys) ? keys : [])].filter(Boolean))]
+      let lane = findLane(allKeys)
+      if (!lane) {
+        lane = { keys: new Set(), active: null, waiting: [] }
+      }
+      let resolve
+      let reject
+      const promise = new Promise((yes, no) => {
+        resolve = yes
+        reject = no
+      })
+      const task = { key: id, start, resolve, reject, onStart, onQueue }
+      if (lane.active || lane.waiting.length) {
+        if (lane.waiting.length >= max) {
+          return { accepted: false, status: 'FULL', position: 0, limit: max, promise: null }
+        }
+        registerKeys(lane, allKeys)
+        lane.waiting.push(task)
+        const position = lane.waiting.length - 1 + (lane.active ? 1 : 0)
+        onQueue?.({ status: 'QUEUED', position })
+        return { accepted: true, status: 'QUEUED', position, limit: max, promise }
+      }
+      registerKeys(lane, allKeys)
+      startTask(lane, task)
+      return { accepted: true, status: 'RUNNING', position: 0, limit: max, promise }
+    },
+    cancel(key) {
+      const wanted = String(key ?? '')
+      for (const lane of new Set(lanes.values())) {
+        const index = lane.waiting.findIndex((task) => task.key === wanted)
+        if (index < 0) continue
+        const [task] = lane.waiting.splice(index, 1)
+        task.resolve({ cancelled: true })
+        notifyWaiting(lane)
+        if (!lane.active) pump(lane)
+        return true
+      }
+      return false
+    },
+    addAliases(key, keys = []) {
+      const allKeys = [String(key || ''), ...(Array.isArray(keys) ? keys : [])].filter(Boolean)
+      const lane = findLane(allKeys)
+      if (lane) registerKeys(lane, allKeys)
+      return !!lane
+    },
+    reserve(keys = []) {
+      const allKeys = (Array.isArray(keys) ? keys : []).filter(Boolean)
+      if (!allKeys.length) return null
+      let lane = findLane(allKeys)
+      if (!lane) {
+        lane = { keys: new Set(), active: null, waiting: [] }
+        registerKeys(lane, allKeys)
+      } else {
+        registerKeys(lane, allKeys)
+      }
+      if (lane.active) return null
+      const token = { reserved: true, key: `reserved:${allKeys[0] || 'unknown'}` }
+      lane.active = token
+      return token
+    },
+    release(token) {
+      if (!token) return false
+      for (const lane of new Set(lanes.values())) {
+        if (lane.active !== token) continue
+        lane.active = null
+        pump(lane)
+        return true
+      }
+      return false
+    },
+    position(key) {
+      const wanted = String(key ?? '')
+      for (const lane of new Set(lanes.values())) {
+        if (lane.active?.key === wanted) return 0
+        const index = lane.waiting.findIndex((task) => task.key === wanted)
+        if (index >= 0) return index + 1
+      }
+      return null
+    },
+    stats() {
+      const unique = new Set(lanes.values())
+      let waiting = 0
+      for (const lane of unique) waiting += lane.waiting.length
+      return { limit: max, sessions: unique.size, waiting }
     },
   }
 }
@@ -1302,9 +1595,17 @@ export function mergeSessionRows(target, alias) {
     target.excerpt = String(alias.excerpt || '')
   }
   target.running = !!(target.running || alias.running)
+  if (target.running) {
+    target.status = 'RUNNING'
+    target.ok = false
+  }
   target.notStarted = !target.turns && !target.running ? !!(target.notStarted && alias.notStarted) : false
-  for (const key of ['conversationId', 'sessionKey', 'name', 'cwd', 'model']) {
+  for (const key of ['conversationId', 'sessionKey', 'cwd', 'model']) {
     if (!target[key] && alias[key]) target[key] = alias[key]
+  }
+  if ((!target.name || isFallbackSessionName(target.name)) && alias.name && !isFallbackSessionName(alias.name)) {
+    target.name = alias.name
+    target.sessionKey = `${target.hand || alias.hand || ''}/${target.name}`
   }
   return target
 }
@@ -1350,7 +1651,7 @@ export function upsertSessionIndexRow(rows, hand, name, value = {}) {
   row.hand = hand
   row.conversationId = id
   const updated = String(value?.updated || '')
-  if (!hadRow || !row.name || (updated && (!row.lastAt || updated > row.lastAt))) row.name = String(name)
+  if (!hadRow || !row.name || isFallbackSessionName(row.name) || (updated && (!row.lastAt || updated > row.lastAt))) row.name = String(name)
   row.sessionKey = `${hand}/${row.name || name}`
   if (!row.cwd) row.cwd = String(value?.cwd || '')
   if (updated && (!row.lastAt || updated > row.lastAt)) row.lastAt = updated
@@ -1620,7 +1921,7 @@ export function mergeJobRecords(records) {
 // 面板统一状态：历史 end ∪ 当前 RUNNING ∪ asyncState 里仍活跃的恢复任务。
 // 旧版本曾把活进程误补成 INTERRUPTED；只要 asyncState/pid 证明它还活着，就以 RUNNING 覆盖。
 // 已经写了真正 end 的任务不覆盖（收尾记录优先于过期的 asyncState）。
-export function buildPanelDispatchState(records, asyncJobs = {}, running = [], { isAlive } = {}) {
+export function buildPanelDispatchState(records, asyncJobs = {}, running = [], { isAlive, sessionIndexes = {} } = {}) {
   const jobs = mergeJobRecords(records)
   const jobById = new Map(jobs.map((job) => [String(job.id || ''), job]))
   const starts = new Map()
@@ -1631,39 +1932,101 @@ export function buildPanelDispatchState(records, asyncJobs = {}, running = [], {
   for (const entry of Array.isArray(running) ? running : []) {
     if (entry?.id) runningMap.set(String(entry.id), entry)
   }
+  const queuedMap = new Map()
   for (const record of Object.values(asyncJobs || {})) {
+    if (!record?.id) continue
+    const status = String(record.status || '').toUpperCase()
+    if (status === 'QUEUED' && !record.endedAt) {
+      const id = String(record.dispatchId || record.id || '')
+      if (!id || runningMap.has(id)) continue
+      const numericRecordStart = Number(record.startedAt)
+      const startedMs = Number.isFinite(numericRecordStart)
+        ? numericRecordStart
+        : Date.parse(String(record.startedAt || '')) || Date.now()
+      const metadata = recoverSessionMetadata(
+        {
+          ...record,
+          id,
+          dispatchId: id,
+          status: 'QUEUED',
+          running: false,
+          queued: true,
+          queuePosition: Math.max(0, Number(record.queuePosition) || 0),
+          queueLimit: Math.max(0, Number(record.queueLimit) || 0),
+        },
+        sessionIndexes,
+      )
+      const entry = {
+        ...metadata,
+        startedAt: new Date(startedMs).toISOString(),
+        at: new Date(startedMs).toISOString(),
+        status: 'QUEUED',
+        running: false,
+        queued: true,
+        output: '',
+        outputAt: startedMs,
+      }
+      queuedMap.set(id, entry)
+      // 历史里也要看得到 QUEUED；但不覆盖已经存在的真正收尾记录。
+      if (!jobById.has(id)) {
+        jobs.push(entry)
+        jobById.set(id, entry)
+      }
+      continue
+    }
     if (!isAsyncJobActive(record, { isAlive })) continue
-    const id = String(record.id || '')
+    const start = findAsyncDispatchStart(record, starts)
+    const id = String(start?.id || record.dispatchId || record.id || '')
     if (!id || runningMap.has(id)) continue
+    const numericRecordStart = Number(record.startedAt)
+    const startedMs = Number.isFinite(numericRecordStart)
+      ? numericRecordStart
+      : Date.parse(String(record.startedAt || '')) || Date.now()
     const job = jobById.get(id)
     // 真正的收尾记录已经落盘：不能拿旧 asyncState 把它盖回 RUNNING。
     // INTERRUPTED 即使老数据没带 interrupted 标记，也允许被仍存活的进程纠正。
     if (job && job.status !== 'INTERRUPTED' && !job.interrupted) continue
-    const start = starts.get(id) || {}
-    const startedMs = Date.parse(start.startedAt || start.at) || Number(record.startedAt) || Date.now()
+    const parsedStart = Date.parse(start?.startedAt || start?.at || '')
+    const resolvedStartMs = parsedStart || startedMs
+    const hand = String(start?.hand || record.hand || '')
+    const metadata = recoverSessionMetadata(
+      {
+        ...record,
+        ...start,
+        id,
+        dispatchId: id,
+        hand,
+        tool: String(record.tool || start?.tool || ''),
+        prompt: String(record.prompt || start?.prompt || ''),
+        session: String(start?.session || record.session || ''),
+        conversationId: String(start?.conversationId || record.conversationId || ''),
+        cwd: String(start?.cwd || record.cwd || ''),
+        model: String(start?.model || record.model || ''),
+        status: 'RUNNING',
+        running: true,
+        queued: false,
+        queuePosition: 0,
+      },
+      sessionIndexes,
+    )
     runningMap.set(id, {
-      ...start,
-      id,
-      hand: String(record.hand || start.hand || ''),
-      tool: String(record.tool || start.tool || ''),
-      prompt: String(record.prompt || start.prompt || ''),
-      session: String(start.session || ''),
-      sessionKey: String(start.sessionKey || sessionKeyOf(record.hand || start.hand || '', start.session || '', startedMs)),
-      conversationId: String(start.conversationId || ''),
-      cwd: String(start.cwd || ''),
-      model: String(start.model || ''),
-      startedAt: String(start.startedAt || new Date(startedMs).toISOString()),
-      at: String(start.at || start.startedAt || new Date(startedMs).toISOString()),
+      ...metadata,
+      startedAt: String(start?.startedAt || new Date(resolvedStartMs).toISOString()),
+      at: String(start?.at || start?.startedAt || new Date(resolvedStartMs).toISOString()),
       status: 'RUNNING',
       running: true,
+      queued: false,
       recovered: true,
       output: '',
-      outputAt: startedMs,
+      outputAt: resolvedStartMs,
     })
   }
   const activeIds = new Set(runningMap.keys())
   const visibleJobs = jobs.filter((job) => !activeIds.has(String(job.id || '')))
-  return { jobs: visibleJobs, running: [...runningMap.values()] }
+  const queued = [...queuedMap.values()].sort((a, b) =>
+    Number(a.queuePosition || 0) - Number(b.queuePosition || 0) || String(a.startedAt).localeCompare(String(b.startedAt)),
+  )
+  return { jobs: visibleJobs, running: [...runningMap.values()], queued }
 }
 
 export function apply(ctx, config = {}) {
@@ -1911,8 +2274,10 @@ export function apply(ctx, config = {}) {
 
   // 面板专用：把日志、当前 RUNNING、asyncState 里仍活着的任务统一成一份状态。
   // 历史接口不能只读 end 日志，否则插件重启后仍活的异步任务会凭空变成 INTERRUPTED。
-  function panelDispatchState() {
-    return buildPanelDispatchState(readRecords(), asyncState.jobs, [...RUNNING.values()])
+  function panelDispatchState(sessionIndexes = readSessionIndexes()) {
+    return buildPanelDispatchState(readRecords(), asyncState.jobs, [...RUNNING.values()], {
+      sessionIndexes,
+    })
   }
 
   // 日志按行裁，最多 LOG_KEEP 行。start 被裁掉也没关系：end 自带全部元信息。
@@ -2003,7 +2368,7 @@ export function apply(ctx, config = {}) {
       const startedMs = Date.parse(job.startedAt || job.at)
       if (!Number.isFinite(startedMs) || localDateKey(startedMs) !== bucket.date) continue
       const hand = String(job.hand || '')
-      const key = String(job.sessionKey || sessionKeyOf(hand, job.session, startedMs))
+      const key = String(job.sessionKey || sessionKeyOf(hand, job.session, startedMs, job.conversationId || job.id))
       bucket.byHand[hand] = (bucket.byHand[hand] || 0) + 1
       bucket.byKey[key] = (bucket.byKey[key] || 0) + 1
     }
@@ -2025,10 +2390,20 @@ export function apply(ctx, config = {}) {
     ]
   }
 
+  function readSessionIndexes() {
+    const indexes = {}
+    for (const [hand, file] of sessionIndexFiles()) {
+      const value = readJson(file, {})
+      if (value && typeof value === 'object') indexes[hand] = value
+    }
+    return indexes
+  }
+
   function listSessions(handFilter = '', opts = {}) {
     const wantArchived = !!opts.archived
     ensureToday()
     const rows = new Map()
+    const sessionIndexes = readSessionIndexes()
     const ensureRow = (key, hand) => {
       let row = rows.get(key)
       if (!row) {
@@ -2049,6 +2424,9 @@ export function apply(ctx, config = {}) {
           model: '',
           excerpt: '',
           running: false,
+          queued: false,
+          queuePosition: 0,
+          queueLimit: 0,
           notStarted: false,
         }
         rows.set(key, row)
@@ -2056,11 +2434,12 @@ export function apply(ctx, config = {}) {
       return row
     }
 
-    const absorb = (record, running) => {
+    const absorb = (source, running) => {
+      const record = recoverSessionMetadata(source, sessionIndexes)
       const hand = String(record.hand || '')
       if (handFilter && hand !== handFilter) return
       const startedMs = Date.parse(record.startedAt || record.at) || Date.now()
-      const sessionKey = String(record.sessionKey || sessionKeyOf(hand, record.session, startedMs))
+      const sessionKey = String(record.sessionKey || sessionKeyOf(hand, record.session, startedMs, record.conversationId || record.id))
       const conversationId = String(record.conversationId || '')
       const key = conversationId ? `${hand}/sid:${conversationId}` : sessionKey
       const row = ensureRow(key, hand)
@@ -2082,6 +2461,9 @@ export function apply(ctx, config = {}) {
         row.ms = running ? Math.max(0, Date.now() - startedMs) : Number(record.ms) || 0
         row.excerpt = String(record.excerpt || '').slice(-600)
         row.running = !!running
+        row.queued = !running && String(record.status || '').toUpperCase() === 'QUEUED'
+        row.queuePosition = row.queued ? Math.max(0, Number(record.queuePosition) || 0) : 0
+        row.queueLimit = Math.max(0, Number(record.queueLimit) || 0)
         if (record.session) row.name = String(record.session)
       }
       // 同一会话里只要还有一条在跑，聚合行就必须是 RUNNING，不能被较晚收尾的别的轮次盖掉。
@@ -2093,14 +2475,29 @@ export function apply(ctx, config = {}) {
       }
     }
 
-    const panel = panelDispatchState()
-    for (const job of panel.jobs) absorb(job, false)
+    const panel = panelDispatchState(sessionIndexes)
+    for (const job of panel.jobs) {
+      if (String(job.status || '').toUpperCase() !== 'QUEUED') absorb(job, false)
+    }
     for (const entry of panel.running) absorb(entry, true)
+    for (const entry of panel.queued || []) absorb(entry, false)
+    // QUEUED 是「还没启动」的活跃状态：同会话有 RUNNING 时聚合行仍显示 RUNNING，
+    // 否则不能被时间更晚的 end 记录盖掉；多个排队任务展示最靠前的位置。
+    for (const row of rows.values()) {
+      const pending = (panel.queued || []).filter((entry) => turnMatches(entry, row.key))
+      if (!pending.length) continue
+      const position = Math.min(...pending.map((entry) => Number(entry.queuePosition) || 1))
+      row.queued = true
+      row.queuePosition = position
+      row.queueLimit = Math.max(Number(row.queueLimit) || 0, ...pending.map((entry) => Number(entry.queueLimit) || 0))
+      if (!row.running) {
+        row.status = 'QUEUED'
+        row.ok = false
+      }
+    }
 
-    for (const [hand, file] of sessionIndexFiles()) {
+    for (const [hand, index] of Object.entries(sessionIndexes)) {
       if (handFilter && hand !== handFilter) continue
-      const index = readJson(file, {})
-      if (!index || typeof index !== 'object') continue
       for (const [name, value] of Object.entries(index)) {
         upsertSessionIndexRow(rows, hand, name, value && typeof value === 'object' ? value : {})
       }
@@ -2109,7 +2506,10 @@ export function apply(ctx, config = {}) {
     const archived = new Set(readArchive())
     // 归档不再单独成视图：给每行打标记，前端在文件夹底部折叠展示
     return [...rows.values()]
-      .map((row) => ({ ...row, archived: isArchivedSessionEntry(row.hand, row.name, row, archived) }))
+      .map((row) => {
+        const named = recoverSessionMetadata(row, sessionIndexes)
+        return { ...named, archived: isArchivedSessionEntry(row.hand, named.name, named, archived) }
+      })
       .sort((a, b) => String(b.lastAt || '').localeCompare(String(a.lastAt || '')))
   }
 
@@ -2132,7 +2532,9 @@ export function apply(ctx, config = {}) {
     // 把 pid 落盘：重启对账用它判「进程还在不在」，比凭无 endedAt 就宣告 ORPHAN 诚实。
     // 只有异步 job 有对应记录；同步派活不进 asyncState。
     try {
-      const record = asyncState.jobs[String(id)]
+      const record =
+        asyncState.jobs[String(id)] ||
+        Object.values(asyncState.jobs).find((job) => String(job.dispatchId || '') === String(id))
       if (record && child?.pid) {
         record.pid = child.pid
         saveAsyncState()
@@ -2151,7 +2553,8 @@ export function apply(ctx, config = {}) {
     const startedMs = Date.now()
     const startedAt = new Date(startedMs).toISOString()
     const session = String(fields.session || '')
-    const sessionKey = sessionKeyOf(fields.hand, session, startedMs)
+    const conversationId = String(fields.conversationId || '')
+    const sessionKey = sessionKeyOf(fields.hand, session, startedMs, conversationId || id)
     const entry = {
       id,
       startedAt,
@@ -2161,7 +2564,7 @@ export function apply(ctx, config = {}) {
       write: !!fields.write,
       session,
       sessionKey,
-      conversationId: String(fields.conversationId || ''),
+      conversationId,
       cwd: String(fields.cwd || ''),
       model: String(fields.model || ''),
       output: '',
@@ -2188,6 +2591,15 @@ export function apply(ctx, config = {}) {
     bumpToday(entry.hand, entry.sessionKey, startedMs)
     const live = createLiveView(entry.hand)
     RUNNING.set(id, entry)
+    // 异步 job 先按目标会话排队、这里才真正派发；补上权威 id 和目标会话元数据。
+    const asyncRecord = asyncState.jobs[id]
+    if (asyncRecord) {
+      Object.assign(asyncRecord, dispatchJobMetadata({ id, entry }))
+      const liveJob = ASYNC_JOBS.get(id)
+      if (liveJob) Object.assign(liveJob, dispatchJobMetadata({ id, entry }))
+      sessionQueue.addAliases(id, asyncSessionLockKeys(asyncRecord))
+      saveAsyncState()
+    }
     touchRunning()
     touchAgentDimensions(entry)
     return {
@@ -2231,7 +2643,7 @@ export function apply(ctx, config = {}) {
     const status = String(fields.status || (fields.ok ? 'OK' : 'ERROR')).toUpperCase()
     const jobFile = saveJobText(run.id, output)
     const sessionKey =
-      run.entry.sessionKey || sessionKeyOf(run.entry.hand, run.entry.session, startedMs)
+      run.entry.sessionKey || sessionKeyOf(run.entry.hand, run.entry.session, startedMs, run.entry.conversationId || run.id)
     RUNNING.delete(run.id)
     RUNNING_PROCS.delete(run.id)
     appendRecord(
@@ -2268,7 +2680,14 @@ export function apply(ctx, config = {}) {
       }),
     )
     touchHistory()
-    touchAgentDimensions({ ...run.entry, sessionKey, conversationId: fields.conversationId || run.entry.conversationId || '' })
+    const conversationId = fields.conversationId || run.entry.conversationId || ''
+    touchAgentDimensions({ ...run.entry, sessionKey, conversationId })
+    const asyncRecord = asyncState.jobs[run.id]
+    if (asyncRecord) {
+      Object.assign(asyncRecord, dispatchJobMetadata({ id: run.id, entry: { ...run.entry, conversationId } }))
+      sessionQueue.addAliases(run.id, asyncSessionLockKeys({ ...run.entry, conversationId }))
+      saveAsyncState()
+    }
     return true
   }
 
@@ -2284,11 +2703,26 @@ export function apply(ctx, config = {}) {
   const asyncState = readAsyncState()
   const saveAsyncState = () => writeAsyncState(asyncState)
 
-  function beginAsyncJob(job) {
+  function beginAsyncJob(job, run) {
+    if (run) Object.assign(job, dispatchJobMetadata(run))
+    if (!job.dispatchId) job.dispatchId = job.id
     ASYNC_JOBS.set(job.id, job)
     asyncState.jobs[job.id] = { ...job }
     saveAsyncState()
     return job
+  }
+
+  // 手下会话身份与 DSH 调用方 sessionId 分开存；恢复时只用这些字段回查索引。
+  function dispatchJobMetadata(run) {
+    return {
+      dispatchId: run.id,
+      session: String(run.entry.session || ''),
+      sessionKey: String(run.entry.sessionKey || ''),
+      conversationId: String(run.entry.conversationId || ''),
+      cwd: String(run.entry.cwd || ''),
+      model: String(run.entry.model || ''),
+      sessionLockKey: asyncSessionLockKeys(run.entry)[0] || '',
+    }
   }
 
   // ── 并发闸门：同时最多跑 N 个异步活，多的排队（先进先出） ──────────────
@@ -2298,6 +2732,103 @@ export function apply(ctx, config = {}) {
   // 第二参数 key：异步任务传 jobId，/dsh-hands/cancel 就拿它去 asyncQueue.cancel
   const runQueued = (start, key) => asyncQueue.run(start, key)
   const asyncQueueStats = () => asyncQueue.stats()
+  const sessionQueueLimit = normalizeSessionQueueLimit(config.maxSessionQueue)
+  const sessionQueue = createSessionQueue(sessionQueueLimit)
+
+  // 宿主重启后，旧进程可能仍活着。给它保留目标会话锁，直到 pid 真死才释放，
+  // 否则新任务会与旧任务同时改同一个工作区。无 pid 的旧 RUNNING 无法证明存活，不锁。
+  const recoveredSessionLocks = new Map()
+  for (const record of Object.values(asyncState.jobs || {})) {
+    if (!record?.id || record.endedAt || String(record.status || '').toUpperCase() !== 'RUNNING') continue
+    const pid = Number(record.pid)
+    if (!Number.isInteger(pid) || pid <= 0 || !isProcessAlive(pid)) continue
+    const token = sessionQueue.reserve(asyncSessionLockKeys(record))
+    if (token) recoveredSessionLocks.set(String(record.id), { token, pid })
+  }
+  ctx.effect(() => {
+    if (!recoveredSessionLocks.size) return () => {}
+    const timer = setInterval(() => {
+      for (const [id, locked] of recoveredSessionLocks) {
+        if (isProcessAlive(locked.pid)) continue
+        if (!sessionQueue.release(locked.token)) continue
+        recoveredSessionLocks.delete(id)
+        const record = asyncState.jobs[id]
+        if (record && !record.endedAt) {
+          record.status = 'ORPHAN'
+          record.endedAt = new Date().toISOString()
+          record.delivery = record.delivery === 'sent' ? 'sent' : 'skipped'
+          record.deliveryError = 'DSH 重启后恢复的进程已经退出'
+          record.recoverNote = `恢复锁在 pid ${locked.pid} 退出后释放`
+          saveAsyncState()
+          touchRunning()
+        }
+      }
+    }, 5000)
+    timer.unref?.()
+    return () => clearInterval(timer)
+  }, 'dsh-hands: recovered session locks')
+
+  function setAsyncJobStatus(job, status, queuePosition = 0) {
+    job.status = status
+    job.queuePosition = Math.max(0, Number(queuePosition) || 0)
+    job.queueLimit = sessionQueueLimit
+    const record = asyncState.jobs[job.id]
+    if (record) {
+      record.status = job.status
+      record.queuePosition = job.queuePosition
+      record.queueLimit = job.queueLimit
+      saveAsyncState()
+    }
+    touchRunning()
+    touchAgentDimensions(job)
+  }
+
+  // 五条异步派活共用：先按目标会话排队，队首才进入全局并发闸门。
+  // 队列满时在写 asyncState 之前直接拒绝，不会留下一个假装 RUNNING 的幽灵 job。
+  function startAsyncJob(ctx, job, start, summarize) {
+    const keys = asyncSessionLockKeys(job)
+    const placement = sessionQueue.enqueue({
+      key: job.id,
+      keys,
+      start: () => runQueued(start, job.id),
+      onStart: () => setAsyncJobStatus(job, 'RUNNING', 0),
+      onQueue: ({ position }) => setAsyncJobStatus(job, 'QUEUED', position),
+    })
+    if (!placement.accepted) {
+      throw new Error(`该会话已有任务在跑，且排队已满（上限 ${placement.limit}）`)
+    }
+    job.status = placement.status
+    job.queuePosition = placement.position
+    job.queueLimit = placement.limit
+    job.sessionLockKey = keys[0] || ''
+    beginAsyncJob(job)
+    placement.promise
+      .then(async (value) => {
+        if (await settleCancelledQueuedJob(ctx, job, null, value)) return job
+        return settleAsyncJob(ctx, job, summarize(value))
+      })
+      .catch((error) =>
+        settleAsyncJob(ctx, job, {
+          status: 'ERROR',
+          ms: Date.now() - job.startedAt,
+          exitCode: null,
+          excerpt: '',
+          error: String(error?.message ?? error),
+        }),
+      )
+    return {
+      status: job.status,
+      queuePosition: job.queuePosition,
+      queueLimit: job.queueLimit,
+      sessionLockKey: job.sessionLockKey,
+    }
+  }
+
+  function asyncDispatchNote(status, queuePosition) {
+    return status === 'QUEUED'
+      ? `已排队，前面还有 ${queuePosition} 个`
+      : '跑完会把结果投回这个会话，期间你可以接着干别的'
+  }
 
   async function deliverAsyncReport(ctx, job, text) {
     const agent = findAgentFor(ctx, job.sessionId)
@@ -2328,6 +2859,7 @@ export function apply(ctx, config = {}) {
   async function settleAsyncJob(ctx, job, summary) {
     job.status = summary.status
     job.ms = summary.ms
+    job.queuePosition = 0
     job.endedAt = new Date().toISOString()
     const text = asyncReportText(job, summary)
     const record = asyncState.jobs[job.id] || (asyncState.jobs[job.id] = { ...job })
@@ -2335,9 +2867,13 @@ export function apply(ctx, config = {}) {
       sessionId: job.sessionId || record.sessionId || '',
       status: job.status,
       ms: job.ms,
+      queuePosition: 0,
       endedAt: job.endedAt,
       report: String(text).slice(0, 2000), // 存正文：重启后能原样补投，不用重算
     })
+    touchRunning()
+    touchHistory()
+    touchAgentDimensions(job)
     // 已经投过就别再投一次（同一次派活只该有一条回传）
     if (record.delivery === 'sent') {
       saveAsyncState()
@@ -2350,7 +2886,7 @@ export function apply(ctx, config = {}) {
   // 队列期取消（/dsh-hands/cancel 把排队中的条目摘下、value.cancelled）：
   // perform 没跑，从运行表摘下并写 end 记录，回传按 CANCELLED 收尾。返回 true。
   // 已在跑正常走 settleAsyncJob，返回 false。
-  function settleCancelledQueuedJob(ctx, job, run, value) {
+  async function settleCancelledQueuedJob(ctx, job, run, value) {
     if (!value?.cancelled) return false
     if (run && !run.finished) {
       finishDispatch(run, {
@@ -2361,7 +2897,7 @@ export function apply(ctx, config = {}) {
         excerpt: 'cancelled',
       })
     }
-    settleAsyncJob(ctx, job, {
+    await settleAsyncJob(ctx, job, {
       status: 'CANCELLED',
       ms: Date.now() - job.startedAt,
       exitCode: null,
@@ -2444,6 +2980,17 @@ export function apply(ctx, config = {}) {
   // 跑完但没投出去的补投一次。
   async function recoverAsyncJobs() {
     const plan = planAsyncRecovery(asyncState)
+    for (const id of plan.queued || []) {
+      const record = asyncState.jobs[id]
+      if (!record) continue
+      record.status = 'CANCELLED'
+      record.endedAt = record.endedAt || new Date().toISOString()
+      record.delivery = record.delivery === 'sent' ? 'sent' : 'skipped'
+      record.deliveryError = 'DSH 重启：排队任务从未启动，已安全丢弃'
+      record.recoverNote = `排队任务未启动（原位置 ${Number(record.queuePosition) || 0}），宿主重启后不自动重放`
+      record.queuePosition = 0
+      console.warn(`[dsh-hands] 丢弃未启动的排队任务 ${id}：${record.recoverNote}`)
+    }
     for (const id of plan.orphan) {
       const record = asyncState.jobs[id]
       if (!record) continue
@@ -2484,7 +3031,7 @@ export function apply(ctx, config = {}) {
       }
     }
     saveAsyncState()
-    return { delivered, orphans: plan.orphan.length, running: plan.running.length }
+    return { delivered, orphans: plan.orphan.length, running: plan.running.length, discardedQueued: (plan.queued || []).length }
   }
 
   // 启动后等 agents 服务就绪，再补投上一次没投出去的回传。
@@ -2514,6 +3061,23 @@ export function apply(ctx, config = {}) {
       .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))
   }
 
+  function queuedList() {
+    return panelDispatchState().queued
+      .map((entry) =>
+        clean({
+          ...entry,
+          status: 'QUEUED',
+          ok: false,
+          running: false,
+          queued: true,
+          queuePosition: Math.max(0, Number(entry.queuePosition) || 0),
+          queueLimit: Math.max(0, Number(entry.queueLimit) || 0),
+          output: '',
+        }),
+      )
+      .sort((a, b) => Number(a.queuePosition) - Number(b.queuePosition) || String(a.startedAt).localeCompare(String(b.startedAt)))
+  }
+
   function historyList(limit = 80) {
     const count = Math.max(1, Math.min(LOG_KEEP, Number(limit) || 80))
     return panelDispatchState().jobs.slice(0, count).map(stripOutput)
@@ -2526,6 +3090,7 @@ export function apply(ctx, config = {}) {
       revision: runningRevision,
       historyRevision,
       running: runningList(),
+      queued: queuedList(),
       entries: historyList(limit),
     }
   }
@@ -2551,9 +3116,14 @@ export function apply(ctx, config = {}) {
     const checkedAt = new Date().toISOString()
     const panel = panelDispatchState()
     const runningByHand = Object.create(null)
+    const queuedByHand = Object.create(null)
     for (const entry of panel.running) {
       const hand = String(entry.hand || '')
       runningByHand[hand] = (runningByHand[hand] || 0) + 1
+    }
+    for (const entry of panel.queued || []) {
+      const hand = String(entry.hand || '')
+      queuedByHand[hand] = (queuedByHand[hand] || 0) + 1
     }
     const lastAtByHand = Object.create(null)
     for (const job of panel.jobs) {
@@ -2566,6 +3136,7 @@ export function apply(ctx, config = {}) {
         hand,
         label: handDef.label,
         running: runningByHand[hand] || 0,
+        queued: queuedByHand[hand] || 0,
         today: todayCount(hand),
         sessions: listSessions(hand).filter((row) => row.archived !== true).length,
         lastAt: lastAtByHand[hand] || '',
@@ -2808,6 +3379,13 @@ export function apply(ctx, config = {}) {
                   tool: job.tool,
                   status: job.status,
                   sessionId: job.sessionId,
+                  session: job.session || '',
+                  conversationId: job.conversationId || '',
+                  cwd: job.cwd || '',
+                  sessionLockKey: job.sessionLockKey || '',
+                  queued: job.status === 'QUEUED',
+                  queuePosition: Number(job.queuePosition) || 0,
+                  queueLimit: Number(job.queueLimit) || 0,
                   startedAt: job.startedAt,
                   ms: job.ms,
                   delivery: job.delivery,
@@ -2824,6 +3402,13 @@ export function apply(ctx, config = {}) {
                     tool: record.tool,
                     status: record.status,
                     sessionId: record.sessionId,
+                    session: record.session || '',
+                    conversationId: record.conversationId || '',
+                    cwd: record.cwd || '',
+                    sessionLockKey: record.sessionLockKey || '',
+                    queued: String(record.status || '').toUpperCase() === 'QUEUED' && !record.endedAt,
+                    queuePosition: Number(record.queuePosition) || 0,
+                    queueLimit: Number(record.queueLimit) || 0,
                     startedAt: record.startedAt,
                     endedAt: record.endedAt,
                     ms: record.ms,
@@ -2838,9 +3423,9 @@ export function apply(ctx, config = {}) {
               return send(200, {
                 live,
                 persisted,
-                counts: { live: live.length, persisted: persisted.length },
-                // 队列水位：面板据此显示「排队 N / 跑着 M」，不用自己猜
-                queue: asyncQueueStats(),
+                counts: { live: live.length, persisted: persisted.length, queued: live.filter((job) => job.status === 'QUEUED').length },
+                // 队列水位：全局并发 + 每个目标会话的等待上限/数量。
+                queue: { ...asyncQueueStats(), session: sessionQueue.stats() },
               })
             }
             // 权限请求回流：面板轮询挂起中的授权，POST 回 allow/reject
@@ -3270,7 +3855,7 @@ export function apply(ctx, config = {}) {
                 if (!proc || proc.run?.finished) {
                   // 排队中、还没起进程的任务：从队列里摘掉，promise 以 cancelled 收尾，
                   // 由 settleCancelledQueuedJob 写 CANCELLED 回传。
-                  if (asyncQueue.cancel(id)) {
+                  if (sessionQueue.cancel(id) || asyncQueue.cancel(id)) {
                     return send(200, { ok: true, id, cancelled: 'queued', killed: false })
                   }
                   // 幂等：跑完的、取消过的、不存在的 id 都按「没在跑」回，别谎报成功
@@ -3397,7 +3982,7 @@ export function apply(ctx, config = {}) {
         async: {
           type: 'boolean',
           description:
-            'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
+            'true = 派完立刻返回 jobId；同一目标会话已有任务在跑时返回 QUEUED 和排队位置，跑完把结果投回本会话；默认 false 阻塞到它跑完。',
         },
         timeoutSec: {
           type: 'number',
@@ -3408,7 +3993,20 @@ export function apply(ctx, config = {}) {
       additionalProperties: false,
     },
     output: {
-      schema: { type: 'object', properties: { status: { type: 'string' }, response: { type: 'string' } } },
+      schema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string' },
+          response: { type: 'string' },
+          jobId: { type: 'string' },
+          sessionId: { type: 'string' },
+          note: { type: 'string' },
+          queued: { type: 'boolean' },
+          queuePosition: { type: 'number' },
+          queueLimit: { type: 'number' },
+          queue: { type: 'object' },
+        },
+      },
       render: (_args, value) => asText(value),
     },
     async execute(args, exec) {
@@ -3532,46 +4130,38 @@ export function apply(ctx, config = {}) {
         const jobId = crypto.randomUUID()
         const job = {
           id: jobId,
+          dispatchId: jobId,
           hand: 'agy',
           tool: 'agy_run',
           sessionId: sessionIdFromExec(exec),
+          session: String(args?.session || '').trim(),
+          conversationId: String(args?.conversationId || ''),
+          sessionKey: sessionKeyOf('agy', args?.session, Date.now(), args?.conversationId || jobId),
+          cwd: runCwd,
+          model: String(args?.model || ''),
           prompt,
           startedAt: Date.now(),
-          status: 'RUNNING',
           delivery: 'pending',
         }
-        beginAsyncJob(job)
-        runQueued(() => perform(jobId), job.id)
-          .then((value) => {
-            // 排队阶段就被取消了：perform 没跑，直接按 CANCELLED 收尾
-            if (settleCancelledQueuedJob(ctx, job, null, value)) return job
-            return settleAsyncJob(ctx, job, {
-              // 取消的判定在 perform 里做（run 在那边），这里直接用结果
-              status: value.status,
-              ms: (Number(value.durationSec) || 0) * 1000,
-              exitCode: value.exitCode,
-              excerpt: value.response,
-              cost: null,
-              error: value.status === 'SUCCESS' || value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
-              jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
-            })
-          })
-          .catch((error) =>
-            settleAsyncJob(ctx, job, {
-              status: 'ERROR',
-              ms: Date.now() - job.startedAt,
-              exitCode: null,
-              excerpt: '',
-              error: String(error?.message ?? error),
-            }),
-          )
+        const placement = startAsyncJob(ctx, job, () => perform(jobId), (value) => ({
+          status: value.status,
+          ms: (Number(value.durationSec) || 0) * 1000,
+          exitCode: value.exitCode,
+          excerpt: value.response,
+          cost: null,
+          error: value.status === 'SUCCESS' || value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
+          jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
+        }))
         return clean({
-          status: 'RUNNING',
+          status: placement.status,
           jobId: job.id,
           hand: 'agy',
           sessionId: job.sessionId,
-          note: '跑完会把结果投回这个会话，期间你可以接着干别的',
-          queue: asyncQueueStats(),
+          queued: placement.status === 'QUEUED',
+          queuePosition: placement.queuePosition,
+          queueLimit: placement.queueLimit,
+          note: asyncDispatchNote(placement.status, placement.queuePosition),
+          queue: { ...asyncQueueStats(), session: sessionQueue.stats() },
         })
       }
 
@@ -3827,7 +4417,7 @@ export function apply(ctx, config = {}) {
         async: {
           type: 'boolean',
           description:
-            'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
+            'true = 派完立刻返回 jobId；同一目标会话已有任务在跑时返回 QUEUED 和排队位置，跑完把结果投回本会话；默认 false 阻塞到它跑完。',
         },
         timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900); async jobs default to unlimited.' },
         sessionMode: {
@@ -3853,6 +4443,12 @@ export function apply(ctx, config = {}) {
           response: { type: 'string' },
           sessionId: { type: 'string' },
           resumed: { type: 'boolean' },
+          jobId: { type: 'string' },
+          note: { type: 'string' },
+          queued: { type: 'boolean' },
+          queuePosition: { type: 'number' },
+          queueLimit: { type: 'number' },
+          queue: { type: 'object' },
         },
       },
       render: (_args, value) => asText(value),
@@ -3964,46 +4560,38 @@ export function apply(ctx, config = {}) {
         const jobId = crypto.randomUUID()
         const job = {
           id: jobId,
+          dispatchId: jobId,
           hand: 'codex',
           tool: 'codex_run',
           sessionId: sessionIdFromExec(exec),
+          session: String(args?.session || '').trim(),
+          conversationId: String(args?.conversationId || ''),
+          sessionKey: sessionKeyOf('codex', args?.session, Date.now(), args?.conversationId || jobId),
+          cwd: resolveRunCwd(args, exec),
+          model: String(args?.model || ''),
           prompt,
           startedAt: Date.now(),
-          status: 'RUNNING',
           delivery: 'pending',
         }
-        beginAsyncJob(job)
-        runQueued(() => perform(jobId), job.id)
-          .then((value) => {
-            // 排队阶段就被取消了：perform 没跑，直接按 CANCELLED 收尾
-            if (settleCancelledQueuedJob(ctx, job, null, value)) return job
-            return settleAsyncJob(ctx, job, {
-              // 取消的判定在 perform 里做（run 在那边），这里直接用结果
-              status: value.status,
-              ms: value.ms,
-              exitCode: value.exitCode,
-              excerpt: value.response,
-              cost: null,
-              error: value.status === 'OK' || value.status === 'CANCELLED' ? '' : String(value.response || '').slice(0, 400),
-              jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
-            })
-          })
-          .catch((error) =>
-            settleAsyncJob(ctx, job, {
-              status: 'ERROR',
-              ms: Date.now() - job.startedAt,
-              exitCode: null,
-              excerpt: '',
-              error: String(error?.message ?? error),
-            }),
-          )
+        const placement = startAsyncJob(ctx, job, () => perform(jobId), (value) => ({
+          status: value.status,
+          ms: value.ms,
+          exitCode: value.exitCode,
+          excerpt: value.response,
+          cost: null,
+          error: value.status === 'OK' || value.status === 'CANCELLED' ? '' : String(value.response || '').slice(0, 400),
+          jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
+        }))
         return clean({
-          status: 'RUNNING',
+          status: placement.status,
           jobId: job.id,
           hand: 'codex',
           sessionId: job.sessionId,
-          note: '跑完会把结果投回这个会话，期间你可以接着干别的',
-          queue: asyncQueueStats(),
+          queued: placement.status === 'QUEUED',
+          queuePosition: placement.queuePosition,
+          queueLimit: placement.queueLimit,
+          note: asyncDispatchNote(placement.status, placement.queuePosition),
+          queue: { ...asyncQueueStats(), session: sessionQueue.stats() },
         })
       }
 
@@ -4079,6 +4667,8 @@ export function apply(ctx, config = {}) {
           delivery: { type: 'string' },
           deliveryError: { type: 'string' },
           excerpt: { type: 'string' },
+          queuePosition: { type: 'number' },
+          queueLimit: { type: 'number' },
           queue: { type: 'object' },
         },
         required: ['jobId', 'status', 'finished', 'timedOut', 'waitedMs'],
@@ -4100,11 +4690,13 @@ export function apply(ctx, config = {}) {
       return clean({
         jobId: id,
         hand: String(record.hand || ''),
-        status: finished ? String(record.status || 'UNKNOWN') : 'RUNNING',
+        status: finished ? String(record.status || 'UNKNOWN') : String(record.status || 'RUNNING').toUpperCase() === 'QUEUED' ? 'QUEUED' : 'RUNNING',
         finished,
         timedOut: !finished,
         waitedMs: Date.now() - started,
         ms: Number(record.ms) || 0,
+        queuePosition: Number(record.queuePosition) || 0,
+        queueLimit: Number(record.queueLimit) || 0,
         delivery: String(record.delivery || ''),
         deliveryError: String(record.deliveryError || ''),
         excerpt: String(record.report || '').slice(0, 4000),
@@ -4144,7 +4736,7 @@ export function apply(ctx, config = {}) {
         async: {
           type: 'boolean',
           description:
-            'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
+            'true = 派完立刻返回 jobId；同一目标会话已有任务在跑时返回 QUEUED 和排队位置，跑完把结果投回本会话；默认 false 阻塞到它跑完。',
         },
         timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900); async jobs default to unlimited.' },
         sessionMode: {
@@ -4170,6 +4762,12 @@ export function apply(ctx, config = {}) {
           response: { type: 'string' },
           sessionId: { type: 'string' },
           resumed: { type: 'boolean' },
+          jobId: { type: 'string' },
+          note: { type: 'string' },
+          queued: { type: 'boolean' },
+          queuePosition: { type: 'number' },
+          queueLimit: { type: 'number' },
+          queue: { type: 'object' },
         },
       },
       render: (_args, value) => asText(value),
@@ -4197,7 +4795,7 @@ export function apply(ctx, config = {}) {
       if (args?.permissionMode) argv.push('--permission-mode', String(args.permissionMode))
       if (known) argv.push('--resume', known)
 
-      const run = startDispatch({
+      const dispatchFields = {
         hand: 'claude',
         tool: 'claude_run',
         prompt,
@@ -4206,7 +4804,9 @@ export function apply(ctx, config = {}) {
         conversationId: known || '',
         cwd: runCwd,
         model: args?.model || '',
-      })
+      }
+      let run = null
+      let forcedDispatchId = ''
 
       // 收尾：解析 + 落记录。同步和异步两条路共用，行为必须一致。
       const settle = (result) => {
@@ -4258,57 +4858,53 @@ export function apply(ctx, config = {}) {
           onSpawn: (child) => trackProc(run.id, child, run),
         })
 
+      const perform = async () => {
+        run = startDispatch({ ...dispatchFields, id: forcedDispatchId || undefined })
+        return settle(await spawn())
+      }
+
       // 异步：立刻返回 jobId，跑完把结果投回调用方会话
       if (args?.async === true) {
+        const jobId = crypto.randomUUID()
+        forcedDispatchId = jobId
         const job = {
-          id: run.id,
+          id: jobId,
+          dispatchId: jobId,
           hand: 'claude',
           tool: 'claude_run',
           sessionId: sessionIdFromExec(exec),
+          session: name,
+          conversationId: known || '',
+          sessionKey: sessionKeyOf('claude', name, Date.now(), known || jobId),
+          cwd: runCwd,
+          model: String(args?.model || ''),
           prompt,
           startedAt: Date.now(),
-          status: 'RUNNING',
           delivery: 'pending',
         }
-        beginAsyncJob(job)
-        runQueued(async () => {
-          const result = await spawn()
-          {
-            const value = settle(result)
-            return settleAsyncJob(ctx, job, {
-              // /cancel 杀掉进程后 CLI 那条路只会返回失败码；回传要如实写 CANCELLED
-              status: run.cancelled ? 'CANCELLED' : value.status,
-              ms: value.ms,
-              exitCode: value.exitCode,
-              excerpt: value.response,
-              cost: value.cost,
-              error: value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
-              jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
-            })
-          }
-        }, job.id)
-          // 排队阶段就被取消了：spawn 没跑，直接按 CANCELLED 收尾
-          .then((value) => settleCancelledQueuedJob(ctx, job, run, value))
-          .catch((error) =>
-            settleAsyncJob(ctx, job, {
-              status: 'ERROR',
-              ms: Date.now() - job.startedAt,
-              exitCode: null,
-              excerpt: '',
-              error: String(error?.message ?? error),
-            }),
-          )
+        const placement = startAsyncJob(ctx, job, perform, (value) => ({
+          status: run.cancelled ? 'CANCELLED' : value.status,
+          ms: value.ms,
+          exitCode: value.exitCode,
+          excerpt: value.response,
+          cost: value.cost,
+          error: value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
+          jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
+        }))
         return clean({
-          status: 'RUNNING',
+          status: placement.status,
           jobId: job.id,
           hand: 'claude',
           sessionId: job.sessionId,
-          note: '跑完会把结果投回这个会话，期间你可以接着干别的',
-          queue: asyncQueueStats(),
+          queued: placement.status === 'QUEUED',
+          queuePosition: placement.queuePosition,
+          queueLimit: placement.queueLimit,
+          note: asyncDispatchNote(placement.status, placement.queuePosition),
+          queue: { ...asyncQueueStats(), session: sessionQueue.stats() },
         })
       }
 
-      return settle(await spawn())
+      return perform()
     },
   })
 
@@ -4346,7 +4942,7 @@ export function apply(ctx, config = {}) {
         async: {
           type: 'boolean',
           description:
-            'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
+            'true = 派完立刻返回 jobId；同一目标会话已有任务在跑时返回 QUEUED 和排队位置，跑完把结果投回本会话；默认 false 阻塞到它跑完。',
         },
         timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900); async jobs default to unlimited.' },
         sessionMode: {
@@ -4372,6 +4968,12 @@ export function apply(ctx, config = {}) {
           response: { type: 'string' },
           sessionId: { type: 'string' },
           resumed: { type: 'boolean' },
+          jobId: { type: 'string' },
+          note: { type: 'string' },
+          queued: { type: 'boolean' },
+          queuePosition: { type: 'number' },
+          queueLimit: { type: 'number' },
+          queue: { type: 'object' },
         },
       },
       render: (_args, value) => asText(value),
@@ -4389,7 +4991,7 @@ export function apply(ctx, config = {}) {
       const model = args?.model ? String(args.model) : ''
       const timeoutSec = effTimeout(args)
 
-      const run = startDispatch({
+      const dispatchFields = {
         hand: 'opencode',
         tool: 'opencode_run',
         prompt,
@@ -4398,9 +5000,12 @@ export function apply(ctx, config = {}) {
         conversationId: known || '',
         cwd: runCwd,
         model,
-      })
+      }
+      let run = null
+      let forcedDispatchId = ''
 
       const perform = async () => {
+      if (!run) run = startDispatch({ ...dispatchFields, id: forcedDispatchId || undefined })
       // 开关命中就先走 ACP；拿不到结果（异常 / ok=false）runAcpTurn 已记日志并返回 null，
       // 下面的 CLI 分支就是那次回退，行为与以前完全一致。
       const acp = useAcp('opencode')
@@ -4410,10 +5015,7 @@ export function apply(ctx, config = {}) {
             cwd: runCwd,
             model,
             timeoutSec,
-            sessionId:
-            sessionIdFromExec(ctx) ||
-            String(ctx?.session?.id || ctx?.sessionId || ctx?.agent?.session?.id || ''),
-          debugCtx: ctx ? Object.keys(ctx).slice(0, 24) : null,
+            sessionId: known || '',
             write: !!args?.auto,
           })
         : null
@@ -4503,48 +5105,42 @@ export function apply(ctx, config = {}) {
 
       // 异步：立刻返回 jobId，跑完把结果投回调用方会话
       if (args?.async === true) {
+        const jobId = crypto.randomUUID()
+        forcedDispatchId = jobId
         const job = {
-          id: run.id,
+          id: jobId,
+          dispatchId: jobId,
           hand: 'opencode',
           tool: 'opencode_run',
           sessionId: sessionIdFromExec(exec),
+          session: name,
+          conversationId: known || '',
+          sessionKey: sessionKeyOf('opencode', name, Date.now(), known || jobId),
+          cwd: runCwd,
+          model,
           prompt,
           startedAt: Date.now(),
-          status: 'RUNNING',
           delivery: 'pending',
         }
-        beginAsyncJob(job)
-        runQueued(() => perform(), job.id)
-          .then((value) => {
-            // 排队阶段就被取消了：perform 没跑，直接按 CANCELLED 收尾
-            if (settleCancelledQueuedJob(ctx, job, run, value)) return job
-            return settleAsyncJob(ctx, job, {
-              // /cancel 杀掉进程后 CLI 那条路只会返回失败码；回传要如实写 CANCELLED
-              status: run.cancelled ? 'CANCELLED' : value.status,
-              ms: value.ms,
-              exitCode: value.exitCode,
-              excerpt: value.response,
-              cost: value.cost,
-              error: value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
-              jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
-            })
-          })
-          .catch((error) =>
-            settleAsyncJob(ctx, job, {
-              status: 'ERROR',
-              ms: Date.now() - job.startedAt,
-              exitCode: null,
-              excerpt: '',
-              error: String(error?.message ?? error),
-            }),
-          )
+        const placement = startAsyncJob(ctx, job, perform, (value) => ({
+          status: run.cancelled ? 'CANCELLED' : value.status,
+          ms: value.ms,
+          exitCode: value.exitCode,
+          excerpt: value.response,
+          cost: value.cost,
+          error: value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
+          jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
+        }))
         return clean({
-          status: 'RUNNING',
+          status: placement.status,
           jobId: job.id,
           hand: 'opencode',
           sessionId: job.sessionId,
-          note: '跑完会把结果投回这个会话，期间你可以接着干别的',
-          queue: asyncQueueStats(),
+          queued: placement.status === 'QUEUED',
+          queuePosition: placement.queuePosition,
+          queueLimit: placement.queueLimit,
+          note: asyncDispatchNote(placement.status, placement.queuePosition),
+          queue: { ...asyncQueueStats(), session: sessionQueue.stats() },
         })
       }
 
@@ -4859,7 +5455,7 @@ export function apply(ctx, config = {}) {
         async: {
           type: 'boolean',
           description:
-            'true = 派完立刻返回 jobId，跑完把结果投回本会话（这一轮不用等）；默认 false 阻塞到它跑完。',
+            'true = 派完立刻返回 jobId；同一目标会话已有任务在跑时返回 QUEUED 和排队位置，跑完把结果投回本会话；默认 false 阻塞到它跑完。',
         },
         timeoutSec: { type: 'number', description: 'Hard timeout in seconds (default 900); async jobs default to unlimited.' },
         sessionMode: {
@@ -4888,6 +5484,9 @@ export function apply(ctx, config = {}) {
           resumed: { type: 'boolean' },
           jobId: { type: 'string' },
           note: { type: 'string' },
+          queued: { type: 'boolean' },
+          queuePosition: { type: 'number' },
+          queueLimit: { type: 'number' },
           queue: { type: 'object' },
         },
       },
@@ -4904,7 +5503,7 @@ export function apply(ctx, config = {}) {
       const index = readJson(idxFile, {}) || {}
       const name = args?.session ? String(args.session) : ''
       const runCwd = resolveRunCwd(args, ctx)
-      const resume = resolveSession(index, name, runCwd, args, 'hands_run', sessionIdFromExec(ctx), readArchive())
+      const resume = resolveSession(index, name, runCwd, args, to, sessionIdFromExec(ctx), readArchive())
       const known = resume.id
       const sessionReset = resume.reset
 
@@ -4913,7 +5512,7 @@ export function apply(ctx, config = {}) {
       const providerCtx = to === 'agy' ? agyProviderContext(opts.provider) : null
       if (providerCtx) opts.providerCtx = providerCtx
       const timeoutSec = effTimeout(args)
-      const run = startDispatch({
+      const dispatchFields = {
         hand: to,
         tool: 'hands_run',
         prompt,
@@ -4922,9 +5521,12 @@ export function apply(ctx, config = {}) {
         conversationId: known || '',
         cwd: runCwd,
         model: opts.model,
-      })
+      }
+      let run = null
+      let forcedDispatchId = ''
 
       const perform = async () => {
+      if (!run) run = startDispatch({ ...dispatchFields, id: forcedDispatchId || undefined })
       // config.acpHands 点名的手下先走 ACP；没命中 / 失败回退 CLI，argv 仍按老配方 build。
       const acp = useAcp(to)
         ? await runAcpTurn(to, {
@@ -5024,15 +5626,24 @@ export function apply(ctx, config = {}) {
       // （async 这个参数之前只写在 schema 里、execute 里没有分支，2026-11-21 20:37 爸爸抓出来的。）
       if (args?.async === true && ctx) {
         const jobId = crypto.randomUUID()
+        forcedDispatchId = jobId
         const job = {
           id: jobId,
+          dispatchId: jobId,
           hand: to,
           tool: 'hands_run',
           // 投递要靠「调用方 DSH 会话 id」，不是手下自己的会话 id。
-          // 2026-11-22 02:14 实测这里还是空的：多试几种形状，并把 ctx 结构记下来。
           sessionId:
             sessionIdFromExec(ctx) ||
             String(ctx?.session?.id || ctx?.sessionId || ctx?.agent?.session?.id || ''),
+          session: name,
+          conversationId: known || '',
+          sessionKey: sessionKeyOf(to, name, Date.now(), known || jobId),
+          cwd: runCwd,
+          model: opts.model,
+          prompt,
+          startedAt: Date.now(),
+          delivery: 'pending',
           debugCtx: (() => {
             try {
               if (!ctx) return null;
@@ -5047,43 +5658,29 @@ export function apply(ctx, config = {}) {
               return null;
             }
           })(),
-          prompt,
-          startedAt: Date.now(),
-          status: 'RUNNING',
-          delivery: 'pending',
         }
-        beginAsyncJob(job)
-        runQueued(() => perform(), job.id)
-          .then((value) => {
-            if (settleCancelledQueuedJob(ctx, job, null, value)) return job
-            return settleAsyncJob(ctx, job, {
-              status: value.status,
-              ms: Number(value.ms) || 0,
-              exitCode: value.exitCode ?? null,
-              excerpt: value.response,
-              cost: null,
-              error:
-                value.status === 'OK' || value.status === 'SUCCESS'
-                  ? ''
-                  : String(value.response || '').slice(0, 400),
-              jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
-            })
-          })
-          .catch((error) =>
-            settleAsyncJob(ctx, job, {
-              status: 'ERROR',
-              ms: Date.now() - job.startedAt,
-              exitCode: null,
-              excerpt: '',
-              error: String(error?.message ?? error),
-            }),
-          )
+        const placement = startAsyncJob(ctx, job, perform, (value) => ({
+          status: run.cancelled ? 'CANCELLED' : value.status,
+          ms: Number(value.ms) || 0,
+          exitCode: value.exitCode ?? null,
+          excerpt: value.response,
+          cost: value.cost ?? null,
+          error:
+            value.status === 'OK' || value.status === 'SUCCESS'
+              ? ''
+              : String(value.response || '').slice(0, 400),
+          jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
+        }))
         return clean({
-          status: 'RUNNING',
+          status: placement.status,
           jobId: job.id,
           hand: to,
-          note: '跑完会把结果投回这个会话，期间你可以接着干别的',
-          queue: asyncQueueStats(),
+          sessionId: job.sessionId,
+          queued: placement.status === 'QUEUED',
+          queuePosition: placement.queuePosition,
+          queueLimit: placement.queueLimit,
+          note: asyncDispatchNote(placement.status, placement.queuePosition),
+          queue: { ...asyncQueueStats(), session: sessionQueue.stats() },
         })
       }
 

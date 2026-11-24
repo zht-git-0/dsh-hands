@@ -63,6 +63,12 @@ window.__ModuleLoader__.load({
       toolDone: 'done',
       toolFailed: 'failed',
       openFolder: 'Open folder',
+      copy: 'Copy',
+      copied: 'Copied',
+      codeBlockTitle: 'Code',
+      codeBlockWrap: 'Wrap lines',
+      codeBlockUnwrap: 'Do not wrap lines',
+      markdownFootnotes: 'Footnotes',
       usageHint: 'Session total',
       searchSessions: 'Search sessions or folders',
       searchArchivedSessions: 'Search archived sessions',
@@ -70,7 +76,7 @@ window.__ModuleLoader__.load({
       searchEmpty: 'No matches',
       asyncTasks: 'Async',
       asyncRunning: 'Running',
-      asyncQueued: 'queued',
+      asyncQueued: 'QUEUED',
       asyncRetrying: 'delivery retry',
       asyncFailed: 'Failed',
       asyncIdle: 'idle',
@@ -78,6 +84,7 @@ window.__ModuleLoader__.load({
       asyncDelivery: 'delivery',
       asyncHint: 'Async dispatch queue: running/queued/retrying/failed; click for details',
       asyncCancel: 'cancel',
+      queueAhead: '{n} ahead',
       permAllow: 'Allow',
       permReject: 'Reject',
       loadFailed: 'Could not read the dispatch feed.',
@@ -152,6 +159,12 @@ window.__ModuleLoader__.load({
       toolDone: '完成',
       toolFailed: '失败',
       openFolder: '打开文件夹',
+      copy: '复制',
+      copied: '已复制',
+      codeBlockTitle: '代码',
+      codeBlockWrap: '换行',
+      codeBlockUnwrap: '不换行',
+      markdownFootnotes: '脚注',
       usageHint: '整条会话累计',
       searchSessions: '搜索会话或目录',
       searchArchivedSessions: '搜索归档会话',
@@ -159,7 +172,7 @@ window.__ModuleLoader__.load({
       searchEmpty: '没有匹配',
       asyncTasks: '异步',
       asyncRunning: '在跑',
-      asyncQueued: '排队',
+      asyncQueued: '排队中',
       asyncRetrying: '回传重试',
       asyncFailed: '失败',
       asyncIdle: '空闲',
@@ -167,6 +180,7 @@ window.__ModuleLoader__.load({
       asyncDelivery: '投递',
       asyncHint: '异步派活队列：跑着/排队/回传重试/回传失败，点开看详情',
       asyncCancel: '取消',
+      queueAhead: '前面还有 {n} 个',
       permAllow: '允许',
       permReject: '拒绝',
       loadFailed: '读取调度输出失败。',
@@ -205,6 +219,30 @@ window.__ModuleLoader__.load({
       handOpencode: 'opencode · 写码',
     };
 
+    // MarkdownText 在流式时会缓存 labels 的引用；按语言返回固定对象，避免每个字重建解析器。
+    const MARKDOWN_LABELS = {
+      en: {
+        code: {
+          copyLabel: en.copy,
+          copiedLabel: en.copied,
+          toolbarLabels: { codeLabel: en.codeBlockTitle, wrapLabel: en.codeBlockWrap, unwrapLabel: en.codeBlockUnwrap },
+        },
+        footnotes: en.markdownFootnotes,
+      },
+      zh: {
+        code: {
+          copyLabel: zh.copy,
+          copiedLabel: zh.copied,
+          toolbarLabels: { codeLabel: zh.codeBlockTitle, wrapLabel: zh.codeBlockWrap, unwrapLabel: zh.codeBlockUnwrap },
+        },
+        footnotes: zh.markdownFootnotes,
+      },
+    };
+
+    function markdownLabelsFor(t) {
+      return typeof t === 'function' && t('copy') === zh.copy ? MARKDOWN_LABELS.zh : MARKDOWN_LABELS.en;
+    }
+
     // ── 小工具 ──────────────────────────────────────────────────────────────
     const HAND_COLOR = {
       agy: 'var(--dsw-alias-brand-primary)',
@@ -217,6 +255,7 @@ window.__ModuleLoader__.load({
       failed: 'var(--dsw-alias-state-error-primary)',
       timeout: 'var(--dsw-alias-state-warn-primary)',
       running: 'var(--dsw-alias-state-business-primary)',
+      queued: 'var(--dsw-alias-state-warn-primary)',
       unknown: 'var(--dsw-alias-label-tertiary)',
     };
 
@@ -228,17 +267,27 @@ window.__ModuleLoader__.load({
       return hand || '—';
     }
 
+    function isQueued(entry) {
+      return String(entry?.status || '').toUpperCase() === 'QUEUED' || entry?.queued === true;
+    }
+
+    function queuePositionOf(entry) {
+      const value = Number(entry?.queuePosition);
+      return Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
+    }
+
     function isOk(entry) {
-      const status = String(entry.status || '').toUpperCase();
-      if (status === 'RUNNING') return false;
-      if (entry.ok === true) return true;
-      if (entry.ok === false) return false;
+      const status = String(entry?.status || '').toUpperCase();
+      if (status === 'RUNNING' || isQueued(entry)) return false;
+      if (entry?.ok === true) return true;
+      if (entry?.ok === false) return false;
       return status === 'OK' || status === 'SUCCESS';
     }
 
     function toneOf(entry) {
-      const status = String(entry.status || '').toUpperCase();
-      if (status === 'RUNNING' || entry.running) return 'running';
+      if (isQueued(entry)) return 'queued';
+      const status = String(entry?.status || '').toUpperCase();
+      if (status === 'RUNNING' || entry?.running) return 'running';
       if (isOk(entry)) return 'ok';
       if (status === 'TIMEOUT') return 'timeout';
       if (status === 'ERROR' || status === 'FAILED' || status === 'UNPARSED') return 'failed';
@@ -246,7 +295,8 @@ window.__ModuleLoader__.load({
     }
 
     function statusLabel(entry, t) {
-      const status = String(entry.status || '').toUpperCase();
+      const status = String(entry?.status || '').toUpperCase();
+      if (isQueued(entry)) return t('asyncQueued');
       if (status === 'RUNNING') return t('statusRunning');
       if (status === 'OK' || status === 'SUCCESS') return t('statusOk');
       if (status === 'TIMEOUT') return t('statusTimeout');
@@ -254,6 +304,13 @@ window.__ModuleLoader__.load({
       if (status === 'CANCELLED') return t('statusCancelled');
       if (status === 'ERROR' || status === 'FAILED') return t('statusError');
       return status || t('statusUnknown');
+    }
+
+    function statusLabelWithQueue(entry, t) {
+      const label = statusLabel(entry, t);
+      return isQueued(entry)
+        ? `${label} · ${t('queueAhead', { n: queuePositionOf(entry) })}`
+        : label;
     }
 
     function formatDuration(ms, t) {
@@ -332,6 +389,9 @@ window.__ModuleLoader__.load({
     function formatTurnMeta(turn, t = (key) => key) {
       const row = turn || {};
       const parts = [];
+      if (isQueued(row)) {
+        parts.push({ key: 'queue', text: t('queueAhead', { n: queuePositionOf(row) }) });
+      }
       const ms = Number(row.ms);
       if (Number.isFinite(ms) && ms > 0) parts.push({ key: 'ms', text: formatDuration(ms, t) });
       const tokens = formatTokens(row.tokens);
@@ -370,7 +430,7 @@ window.__ModuleLoader__.load({
     }
 
     function turnIsRunning(turn) {
-      if (!turn) return false;
+      if (!turn || isQueued(turn)) return false;
       if (turn.running === true) return true;
       return String(turn.status || '').toUpperCase() === 'RUNNING';
     }
@@ -444,6 +504,18 @@ window.__ModuleLoader__.load({
           (row) => String(row?.key || '') === wanted || String(row?.sessionKey || '') === wanted,
         ) || null
       );
+    }
+
+    // 没名字时只展示 sid 短码，不把内部 key（例如 hand/临时-日期）当标题。
+    function sessionDisplayName(row) {
+      const name = String(row?.name || '').trim();
+      if (name) return name;
+      let sid = String(row?.conversationId || '').trim();
+      if (!sid) {
+        const matched = String(row?.key || row?.sessionKey || '').match(/\/sid:([^/]+)/);
+        sid = matched ? matched[1] : '';
+      }
+      return sid ? `未命名会话（${sid.slice(0, 8)}）` : '未命名会话';
     }
 
     // 会话按服务端给的 lastAt 取最新；空会话返回 null。
@@ -805,9 +877,17 @@ window.__ModuleLoader__.load({
         return applyDelta(id, delta, next);
       }
 
+      function queuedTurnId(id) {
+        const wanted = String(id || '');
+        if (!wanted) return false;
+        return Object.values(state.turnsByKey).some(
+          (rows) => Array.isArray(rows) && rows.some((row) => String(row?.id || '') === wanted && isQueued(row)),
+        );
+      }
+
       async function loadTurnBody(id, from = 0) {
         const wanted = String(id || '');
-        if (!wanted) return null;
+        if (!wanted || queuedTurnId(wanted)) return null;
         const life = lifeToken;
         try {
           const offset = Math.max(0, Math.trunc(Number(from) || 0));
@@ -914,7 +994,7 @@ window.__ModuleLoader__.load({
 
       function ensureTurnBody(id, priority) {
         const wanted = String(id || '');
-        if (!wanted) return Promise.resolve(null);
+        if (!wanted || queuedTurnId(wanted)) return Promise.resolve(null);
         if (bodyDone.has(wanted)) return Promise.resolve(null);
         const inflight = bodyPending.get(wanted);
         if (inflight) return inflight;
@@ -1024,7 +1104,7 @@ window.__ModuleLoader__.load({
         if (!key) return;
         applySelection({ hand: state.selection.hand, key, turnId: String(turnId || '') });
         const id = String(turnId || '');
-        if (id && state.liveByTurn[id] === undefined) ensureTurnBody(id, true);
+        if (id && !queuedTurnId(id) && state.liveByTurn[id] === undefined) ensureTurnBody(id, true);
       }
 
       // 读存档 → key 还在就恢复 → 否则该 hand 下 lastAt 最新 → 否则第一个 hand 的第一个会话。
@@ -1670,6 +1750,7 @@ window.__ModuleLoader__.load({
       .dsh-hands-asyncrowCancel{flex:none;padding:0 6px;border:.5px solid var(--dsw-alias-border-l2);border-radius:999px;background:transparent;color:var(--dsw-alias-label-tertiary);font:inherit;font-size:10px;line-height:15px;cursor:pointer}
       .dsh-hands-asyncrowCancel:hover{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
       .dsh-hands-asyncrow[data-status=failed] .dsh-hands-asyncrowStatus{color:var(--dsw-alias-state-error-primary)}
+      .dsh-hands-asyncrow[data-status=queued] .dsh-hands-asyncrowStatus{color:var(--dsw-alias-state-warn-primary)}
       .dsh-hands-v2-error{flex:none;margin:6px 8px 0;padding:5px 8px;border:.5px solid var(--dsw-alias-state-error-primary);border-radius:var(--dsw-radius-sm);color:var(--dsw-alias-state-error-primary);font-size:11px;line-height:16px;overflow-wrap:anywhere}
       .dsh-hands-v2,.dsh-hands-v2 *{box-sizing:border-box}
       .dsh-hands-v2-rail{flex:none;display:flex;flex-direction:row;align-items:center;gap:4px;width:auto;min-width:0;padding:6px 8px;border-right:0;border-bottom:.5px solid var(--dsw-alias-border-l2);overflow-x:auto;overflow-y:hidden}
@@ -1687,6 +1768,7 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-agentMeta{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:15px}
       .dsh-hands-v2-agentDot{position:absolute;top:8px;right:8px;width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-label-tertiary);opacity:.4}
       .dsh-hands-v2-agentDot[data-tone=running]{background:var(--dsw-alias-state-success-primary);opacity:1;--tone-color:var(--dsw-alias-state-success-primary);animation:dsh-hands-pulse 1.6s ease-out infinite}
+      .dsh-hands-v2-agentDot[data-tone=queued]{background:var(--dsw-alias-state-warn-primary);opacity:1;--tone-color:var(--dsw-alias-state-warn-primary)}
       .dsh-hands-v2-dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--tone-color,var(--dsw-alias-label-tertiary))}
       .dsh-hands-v2-dot[data-tone=running]{animation:dsh-hands-pulse 1.6s ease-out infinite}
       .dsh-hands-v2-sessions{flex:none;display:flex;flex-direction:column;width:clamp(150px,22%,200px);min-width:0;border-right:.5px solid var(--dsw-alias-border-l2);overflow:hidden}
@@ -1775,14 +1857,29 @@ window.__ModuleLoader__.load({
       .dsh-hands-blockTool[data-status=completed] .dsh-hands-blockToolState,.dsh-hands-blockTool[data-status=ok] .dsh-hands-blockToolState{color:var(--dsw-alias-state-success-primary)}
       .dsh-hands-blockTool[data-status=failed] .dsh-hands-blockToolState,.dsh-hands-blockTool[data-status=error] .dsh-hands-blockToolState{color:var(--dsw-alias-state-error-primary)}
       .dsh-hands-blockText{white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
-      .dsh-hands-md{display:flex;flex-direction:column;gap:4px;min-width:0}
+      .dsh-hands-md{display:flex;flex-direction:column;gap:4px;min-width:0;max-width:100%}
+      .dsh-hands-mdGap{height:8px}
       .dsh-hands-mdLine{white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
-      .dsh-hands-mdHeading{font-weight:600;font-size:12.5px;line-height:18px}
+      .dsh-hands-mdHeading{font-weight:600;font-size:12.5px;line-height:18px;margin:0}
+      .dsh-hands-mdHeading[data-level="1"]{font-size:18px;line-height:24px}
+      .dsh-hands-mdHeading[data-level="2"]{font-size:16px;line-height:22px}
+      .dsh-hands-mdHeading[data-level="3"]{font-size:14px;line-height:20px}
       .dsh-hands-mdList{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:2px}
       .dsh-hands-mdQuote{margin:0;padding-left:8px;border-left:2px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary)}
-      .dsh-hands-mdCode{margin:4px 0;padding:8px 10px;border-radius:8px;background:color-mix(in srgb,var(--dsw-alias-label-primary) 8%,transparent);overflow:auto;max-height:40vh}
-      .dsh-hands-mdCode code{font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:11.5px;line-height:17px;white-space:pre}
+      .dsh-hands-mdCode{display:flex;flex-direction:column;min-width:0;max-width:100%;margin:4px 0;border-radius:8px;background:color-mix(in srgb,var(--dsw-alias-label-primary) 8%,transparent);overflow:hidden}
+      .dsh-hands-mdCodeHead{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 10px;border-bottom:.5px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary);font-size:10.5px;line-height:16px}
+      .dsh-hands-mdCopy{flex:none;padding:0;border:0;background:transparent;color:inherit;font:inherit;cursor:pointer}
+      .dsh-hands-mdCopy:hover{color:var(--dsw-alias-label-primary)}
+      .dsh-hands-mdCodeBody{min-width:0;max-width:100%;max-height:40vh;margin:0;padding:8px 10px;overflow:auto;overscroll-behavior:contain}
+      .dsh-hands-mdCodeBody code{font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:11.5px;line-height:17px;white-space:pre;word-break:normal;overflow-wrap:normal}
+      .dsh-hands-mdTableScroll{min-width:0;max-width:100%;margin:4px 0;overflow-x:auto;overscroll-behavior-x:contain}
+      .dsh-hands-mdTableScroll table{width:max-content;max-width:none;border-collapse:collapse;font-size:11.5px;line-height:17px}
+      .dsh-hands-mdTableScroll th,.dsh-hands-mdTableScroll td{padding:5px 9px;border-bottom:.5px solid var(--dsw-alias-border-l2);text-align:left;white-space:nowrap}
+      .dsh-hands-mdTableScroll th{font-weight:600;color:var(--dsw-alias-label-primary)}
       .dsh-hands-md code,.dsh-hands-v2-bubbleText code{font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:11.5px;background:color-mix(in srgb,var(--dsw-alias-label-primary) 10%,transparent);padding:1px 4px;border-radius:4px}
+      .dsh-hands-mdCodeBody code{background:none;padding:0;border-radius:0}
+      .dsh-hands-v2-bubble .md-code-block{min-width:0;max-width:100%}
+      .dsh-hands-v2-bubble .md-code-block:not([data-code-wrap="true"]) pre{white-space:pre;overflow-x:auto;word-break:normal;overflow-wrap:normal}
       .dsh-hands-v2-bubbleAgent .dsh-hands-stream{max-height:46vh;min-height:20px;overflow:auto;overscroll-behavior:contain}
       .dsh-hands-v2-bubbleAgent .dsh-hands-streamText{display:block;margin:0;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font:inherit;font-size:12px;line-height:19px;color:var(--dsw-alias-label-primary)}
       .dsh-hands-v2-waiting{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:19px}
@@ -1835,61 +1932,197 @@ window.__ModuleLoader__.load({
       return nodes;
     }
 
-    // 只覆盖聊天里真会出现的语法：围栏代码、标题、列表、引用、行内三种标记。
-    function MarkdownLite({ text, streaming }) {
+    function tableCells(line) {
+      let value = line.trim();
+      if (value.startsWith('|')) value = value.slice(1);
+      if (value.endsWith('|')) value = value.slice(0, -1);
+      return value.split('|').map((cell) => cell.trim());
+    }
+
+    function tableDelimiter(line) {
+      const cells = tableCells(line);
+      return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+    }
+
+    function tableAlignment(line) {
+      return tableCells(line).map((cell) => {
+        if (cell.startsWith(':') && cell.endsWith(':')) return 'center';
+        if (cell.endsWith(':')) return 'right';
+        return 'left';
+      });
+    }
+
+    // 围栏按行识别，流式输出遇到未闭合围栏时也把余下内容当代码渲染。
+    function markdownSegments(source) {
+      const lines = source.split('\n');
+      const segments = [];
+      let prose = [];
+      let fence = null;
+      const flushProse = () => {
+        if (!prose.length) return;
+        segments.push({ kind: 'prose', lines: prose });
+        prose = [];
+      };
+      for (const line of lines) {
+        if (!fence) {
+          const open = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+          if (open) {
+            flushProse();
+            fence = { marker: open[1][0], size: open[1].length, lang: open[2].trim(), code: [] };
+          } else {
+            prose.push(line);
+          }
+          continue;
+        }
+        const close = /^ {0,3}(`{3,}|~{3,})\s*$/.exec(line);
+        if (close && close[1][0] === fence.marker && close[1].length >= fence.size) {
+          segments.push({ kind: 'code', lang: fence.lang, code: fence.code.join('\n').replace(/\n$/, '') });
+          fence = null;
+        } else {
+          fence.code.push(line);
+        }
+      }
+      flushProse();
+      if (fence) segments.push({ kind: 'code', lang: fence.lang, code: fence.code.join('\n'), streaming: true });
+      return segments;
+    }
+
+    function MarkdownCode({ lang, code, streaming, labels }) {
+      const [copied, setCopied] = React.useState(false);
+      const timer = React.useRef(null);
+      React.useEffect(() => () => globalThis.clearTimeout(timer.current), []);
+      const copy = async () => {
+        try {
+          if (!globalThis.navigator?.clipboard?.writeText) return;
+          await globalThis.navigator.clipboard.writeText(code);
+          setCopied(true);
+          globalThis.clearTimeout(timer.current);
+          timer.current = globalThis.setTimeout(() => setCopied(false), 1000);
+        } catch {
+          // 浏览器拒绝剪贴板时保持原文案，下一次还能再试。
+        }
+      };
+      const copyLabel = copied ? labels.code.copiedLabel : labels.code.copyLabel;
+      return h(
+        'div',
+        { className: 'dsh-hands-mdCode', 'data-lang': lang || undefined, 'data-streaming': streaming ? 'true' : undefined },
+        h(
+          'div',
+          { className: 'dsh-hands-mdCodeHead' },
+          h('span', null, lang || labels.code.toolbarLabels.codeLabel),
+          h('button', { type: 'button', className: 'dsh-hands-mdCopy', onClick: copy, 'aria-label': copyLabel }, copyLabel),
+        ),
+        h('pre', { className: 'dsh-hands-mdCodeBody' }, h('code', null, code)),
+      );
+    }
+
+    // 只覆盖聊天里真会出现的语法；原生组件缺席时才走这里。
+    function MarkdownLite({ text, streaming, labels = MARKDOWN_LABELS.en }) {
       const source = String(text || '');
-      const chunks = source.split('```');
       const out = [];
-      chunks.forEach((chunk, index) => {
-        if (index % 2 === 1) {
-          // 围栏块：第一行可能是语言标记
-          const breakAt = chunk.indexOf('\n');
-          const lang = breakAt >= 0 ? chunk.slice(0, breakAt).trim() : '';
-          const code = breakAt >= 0 ? chunk.slice(breakAt + 1) : chunk;
-          out.push(
-            h(
-              'pre',
-              { key: `fence${index}`, className: 'dsh-hands-mdCode', 'data-lang': lang || undefined },
-              h('code', null, code.replace(/\n$/, '')),
-            ),
-          );
+      markdownSegments(source).forEach((segment, segmentIndex) => {
+        if (segment.kind === 'code') {
+          out.push(h(MarkdownCode, {
+            key: `fence${segmentIndex}`,
+            lang: segment.lang,
+            code: segment.code,
+            streaming: segment.streaming,
+            labels,
+          }));
           return;
         }
-        const lines = chunk.split('\n');
+        const lines = segment.lines;
         let list = null;
         const flushList = () => {
           if (!list) return;
-          out.push(h('ul', { key: `ul${out.length}`, className: 'dsh-hands-mdList' }, list));
+          out.push(h(list.type, {
+            key: `${list.type}${out.length}`,
+            className: 'dsh-hands-mdList',
+            start: list.type === 'ol' && list.start !== 1 ? list.start : undefined,
+          }, list.items));
           list = null;
         };
-        lines.forEach((line, lineIndex) => {
-          const key = `l${index}-${lineIndex}`;
+        for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+          const line = lines[lineIndex];
+          const key = `l${segmentIndex}-${lineIndex}`;
           const trimmed = line.trim();
           if (!trimmed) {
             flushList();
-            return;
+            out.push(h('div', { key, className: 'dsh-hands-mdGap', 'aria-hidden': true }));
+            continue;
           }
-          const heading = /^(#{1,4})\s+(.*)$/.exec(trimmed);
+          const heading = /^(#{1,6})\s+(.*)$/.exec(trimmed);
           if (heading) {
             flushList();
-            out.push(h('div', { key, className: 'dsh-hands-mdHeading', 'data-level': heading[1].length }, renderInline(heading[2], key)));
-            return;
+            out.push(h(`h${heading[1].length}`, { key, className: 'dsh-hands-mdHeading', 'data-level': heading[1].length }, renderInline(heading[2], key)));
+            continue;
           }
           const bullet = /^[-*+]\s+(.*)$/.exec(trimmed);
-          if (bullet) {
-            if (!list) list = [];
-            list.push(h('li', { key }, renderInline(bullet[1], key)));
-            return;
+          const ordered = /^(\d+)[.)]\s+(.*)$/.exec(trimmed);
+          if (bullet || ordered) {
+            const type = bullet ? 'ul' : 'ol';
+            const start = ordered ? Number(ordered[1]) : 1;
+            if (!list || list.type !== type) {
+              flushList();
+              list = { type, start, items: [] };
+            }
+            list.items.push(h('li', { key }, renderInline(bullet ? bullet[1] : ordered[2], key)));
+            continue;
           }
           const quote = /^>\s?(.*)$/.exec(trimmed);
           if (quote) {
             flushList();
-            out.push(h('blockquote', { key, className: 'dsh-hands-mdQuote' }, renderInline(quote[1], key)));
-            return;
+            const quoteLines = [];
+            while (lineIndex < lines.length) {
+              const next = /^>\s?(.*)$/.exec(lines[lineIndex].trim());
+              if (!next) break;
+              quoteLines.push(next[1]);
+              lineIndex += 1;
+            }
+            lineIndex -= 1;
+            out.push(h(
+              'blockquote',
+              { key, className: 'dsh-hands-mdQuote' },
+              quoteLines.map((value, index) => h('div', { key: `${key}q${index}` }, renderInline(value, `${key}q${index}`))),
+            ));
+            continue;
+          }
+          if (lineIndex + 1 < lines.length && line.includes('|') && tableDelimiter(lines[lineIndex + 1])) {
+            flushList();
+            const header = tableCells(line);
+            const align = tableAlignment(lines[lineIndex + 1]);
+            const rows = [];
+            lineIndex += 2;
+            while (lineIndex < lines.length && lines[lineIndex].trim() && lines[lineIndex].includes('|')) {
+              rows.push(tableCells(lines[lineIndex]));
+              lineIndex += 1;
+            }
+            lineIndex -= 1;
+            out.push(h(
+              'div',
+              { key, className: 'dsh-hands-mdTableScroll', tabIndex: 0 },
+              h(
+                'table',
+                null,
+                h('thead', null, h('tr', null, header.map((cell, index) => h(
+                  'th',
+                  { key: `${key}h${index}`, style: { textAlign: align[index] || 'left' } },
+                  renderInline(cell, `${key}h${index}`),
+                )))),
+                rows.length
+                  ? h('tbody', null, rows.map((row, rowIndex) => h('tr', { key: `${key}r${rowIndex}` }, row.map((cell, cellIndex) => h(
+                    'td',
+                    { key: `${key}r${rowIndex}c${cellIndex}`, style: { textAlign: align[cellIndex] || 'left' } },
+                    renderInline(cell, `${key}r${rowIndex}c${cellIndex}`),
+                  )))))
+                  : null,
+              ),
+            ));
+            continue;
           }
           flushList();
           out.push(h('div', { key, className: 'dsh-hands-mdLine' }, renderInline(line, key)));
-        });
+        }
         flushList();
       });
       return h(
@@ -1899,13 +2132,13 @@ window.__ModuleLoader__.load({
       );
     }
 
-    function MarkdownBlock(props) {
-      const text = String(props?.text || '');
-      const streaming = !!props?.streaming;
+    function MarkdownBlock({ text, streaming, t, labels }) {
+      const content = String(text || '');
+      const resolvedLabels = labels || markdownLabelsFor(t);
       if (MarkdownText) {
-        return h(MarkdownText, { text, streaming, variant: 'body' });
+        return h(MarkdownText, { text: content, streaming: !!streaming, labels: resolvedLabels, variant: 'body' });
       }
-      return h(MarkdownLite, { text, streaming });
+      return h(MarkdownLite, { text: content, streaming: !!streaming, labels: resolvedLabels });
     }
 
     // ── 单条输出：自己管滚动，贴底时自动跟随 ──────────────────────────────
@@ -1930,7 +2163,7 @@ window.__ModuleLoader__.load({
           ? h(
               React.Fragment,
               null,
-              MarkdownBlock ? h(MarkdownBlock, { text, streaming: !!running }) : h('pre', { className: 'dsh-hands-streamText' }, text),
+              MarkdownBlock ? h(MarkdownBlock, { text, streaming: !!running, t }) : h('pre', { className: 'dsh-hands-streamText' }, text),
               running ? h('span', { className: 'dsh-hands-cursor', 'aria-hidden': true }) : null,
             )
           : h('div', { className: 'dsh-hands-waiting' }, running ? t('waiting') : t('noOutput')),
@@ -1953,15 +2186,19 @@ window.__ModuleLoader__.load({
       const lastActive = React.useRef('');
 
       const rows = React.useMemo(() => {
-        const running = (state.running || []).map((entry) => ({
-          ...entry,
-          running: true,
-          status: 'RUNNING',
-        }));
+        const running = (state.running || []).map((entry) =>
+          isQueued(entry)
+            ? { ...entry, running: false }
+            : {
+                ...entry,
+                running: true,
+                status: 'RUNNING',
+              },
+        );
         return running.concat(state.entries || []);
       }, [state.running, state.entries]);
 
-      const runningCount = rows.filter((entry) => entry.running).length;
+      const runningCount = rows.filter((entry) => turnIsRunning(entry)).length;
       useTicker(runningCount > 0);
 
       // 运行中输出随时更新；收尾后 running 会消失，先把最后一份留在缓存里。
@@ -2008,35 +2245,39 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         if (!activeId) return;
         const row = rows.find((entry) => entry.id === activeId);
-        if (row && !row.running) requestDetail(row.id);
+        if (row && !turnIsRunning(row) && !isQueued(row)) requestDetail(row.id);
       }, [activeId, rows, requestDetail]);
 
       const toggle = (row) => {
         const next = effectiveOpenId === row.id ? '' : row.id;
         setOpenId(next);
-        if (next && !row.running) requestDetail(row.id);
+        if (next && !turnIsRunning(row) && !isQueued(row)) requestDetail(row.id);
       };
 
       function outputOf(row) {
-        return row.running
+        return turnIsRunning(row)
           ? row.output || ''
           : outputCache.current.get(row.id) || details[row.id] || row.output || row.excerpt || '';
       }
 
       function renderRow(row, index) {
         const tone = toneOf(row);
+        const running = turnIsRunning(row);
+        const queued = isQueued(row);
         const hand = String(row.hand || '').toLowerCase();
         const open = effectiveOpenId === row.id;
-        const elapsed = row.running
+        const elapsed = running
           ? Math.max(0, Date.now() - Date.parse(row.startedAt))
-          : row.ms;
+          : queued
+            ? 0
+            : row.ms;
         const prompt = row.prompt || t('noPrompt');
         const firstLine = prompt.split(/\r?\n/)[0].slice(0, 140);
         const output = outputOf(row);
         const detailBits = [];
         if (row.cwd) detailBits.push(row.cwd);
         if (row.model) detailBits.push(row.model);
-        if (!row.running && row.exitCode !== undefined && row.exitCode !== null) {
+        if (!running && row.exitCode !== undefined && row.exitCode !== null) {
           detailBits.push(`${t('exitCode')} ${row.exitCode}`);
         }
         return h(
@@ -2074,7 +2315,7 @@ window.__ModuleLoader__.load({
                 className: 'dsh-hands-status',
                 style: { '--tone-color': TONE_COLOR[tone] || TONE_COLOR.unknown },
               },
-              statusLabel(row, t),
+              statusLabelWithQueue(row, t),
             ),
             h('span', { className: 'dsh-hands-prompt' }, firstLine || t('noPrompt')),
             h(
@@ -2087,7 +2328,7 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { className: 'dsh-hands-jobMeta' },
-            h('span', null, `${t('session')} · ${row.session || t('noSession')}`),
+            h('span', null, `${t('session')} · ${row.session || row.name || sessionDisplayName(row) || t('noSession')}`),
             h('span', null, '·'),
             h('span', null, row.tool || hand || '—'),
             h('span', { className: 'dsh-hands-grow' }),
@@ -2112,10 +2353,10 @@ window.__ModuleLoader__.load({
                     style: { '--hand-color': HAND_COLOR[hand] || 'var(--dsw-alias-label-secondary)' },
                   },
                   h('div', { className: 'dsh-hands-bubbleLabel' }, handLabel(hand, t)),
-                  output || row.running || !row.error
-                    ? h(Stream, { key: row.id || `stream-${index}`, text: output, running: !!row.running, t })
+                  output || running || !row.error
+                    ? h(Stream, { key: row.id || `stream-${index}`, text: output, running, t })
                     : null,
-                  !row.running && row.error && !output
+                  !running && row.error && !output
                     ? h('div', { className: 'dsh-hands-error' }, row.error)
                     : null,
                   detailBits.length
@@ -2356,17 +2597,26 @@ window.__ModuleLoader__.load({
       return parts[parts.length - 1] || text;
     }
 
-    // 会话按工作目录分组：先找项目目录，再找会话（爸爸要的索引方式）。
-    // 纯函数、不碰 React，acp/test-session-groups.mjs 直接测。
+    // 会话按工作目录分组；目录未知时按所属手下分组。
+    // cwd 仍保持空串，不伪造路径，因此不会进入 open-folder 白名单。
     function groupSessionsByCwd(sessions) {
       const map = new Map();
       for (const row of Array.isArray(sessions) ? sessions : []) {
         if (!row) continue;
         const cwd = String(row.cwd || '').trim();
-        let group = map.get(cwd);
+        const hand = String(row.hand || String(row.key || '').split('/')[0] || '').trim();
+        const key = cwd ? `cwd:${cwd}` : `hand:${hand || 'unknown'}`;
+        let group = map.get(key);
         if (!group) {
-          group = { cwd, label: cwd ? lastPathPart(cwd) : '', sessions: [], latestAt: '' };
-          map.set(cwd, group);
+          group = {
+            key,
+            cwd,
+            hand,
+            label: cwd ? lastPathPart(cwd) : hand || '未知手下',
+            sessions: [],
+            latestAt: '',
+          };
+          map.set(key, group);
         }
         group.sessions.push(row);
         const at = String(row.lastAt || row.startedAt || '');
@@ -2395,7 +2645,8 @@ window.__ModuleLoader__.load({
           slice.agents.map((agent) => {
             const hand = String(agent.hand || '');
             const running = Number(agent.running) || 0;
-            const tone = running > 0 ? 'running' : toneOf(agent);
+            const queued = Number(agent.queued) || 0;
+            const tone = running > 0 ? 'running' : queued > 0 ? 'queued' : toneOf(agent);
             return h(
               'button',
               {
@@ -2510,7 +2761,7 @@ window.__ModuleLoader__.load({
               'div',
               { className: 'dsh-hands-v2-list' },
               groups.map((group) => {
-                const folderKey = group.cwd || '__none__';
+                const folderKey = group.key;
                 const anyRunning = group.sessions.some((row) => toneOf(row) === 'running');
                 // 有活儿的文件夹永远展开：跑着的东西藏在折叠里等于没有
                 const isCollapsed = !anyRunning && collapsed[folderKey] === true;
@@ -2528,7 +2779,7 @@ window.__ModuleLoader__.load({
                       {
                         type: 'button',
                         className: 'dsh-hands-v2-folderToggle',
-                        title: group.cwd || undefined,
+                        title: group.cwd || group.label,
                         onClick: () =>
                           setCollapsed((prev) => ({ ...prev, [folderKey]: prev[folderKey] !== true })),
                       },
@@ -2536,7 +2787,7 @@ window.__ModuleLoader__.load({
                       h(
                         'span',
                         { className: 'dsh-hands-v2-folderName' },
-                        group.cwd || t('v2NoFolder') || '未分组',
+                        group.cwd || group.label,
                       ),
                       h('span', {
                         className: 'dsh-hands-v2-dot',
@@ -2609,7 +2860,7 @@ window.__ModuleLoader__.load({
                         h(
                           'span',
                           { className: 'dsh-hands-v2-rowTop' },
-                          h('span', { className: 'dsh-hands-v2-rowName' }, row.name || t('noSession')),
+                          h('span', { className: 'dsh-hands-v2-rowName' }, sessionDisplayName(row)),
                           h(
                             'span',
                             { className: 'dsh-hands-v2-rowTurns' },
@@ -2689,6 +2940,7 @@ window.__ModuleLoader__.load({
             { className: 'dsh-hands-v2-bubbleText' },
             h(MarkdownBlock, {
               text: canExpand && !expanded ? `${full.slice(0, PROMPT_LIMIT)}…` : full,
+              t,
             }),
           ),
           canExpand
@@ -2766,6 +3018,7 @@ window.__ModuleLoader__.load({
             h(MarkdownBlock, {
               text: String(block.text || ''),
               streaming: !!running && index === blocks.length - 1,
+              t,
             }),
           );
         }),
@@ -2836,14 +3089,15 @@ window.__ModuleLoader__.load({
       // store 把 /turn 的增量按绝对偏移拼进了 liveByTurn，所以第三档留空；
       // resolveTurnBody 仍保留 fetched 档，给单独缓存的调用方和测试用。
       const view = resolveTurnBody(turn, liveText, '');
+      const queued = isQueued(turn);
       const needBody = React.useCallback(() => {
         if (id) store.ensureTurnBody(id, true);
       }, [store, id]);
       React.useEffect(() => {
-        if (!id || liveText) return;
+        if (!id || queued || liveText) return;
         if (!autoBody && !active) return;
         store.ensureTurnBody(id);
-      }, [store, id, liveText, autoBody, active]);
+      }, [store, id, liveText, autoBody, active, queued]);
       const tone = toneOf(turn);
       const parts = formatTurnMeta(turn, t);
       return h(
@@ -3000,13 +3254,17 @@ window.__ModuleLoader__.load({
     }
 
     function ThreadHead(props) {
-      const { t, mode, onBack, row, fallbackName, turns, activeTurn, action, onCancel, onRerun, usage } =
+      const { t, mode, onBack, row, turns, activeTurn, action, onCancel, onRerun, usage } =
         props;
       const tone = toneOf(activeTurn || row || {});
       const running = turnIsRunning(activeTurn);
+      const queued = isQueued(activeTurn);
       const finished = !!activeTurn && !running;
       const busy = !!action?.pending;
       const chips = [];
+      if (queued) {
+        chips.push({ key: 'queued', text: statusLabelWithQueue(activeTurn, t) });
+      }
       if (row?.cwd) {
         chips.push({ key: 'cwd', text: lastPathPart(row.cwd), title: String(row.cwd) });
       }
@@ -3050,7 +3308,7 @@ window.__ModuleLoader__.load({
             h(
               'div',
               { className: 'dsh-hands-v2-threadName' },
-              row?.name || fallbackName || t('v2PickSession'),
+              row ? row.name || sessionDisplayName(row) : t('v2PickSession'),
             ),
           ),
           running
@@ -3065,7 +3323,20 @@ window.__ModuleLoader__.load({
                 },
                 t('v2Stop'),
               )
-            : null,
+            : queued
+              ? h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'dsh-hands-v2-btn',
+                    title: t('v2Cancel'),
+                    'aria-label': t('v2Cancel'),
+                    disabled: busy,
+                    onClick: onCancel,
+                  },
+                  t('v2Cancel'),
+                )
+              : null,
         ),
         h(
           'div',
@@ -3130,7 +3401,6 @@ window.__ModuleLoader__.load({
           mode,
           onBack,
           row,
-          fallbackName: sel.key,
           turns,
           activeTurn,
           action,
@@ -3159,6 +3429,19 @@ window.__ModuleLoader__.load({
           selectedTurnId: sel.turnId,
         }),
       );
+    }
+
+    // 纯汇总给状态条和测试共用：不去重时 live/persisted 会把同一票算两次。
+    function asyncBarState(snap) {
+      const live = Array.isArray(snap?.live) ? snap.live : [];
+      const persisted = Array.isArray(snap?.persisted) ? snap.persisted : [];
+      const rows = [...live, ...persisted]
+        .filter((job, index, list) => job && job.id && list.findIndex((item) => item && item.id === job.id) === index)
+        .slice(0, 20);
+      const running = rows.filter((job) => turnIsRunning(job)).length;
+      const queued = rows.filter((job) => isQueued(job)).length;
+      const failed = rows.filter((job) => job.delivery === 'failed').length;
+      return { rows, running, queued, failed, visible: !!(running || queued || failed) };
     }
 
     // 异步任务状态条：独立轮询 /dsh-hands/async，不往 store 里塞东西。
@@ -3192,15 +3475,9 @@ window.__ModuleLoader__.load({
       }, [reload]);
 
       if (!snap) return null;
-      const live = Array.isArray(snap.live) ? snap.live : [];
-      const persisted = Array.isArray(snap.persisted) ? snap.persisted : [];
-      const running = live.filter((job) => job && job.status === 'RUNNING').length;
-      const failed = persisted.filter((job) => job && job.delivery === 'failed').length;
-      const rows = [...live, ...persisted]
-        .filter((job, index, list) => job && job.id && list.findIndex((item) => item && item.id === job.id) === index)
-        .slice(0, 20);
-      // 没有在跑、也没有失败的记录时，整条不渲染
-      if (!running && !failed) return null;
+      const { rows, running, queued, failed, visible } = asyncBarState(snap);
+      // 排队也占着状态条：只有纯空闲才收起。
+      if (!visible) return null;
       const cancelJob = async (id) => {
         try {
           await fetch(endpointOf('dsh-hands/cancel'), {
@@ -3216,6 +3493,7 @@ window.__ModuleLoader__.load({
       };
       const bits = [];
       if (running) bits.push(`${running} ${t('asyncRunning')}`);
+      if (queued) bits.push(`${queued} ${t('asyncQueued')}`);
       if (failed) bits.push(`${failed} ${t('asyncFailed')}`);
       return h(
         'div',
@@ -3236,16 +3514,24 @@ window.__ModuleLoader__.load({
               'div',
               { className: 'dsh-hands-asynclist' },
               rows.length
-                ? rows.map((job) =>
-                    h(
+                ? rows.map((job) => {
+                    const jobQueued = isQueued(job);
+                    const jobRunning = turnIsRunning(job);
+                    return h(
                       'div',
                       {
                         key: String(job.id),
                         className: 'dsh-hands-asyncrow',
-                        'data-status': String(job.status || '').toLowerCase(),
+                        'data-status': jobQueued
+                          ? 'queued'
+                          : String(job.status || '').toLowerCase(),
                       },
                       h('span', { className: 'dsh-hands-asyncrowHand' }, job.hand || '—'),
-                      h('span', { className: 'dsh-hands-asyncrowStatus' }, String(job.status || '')),
+                      h(
+                        'span',
+                        { className: 'dsh-hands-asyncrowStatus' },
+                        statusLabelWithQueue(job, t),
+                      ),
                       h(
                         'span',
                         { className: 'dsh-hands-asyncrowDelivery' },
@@ -3254,7 +3540,7 @@ window.__ModuleLoader__.load({
                         }`,
                       ),
                       h('span', { className: 'dsh-hands-asyncrowId', title: String(job.id) }, String(job.id)),
-                      String(job.status || '').toUpperCase() === 'RUNNING'
+                      jobRunning || jobQueued
                         ? h(
                             'button',
                             {
@@ -3271,8 +3557,8 @@ window.__ModuleLoader__.load({
                       job.deliveryError
                         ? h('span', { className: 'dsh-hands-asyncrowError' }, String(job.deliveryError))
                         : null,
-                    ),
-                  )
+                    );
+                  })
                 : h('div', { className: 'dsh-hands-asyncrow' }, t('asyncEmpty')),
             )
           : null,
@@ -3619,6 +3905,13 @@ window.__ModuleLoader__.load({
       inject: ['slots', 'locale'],
       apply,
       createHandsStore,
+      isQueued,
+      queuePositionOf,
+      toneOf,
+      statusLabel,
+      statusLabelWithQueue,
+      turnIsRunning,
+      asyncBarState,
       resolveTurnBody,
       formatTurnMeta,
       formatTokens,
@@ -3630,6 +3923,7 @@ window.__ModuleLoader__.load({
       HandsPage,
       HandsNavIcon,
       groupSessionsByCwd,
+      sessionDisplayName,
       HandIcon,
       HAND_ICON_PATHS,
       HAND_BRAND_PATHS,

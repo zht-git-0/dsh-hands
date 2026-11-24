@@ -44,6 +44,8 @@ plugin_manager install_bundle  target=<repo>
         acpHands: []             # 例如 ['opencode']：该家改走 ACP（失败自动回退 CLI）
         acpPersist: false        # true = 同一 hand+cwd+会话 id 复用常驻 ACP 进程（默认关）
         acpIdleMs: 600000        # 常驻会话闲置多久回收
+        maxAsync: 3             # 全局同时最多跑几个异步任务（1–16）
+        maxSessionQueue: 3      # 每个目标会话最多再排几个（1–16）
         permissionTimeoutMs: 60000  # ACP 要写文件时，面板授权弹窗等多久（超时按拒绝）
         # 自动探测不到时再显式写：agyBin / codexBin / claudeBin / opencodeBin
 ```
@@ -189,8 +191,9 @@ node acp/test-cancel.mjs        # 进程树击杀
 
 ## 异步派活（`async: true`）
 
-四个手下工具都能异步：传 `async: true` 就**立刻**返回 `{status:'RUNNING', jobId, sessionId}`，
+四个手下工具都能异步：传 `async: true` 就**立刻**返回 `{status:'RUNNING'|'QUEUED', jobId, sessionId, queuePosition}`，
 这一轮不用等；它跑完由插件把结果投回调用方会话（`agent.followup`，`source.kind = 'plugin:hands'`）。
+同一目标会话已有任务在跑时，新任务如实返回 `QUEUED` 和「前面还有 N 个」，不会假装开跑。
 
 ```
 我派活 ──▶ 立刻拿到 jobId ──▶ 我继续干别的
@@ -213,16 +216,24 @@ node acp/test-cancel.mjs        # 进程树击杀
 - **落盘**：`~/.dsh/hands-async.json` 记每个 job 的状态和正文。
 - **不重投**：`delivery === 'sent'` 的直接跳过 —— 一次派活只有一条回传。
 - **不丢**：DSH 重启后 4 秒对账一次：没跑完的标 `ORPHAN`（进程已经没了），
-  跑完但没投出去的**继续补投**。
+  跑完但没投出去的**继续补投**。从未启动的 `QUEUED` 任务不自动重放（执行参数闭包无法安全恢复），
+  统一标 `CANCELLED` / `delivery: skipped`，并在日志写明「排队任务未启动，已安全丢弃」。
+  仍存活的恢复进程会继续占住目标会话锁，直到 pid 退出。
 - **投不进去会重试**：父会话正忙 / agent 句柄瞬时拿不到时，回传按 **30s → 90s → 240s**
   退避重试 3 次（`delivery: 'retrying'`，带 `deliveryAttempts` / `nextRetryAt`），
   用完仍失败才记 `failed`。重试定时器跟着插件走，卸载时清掉；重启后由对账逻辑接手。
 - **拿不到会话就拒绝**：`exec.agent` 里取不到 session id 时，回传会标 `no-agent` 而不是猜一个会话投进去。
-- **并发闸门**：同时最多跑 3 个（`config.maxAsync` 可调，1–16），多的先进先出排队。
-  进程是**排队之后才起**的，不是起了再挂起。同步调用不受限（调用方自己愿意等）。
-  派活返回值里带 `queue: {limit, active, waiting}`。
+- **目标会话串行化**：异步任务按 `hand + conversationId` 加锁；新会话还没有 id 时按
+  `hand + session 名 + 规范化 cwd` 排队，拿到 id 后合并到同一把锁。不同会话互不影响。
+- **会话排队上限**：每个目标会话最多再排 3 个（`config.maxSessionQueue` 可调，1–16），
+  第 4 个直接驳回：「该会话已有任务在跑，且排队已满」。`queuePosition` 是 1-based 的「前面还有几个」。
+- **全局并发闸门**：同时最多跑 3 个（`config.maxAsync` 可调，1–16），跨会话 FIFO。
+  进程是**排队之后才起**的，不是起了再挂起。同步调用不进入这个异步队列：它本身会阻塞当前调用到结束，
+  由调用方自己等待，不会在后台偷偷并发。派活返回值里带全局 `queue` 和会话队列水位。
 - **观测口**：`GET /dsh-hands/async?n=50` 一次看到在跑的（`live`）和落盘的（`persisted`），
-  每条带 `delivery` / `deliveryError` / `deliveredAt` / `deliveryAttempts` / `nextRetryAt`。
+  每条带 `status`（含 `QUEUED`）/ `queuePosition` / `queueLimit` / `sessionLockKey` /
+  `delivery` / `deliveryError` / `deliveredAt` / `deliveryAttempts` / `nextRetryAt`。
+  `/dsh-hands/log` 也单独返回 `queued`，历史轮次保留 QUEUED，不会混进 `running`。
 - **等某一个**：`hands_wait({jobId, timeoutMs})` 轮询落盘状态直到结束，返回 `status / ms / delivery / excerpt`；
   超时返回 `finished:false`（默认 10 分钟，最长 30 分钟）。只在确实要等它才用，不然后台回传就够了。
 - **取消**：`POST /dsh-hands/cancel {id}` 先查正在跑的进程（`taskkill /T`），再查排队队列；

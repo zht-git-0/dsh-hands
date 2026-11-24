@@ -61,6 +61,8 @@ async function call(path) {
   assert.ok(Array.isArray(r.json.live), 'live 是数组')
   assert.ok(Array.isArray(r.json.persisted), 'persisted 是数组')
   assert.ok(r.json.counts && typeof r.json.counts.live === 'number', 'counts 里有 live')
+  assert.equal(r.json.queue.session.limit, 3, '会话队列默认上限 3')
+  assert.equal(typeof r.json.queue.session.waiting, 'number', '会话队列等待数')
   console.log('1) /dsh-hands/async 结构 ok')
 }
 

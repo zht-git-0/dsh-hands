@@ -33,10 +33,11 @@ const mod = def.factory((name) => {
   if (name === 'react') return ReactStub
   throw new Error(`unexpected require: ${name}`)
 })
-const { groupSessionsByCwd } = mod
+const { groupSessionsByCwd, sessionDisplayName } = mod
 assert.equal(typeof groupSessionsByCwd, 'function', '导出 groupSessionsByCwd')
+assert.equal(typeof sessionDisplayName, 'function', '导出 sessionDisplayName')
 
-const row = (key, cwd, lastAt, extra = {}) => ({ key, cwd, lastAt, name: key, turns: 1, ...extra })
+const row = (key, cwd, lastAt, extra = {}) => ({ key, hand: 'opencode', cwd, lastAt, name: key, turns: 1, ...extra })
 
 // ── 1) 按 cwd 分组，组内/组间都按最近时间倒序 ──────────────────────────────
 {
@@ -54,19 +55,38 @@ const row = (key, cwd, lastAt, extra = {}) => ({ key, cwd, lastAt, name: key, tu
   console.log('1) 分组与排序 ok')
 }
 
-// ── 2) 空 cwd 单独归组，label 为空（UI 显示「未分组」）──────────────────────
+// ── 2) 空 cwd 按 hand 分组，不出现「未分组」──────────────────────────────────
 {
   const groups = groupSessionsByCwd([
     row('x', '', '2026-11-19T10:00:00Z'),
     row('y', '   ', '2026-11-19T09:00:00Z'),
     row('z', 'D:\\p\\one', '2026-11-19T08:00:00Z'),
+    row('claude-unknown', '', '2026-11-19T07:00:00Z', { hand: 'claude' }),
   ])
-  assert.equal(groups.length, 2)
-  const empty = groups.find((g) => g.cwd === '')
-  assert.ok(empty, '空 cwd 归到一组')
-  assert.equal(empty.label, '')
-  assert.equal(empty.sessions.length, 2, '空白 cwd 也并进未分组')
-  console.log('2) 未分组 ok')
+  assert.equal(groups.length, 3, '两个未知目录 hand + 一个真实目录')
+  const empty = groups.find((g) => g.cwd === '' && g.hand === 'opencode')
+  assert.ok(empty, 'opencode 的空 cwd 归到自己的组')
+  assert.equal(empty.label, 'opencode')
+  assert.equal(empty.sessions.length, 2, '同 hand 的空白 cwd 合并')
+  assert.equal(groups.find((g) => g.hand === 'claude')?.label, 'claude')
+  assert.ok(groups.every((g) => g.label && g.label !== '未分组'), '不显示未分组')
+  assert.ok(groups.every((g) => g.cwd !== 'opencode' && g.cwd !== 'claude'), '不伪造 cwd')
+  console.log('2) 空 cwd 按 hand 分组 ok')
+}
+
+// ── 5) 没名字时显示 sid 短码，不显示内部 key ────────────────────────────────
+{
+  assert.equal(
+    sessionDisplayName({ name: '', conversationId: 'ses_df8dbfeb4ffeLPsZ206DNMkk6b' }),
+    '未命名会话（ses_df8d）',
+  )
+  assert.equal(
+    sessionDisplayName({ key: 'opencode/sid:ses_unknown1234567890' }),
+    '未命名会话（ses_unkn）',
+  )
+  assert.equal(sessionDisplayName({ key: 'opencode/临时-2026-11-25' }), '未命名会话')
+  assert.equal(sessionDisplayName({ name: '真实会话' }), '真实会话')
+  console.log('5) 会话标题兜底 ok')
 }
 
 // ── 3) 边界：空数组、坏行、没有时间戳 ──────────────────────────────────────

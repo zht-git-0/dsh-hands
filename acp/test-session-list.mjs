@@ -2,7 +2,14 @@
 // 复现「ai-game 开发」两行：取消轮没写 conversationId，先按 hand/name 建行；
 // 索引随后带来真实 sid，又建了一行。upsertSessionIndexRow 应把别名行并进 sid 行。
 import assert from 'node:assert/strict'
-import { mergeSessionRows, upsertSessionIndexRow } from '../index.js'
+import {
+  fallbackSessionName,
+  mergeSessionRows,
+  recoverSessionMetadata,
+  sessionMetadataFromIndex,
+  turnKeyOf,
+  upsertSessionIndexRow,
+} from '../index.js'
 
 function row(key, hand, name, extra = {}) {
   return {
@@ -113,6 +120,73 @@ function row(key, hand, name, extra = {}) {
   assert.equal(a.turns, 3)
   assert.equal(a.status, 'OK')
   console.log('3) 不同 cwd 不误合并 ok')
+}
+
+// ── 4) 缺 name/cwd 的日志按目标 sid 回查索引，并并回同一行 ────────────────
+{
+  const sid = 'ses_df8dbfeb4ffeLPsZ206DNMkk6b'
+  const rows = new Map()
+  rows.set(
+    `opencode/sid:${sid}`,
+    row(`opencode/sid:${sid}`, 'opencode', '', {
+      conversationId: sid,
+      turns: 1,
+      today: 1,
+      status: 'RUNNING',
+      running: true,
+      notStarted: false,
+      sessionKey: 'opencode/临时-2026-11-25',
+      startedAt: '2026-11-25T10:00:00.000Z',
+      lastAt: '2026-11-25T10:00:00.000Z',
+    }),
+  )
+  const indexes = {
+    opencode: {
+      'dsh-hands 优化': { id: sid, cwd: 'D:\\Program\\projects\\dsh-hands', updated: '2026-11-25T10:00:01.000Z' },
+    },
+  }
+  const recovered = recoverSessionMetadata(rows.get(`opencode/sid:${sid}`), indexes)
+  assert.equal(recovered.name, 'dsh-hands 优化')
+  assert.equal(recovered.cwd, 'D:\\Program\\projects\\dsh-hands')
+  assert.equal(recovered.sessionKey, 'opencode/dsh-hands 优化')
+  assert.equal(turnKeyOf(recovered), `opencode/sid:${sid}`)
+
+  upsertSessionIndexRow(rows, 'opencode', 'dsh-hands 优化', indexes.opencode['dsh-hands 优化'])
+  assert.equal(rows.size, 1, '恢复轮与索引行合并成一行')
+  const merged = rows.get(`opencode/sid:${sid}`)
+  assert.equal(merged.turns, 1)
+  assert.equal(merged.name, 'dsh-hands 优化')
+  assert.equal(merged.cwd, 'D:\\Program\\projects\\dsh-hands')
+  assert.equal(merged.status, 'RUNNING')
+  console.log('4) 缺 name/cwd 按 sid 回填并合并 ok')
+}
+
+// ── 5) 未知 sid：保留 hand，用 sid 前 8 位兜底，不造临时 key ────────────────
+{
+  const sid = 'ses_unknown1234567890'
+  const recovered = recoverSessionMetadata(
+    { hand: 'opencode', id: 'dispatch-1', conversationId: sid, session: '', cwd: '', sessionKey: 'opencode/临时-2026-11-25' },
+    { opencode: {} },
+  )
+  assert.equal(recovered.name, '未命名会话（ses_unkn）')
+  assert.equal(recovered.cwd, '')
+  assert.equal(recovered.hand, 'opencode')
+  assert.equal(recovered.sessionKey, 'opencode/未命名会话（ses_unkn）')
+  assert.equal(turnKeyOf(recovered), `opencode/sid:${sid}`)
+  assert.equal(fallbackSessionName(sid), '未命名会话（ses_unkn）')
+  console.log('5) 未知 sid 兜底 ok')
+}
+
+// ── 6) 调用方 sessionId 不能当手下 sid 反查 ────────────────────────────────
+{
+  const caller = 'session-4a39fd61-4f5b-4616-b306-908654c788b2'
+  const indexes = { opencode: { caller: { id: caller, cwd: 'D:/wrong' } } }
+  assert.equal(sessionMetadataFromIndex(indexes.opencode, caller).name, 'caller')
+  const recovered = recoverSessionMetadata({ hand: 'opencode', id: 'dispatch-2', sessionId: caller }, indexes)
+  assert.equal(recovered.conversationId, undefined)
+  assert.equal(recovered.name, '未命名会话（dispatch）')
+  assert.equal(recovered.cwd, '')
+  console.log('6) caller sessionId 与目标 sid 隔离 ok')
 }
 
 console.log('session list ok')
