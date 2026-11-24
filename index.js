@@ -3813,13 +3813,14 @@ export function apply(ctx, config = {}) {
                       : from === 0
                         ? deriveBlocksFromText(text)
                         : undefined
+                  const blocksDerived = from === 0 && !(Array.isArray(entry.blocks) && entry.blocks.length)
                   return send(200, {
                     id,
                     from,
                     next,
                     eof: next >= text.length,
                     delta,
-                    ...(blocks ? { blocks } : {}),
+                    ...(blocks ? { blocks, blocksDerived } : {}),
                   })
                 }
                 return send(200, { turn: entry })

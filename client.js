@@ -117,6 +117,8 @@ window.__ModuleLoader__.load({
       v2LoadFull: 'Load full text',
       v2LoadOlder: 'Load older turns',
       v2Tokens: 'tokens',
+      blocksFallback: 'Fallback view',
+      blocksFallbackHint: 'Structured blocks are unavailable; showing a text-parsed compatibility view.',
       handAgy: 'agy · copy',
       handCodex: 'codex · planning',
       handClaude: 'claude · architecture',
@@ -213,6 +215,8 @@ window.__ModuleLoader__.load({
       v2LoadFull: '加载全文',
       v2LoadOlder: '加载更早',
       v2Tokens: 'tokens',
+      blocksFallback: '兼容视图',
+      blocksFallbackHint: '结构化 blocks 缺失，当前显示按文本解析的兼容视图。',
       handAgy: 'agy · 文案',
       handCodex: 'codex · 规划',
       handClaude: 'claude · 架构',
@@ -535,6 +539,78 @@ window.__ModuleLoader__.load({
       return rows.length ? String(rows[0]?.id || '') : '';
     }
 
+    // 与服务端 index.js:deriveBlocksFromText 保持同一套工具行规则。
+    // 仅用于结构化 blocks 缺失时的最后兜底，避免把尾部截断的原文当普通段落从头渲染。
+    function deriveBlocksFromText(text) {
+      const blocks = [];
+      let buf = '';
+      const flushText = () => {
+        const value = String(buf || '').trim();
+        if (value) blocks.push({ kind: 'text', text: value });
+        buf = '';
+      };
+      const pushTool = (name, detail = '', status = '') => {
+        flushText();
+        blocks.push({
+          kind: 'tool',
+          name: String(name || 'tool').trim().slice(0, 80) || 'tool',
+          detail: String(detail || '').trim().slice(0, 200),
+          status,
+        });
+      };
+      for (const rawLine of String(text || '').split(/\r?\n/)) {
+        const line = String(rawLine || '');
+        if (line.startsWith('→ ')) {
+          const value = line.slice(2);
+          const cut = value.indexOf(': ');
+          pushTool(cut > 0 ? value.slice(0, cut) : value, cut > 0 ? value.slice(cut + 2) : '');
+          continue;
+        }
+        if (line.startsWith('[tool] ')) {
+          pushTool(line.slice('[tool] '.length).trim());
+          continue;
+        }
+        if (line.startsWith('$ ') || line.startsWith('✎ ')) {
+          pushTool(line.slice(2).trim());
+          continue;
+        }
+        if (line.startsWith('! ')) {
+          pushTool(line.slice(2).trim(), '', 'error');
+          continue;
+        }
+        if (line.trim()) buf += (buf ? '\n' : '') + line;
+      }
+      flushText();
+      return blocks.slice(-80);
+    }
+
+    // 列表刷新只更新列表字段；blocks / 已取正文 / localApplied 等本地富数据按 id 保留。
+    // blockCache 让「这一页暂时没返回某轮」或切会话后再回来也不会丢结构数据。
+    function mergeTurnsById(existing, incoming, blockCache) {
+      const before = new Map();
+      for (const row of Array.isArray(existing) ? existing : []) {
+        const id = String(row?.id || '');
+        if (id) before.set(id, row);
+      }
+      return (Array.isArray(incoming) ? incoming : []).map((row) => {
+        const id = String(row?.id || '');
+        const previous = id ? before.get(id) : null;
+        const merged = { ...(previous || {}), ...(row || {}) };
+        for (const [field, value] of Object.entries(previous || {})) {
+          if (merged[field] === undefined) merged[field] = value;
+        }
+        const cached = id && blockCache ? blockCache.get(id) : null;
+        if (!Array.isArray(merged.blocks) && Array.isArray(previous?.blocks)) merged.blocks = previous.blocks;
+        if (!Array.isArray(merged.blocks) && Array.isArray(cached?.blocks)) merged.blocks = cached.blocks;
+        if (merged.blocksDerived == null && previous?.blocksDerived !== undefined) merged.blocksDerived = previous.blocksDerived;
+        if (merged.blocksDerived === undefined && cached) merged.blocksDerived = cached.blocksDerived;
+        if (id && blockCache && Array.isArray(merged.blocks)) {
+          blockCache.set(id, { blocks: merged.blocks, blocksDerived: !!merged.blocksDerived });
+        }
+        return merged;
+      });
+    }
+
     // v2 的唯一状态源。SSE 优先，4s 无首包退轮询；轮询期间继续每隔一会儿试 SSE。
     // options 只给测试注入（fetch / storage / EventSource / now），生产不传。
     function createHandsStore(options = {}) {
@@ -571,6 +647,8 @@ window.__ModuleLoader__.load({
       const sliceCache = new Map();
       // id → 已经拼进 liveByTurn 的绝对字符数，用来丢掉重复的 live 帧
       const liveApplied = new Map();
+      // id → 结构化 blocks；独立于轮次列表，SSE/refresh/切会话都不会抹掉。
+      const turnBlocksById = new Map();
       const sessionSeq = new Map();
       const turnSeq = new Map();
       // key → 还有没有更早的一页；bodyDone 保证同一轮正文只拉一次。
@@ -819,7 +897,7 @@ window.__ModuleLoader__.load({
           );
           if (life !== lifeToken) return [];
           if (turnSeq.get(wanted) !== seq) return [];
-          const turns = Array.isArray(data?.turns) ? data.turns : [];
+          const turns = mergeTurnsById(state.turnsByKey[wanted] || [], Array.isArray(data?.turns) ? data.turns : [], turnBlocksById);
           turnsMore.set(wanted, turns.length >= TURN_PAGE);
           emit({
             turnsByKey: { ...state.turnsByKey, [wanted]: turns },
@@ -896,7 +974,13 @@ window.__ModuleLoader__.load({
           );
           if (life !== lifeToken) return null;
           applyDelta(data?.id || wanted, data?.delta, data?.next, data?.from);
-          if (Array.isArray(data?.blocks)) applyBlocksToTurn(data.id || wanted, data.blocks);
+          if (Array.isArray(data?.blocks)) {
+            applyBlocksToTurn(data.id || wanted, data.blocks, !!data.blocksDerived);
+          } else if (offset === 0) {
+            // 老服务端没带 blocks 时，前端用同一套规则再兜一次；仍不直接渲染截断原文。
+            const derived = deriveBlocksFromText(state.liveByTurn[data?.id || wanted] || '');
+            if (derived.length) applyBlocksToTurn(data.id || wanted, derived, true);
+          }
           return data;
         } catch (error) {
           if (life !== lifeToken) return null;
@@ -924,12 +1008,10 @@ window.__ModuleLoader__.load({
           if (olderSeq.get(wanted) !== seq) return [];
           const incoming = Array.isArray(data?.turns) ? data.turns : [];
           const existing = state.turnsByKey[wanted] || [];
-          const seen = new Set(existing.map((row) => String(row?.id || '')).filter(Boolean));
-          const extra = incoming.filter((row) => {
-            const id = String(row?.id || '');
-            return !id || !seen.has(id);
-          });
-          const merged = existing.concat(extra).sort((a, b) => String(b.startedAt || '').localeCompare(String(a.startedAt || '')));
+          const incomingIds = new Set(incoming.map((row) => String(row?.id || '')).filter(Boolean));
+          const older = existing.filter((row) => !incomingIds.has(String(row?.id || '')));
+          const merged = mergeTurnsById(older, incoming, turnBlocksById)
+            .sort((a, b) => String(b.startedAt || '').localeCompare(String(a.startedAt || '')));
           turnsMore.set(wanted, incoming.length >= TURN_PAGE);
           emit({ turnsByKey: { ...state.turnsByKey, [wanted]: merged }, error: null });
           return merged;
@@ -1273,9 +1355,10 @@ window.__ModuleLoader__.load({
         if (!data || !Array.isArray(data.turns)) return;
         const key = String(data.key || state.selection.key);
         if (!key) return;
-        emit({ turnsByKey: { ...state.turnsByKey, [key]: data.turns } });
+        const turns = mergeTurnsById(state.turnsByKey[key] || [], data.turns, turnBlocksById);
+        emit({ turnsByKey: { ...state.turnsByKey, [key]: turns } });
         if (state.selection.key === key) {
-          const nextTurn = resolveTurnId(data.turns, state.selection.turnId);
+          const nextTurn = resolveTurnId(turns, state.selection.turnId);
           if (nextTurn !== state.selection.turnId) {
             emit({ selection: { ...state.selection, turnId: nextTurn } });
             writeSavedSelection();
@@ -1283,18 +1366,26 @@ window.__ModuleLoader__.load({
         }
       }
 
-      // 把语义分块挂到轮次对象上：气泡据此把思维链/正文/工具分开渲染。
-      // 只改那一轮，不动别的列；服务端没给 blocks 时保持原样（老轮次继续按文本渲染）。
-      function applyBlocksToTurn(id, blocks) {
+      // 把语义分块按 id 缓存，并挂到所有已加载列表里的同一轮；切走后再回来也能恢复。
+      function applyBlocksToTurn(id, blocks, blocksDerived = false) {
         const turnId = String(id || '');
-        const key = String(state.selection.key || '');
-        if (!turnId || !key || !Array.isArray(blocks)) return;
-        const rows = state.turnsByKey[key] || [];
-        const index = rows.findIndex((row) => String(row?.id || '') === turnId);
-        if (index < 0) return;
-        const next = rows.slice();
-        next[index] = { ...next[index], blocks };
-        emit({ turnsByKey: { ...state.turnsByKey, [key]: next } });
+        if (!turnId || !Array.isArray(blocks)) return;
+        turnBlocksById.set(turnId, { blocks, blocksDerived: !!blocksDerived });
+        let changed = false;
+        const turnsByKey = { ...state.turnsByKey };
+        for (const [key, rows] of Object.entries(state.turnsByKey)) {
+          let next = null;
+          for (let index = 0; index < rows.length; index += 1) {
+            if (String(rows[index]?.id || '') !== turnId) continue;
+            if (!next) next = rows.slice();
+            next[index] = { ...next[index], blocks, blocksDerived: !!blocksDerived };
+          }
+          if (next) {
+            turnsByKey[key] = next;
+            changed = true;
+          }
+        }
+        if (changed) emit({ turnsByKey });
       }
 
       function handleLiveEvent(event) {
@@ -1840,6 +1931,7 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-bubbleUser{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 16%,transparent);border-radius:14px 14px 4px 14px}
       .dsh-hands-v2-bubbleAgent{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:14px 14px 14px 4px}
       .dsh-hands-v2-bubbleLabel{display:inline-flex;align-items:center;gap:4px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:10.5px;line-height:14px}
+      .dsh-hands-v2-fallback{flex:none;padding:0 5px;border:.5px solid var(--dsw-alias-border-l2);border-radius:999px;color:var(--dsw-alias-label-tertiary);font-size:9px;line-height:13px}
       .dsh-hands-v2-bubbleIcon{display:inline-flex;align-items:center;flex:none}
       .dsh-hands-v2-bubbleName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       .dsh-hands-v2-bubbleText{margin:0;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;font-size:12px;line-height:19px;color:var(--dsw-alias-label-primary)}
@@ -3033,12 +3125,25 @@ window.__ModuleLoader__.load({
       const source = String(view?.source || 'none');
       const running = !!view?.cursor;
       const blocks = Array.isArray(turn?.blocks) ? turn.blocks : [];
-      const useBlocks =
+      const hasNativeBlocks =
         blocks.length > 0 &&
         blocks.every(
           (block) => block && (block.kind === 'text' || block.kind === 'reasoning' || block.kind === 'tool'),
         );
-      const canExpand = full.length > BODY_LIMIT;
+      const serverDerived = hasNativeBlocks && turn?.blocksDerived === true;
+      const canExpand = full.length > BODY_LIMIT && (!hasNativeBlocks || serverDerived);
+      // job 文件是尾部截断的：真要折叠文本，展示最后 4000 字，不是从中间截断的开头。
+      const displayText = canExpand && !expanded ? full.slice(-BODY_LIMIT) : full;
+      const parsedBlocks =
+        hasNativeBlocks && (!serverDerived || !displayText)
+          ? blocks
+          : deriveBlocksFromText(displayText);
+      const useBlocks =
+        parsedBlocks.length > 0 &&
+        parsedBlocks.every(
+          (block) => block && (block.kind === 'text' || block.kind === 'reasoning' || block.kind === 'tool'),
+        );
+      const fallback = (!hasNativeBlocks || serverDerived) && (!!full || blocks.length > 0);
       const hand = String(turn?.hand || '').toLowerCase();
       const loadFull = source === 'excerpt' && typeof props.onNeedBody === 'function';
       const showToggle = canExpand || loadFull;
@@ -3055,18 +3160,30 @@ window.__ModuleLoader__.load({
           { className: 'dsh-hands-v2-bubbleLabel' },
           h('span', { className: 'dsh-hands-v2-bubbleIcon', style: { color: handColor } }, h(HandIcon, { hand, size: 13 })),
           h('span', { className: 'dsh-hands-v2-bubbleName' }, handLabel(hand, t)),
+          fallback
+            ? h(
+                'span',
+                {
+                  className: 'dsh-hands-v2-fallback',
+                  title: t('blocksFallbackHint'),
+                  'data-kind': serverDerived ? 'derived' : 'text',
+                },
+                t('blocksFallback'),
+              )
+            : null,
         ),
         h(
           'div',
           {
             className: 'dsh-hands-v2-bubble dsh-hands-v2-bubbleAgent',
             'data-source': source,
+            'data-fallback': fallback ? (serverDerived ? 'derived' : 'text') : undefined,
           },
           useBlocks
-            ? h(AgentBlocks, { t, blocks, running })
+            ? h(AgentBlocks, { t, blocks: parsedBlocks, running })
             : full || running
               ? h(Stream, {
-                  text: canExpand && !expanded ? full.slice(0, BODY_LIMIT) : full,
+                  text: displayText,
                   running,
                   t,
                 })
@@ -3912,6 +4029,8 @@ window.__ModuleLoader__.load({
       statusLabelWithQueue,
       turnIsRunning,
       asyncBarState,
+      deriveBlocksFromText,
+      mergeTurnsById,
       resolveTurnBody,
       formatTurnMeta,
       formatTokens,

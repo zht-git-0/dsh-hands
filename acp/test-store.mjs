@@ -80,6 +80,13 @@ const TURNS = {
 }
 
 const BODIES = { t1: 'hello world', t2: 'second body', b1: 'beta body' }
+const BLOCKS = {
+  t1: [
+    { kind: 'text', text: 'hello' },
+    { kind: 'tool', name: 'read', detail: 'a.txt', status: 'completed' },
+    { kind: 'text', text: 'world' },
+  ],
+}
 
 function makeFetch() {
   const calls = []
@@ -100,7 +107,14 @@ function makeFetch() {
       const from = Math.max(0, Number(u.searchParams.get('from')) || 0)
       const text = BODIES[id] || ''
       const delta = text.slice(from)
-      body = { id, from, next: from + delta.length, eof: from + delta.length >= text.length, delta }
+      body = {
+        id,
+        from,
+        next: from + delta.length,
+        eof: from + delta.length >= text.length,
+        delta,
+        ...(from === 0 && BLOCKS[id] ? { blocks: BLOCKS[id], blocksDerived: false } : {}),
+      }
     }
     if (!body) return { ok: false, status: 404, json: async () => ({}) }
     return { ok: true, status: 200, json: async () => body }
@@ -551,6 +565,97 @@ async function until(check, label, tries = 200) {
 
   store.stop()
   console.log('10) QUEUED REST/SSE 保真 + 不拉正文 ok')
+}
+
+// ── 11. blocks 按 id 缓存：列表刷新、切会话、SSE 重连都不丢 ──────────────────
+{
+  FakeEventSource.instances.length = 0
+  const key = 'opencode/alpha'
+  const storage = makeStorage({
+    'dsh.hands.sel': JSON.stringify({
+      hand: 'opencode', key, turnId: 't1', at: '2026-11-18T00:00:00.000Z',
+    }),
+  })
+  const store = createHandsStore({ fetchImpl: makeFetch().fetchImpl, storage, EventSourceImpl: FakeEventSource })
+  store.start()
+  await until(() => store.getSnapshot().turnsByKey[key] !== undefined, 'alpha turns for block cache')
+  await store.selectTurn('t1')
+  await until(
+    () => Array.isArray(store.getSnapshot().turnsByKey[key].find((row) => row.id === 't1')?.blocks),
+    't1 blocks loaded',
+  )
+  const loaded = store.getSnapshot().turnsByKey[key].find((row) => row.id === 't1')
+  assert.deepEqual(loaded.blocks, BLOCKS.t1)
+  assert.equal(store.getSnapshot().liveByTurn.t1, BODIES.t1)
+  assert.equal(store.debug().liveApplied.get('t1'), BODIES.t1.length)
+
+  await store.loadTurns(key)
+  assert.deepEqual(
+    store.getSnapshot().turnsByKey[key].find((row) => row.id === 't1').blocks,
+    BLOCKS.t1,
+    'REST 列表刷新后 blocks 仍在',
+  )
+
+  store.select('opencode', 'opencode/beta')
+  await until(() => store.getSnapshot().turnsByKey['opencode/beta'] !== undefined, 'beta turns')
+  store.select('opencode', key)
+  assert.deepEqual(
+    store.getSnapshot().turnsByKey[key].find((row) => row.id === 't1').blocks,
+    BLOCKS.t1,
+    '切走再切回仍保留结构化 blocks',
+  )
+
+  const es = FakeEventSource.instances.at(-1)
+  es.emit('turns', { revision: 8, key, turns: TURNS[key] })
+  assert.deepEqual(
+    store.getSnapshot().turnsByKey[key].find((row) => row.id === 't1').blocks,
+    BLOCKS.t1,
+    'SSE turns 整体列表事件不抹 blocks',
+  )
+  es.emit('turns', { revision: 9, key, turns: [] })
+  es.emit('turns', { revision: 10, key, turns: TURNS[key] })
+  assert.deepEqual(
+    store.getSnapshot().turnsByKey[key].find((row) => row.id === 't1').blocks,
+    BLOCKS.t1,
+    '列表短暂为空后也能从 id 缓存恢复',
+  )
+  assert.equal(store.getSnapshot().liveByTurn.t1, BODIES.t1, '已取正文不受列表刷新影响')
+  assert.equal(store.debug().liveApplied.get('t1'), BODIES.t1.length, 'localApplied 记账不丢')
+  store.stop()
+  console.log('11) blocks id 缓存 / 切会话 / SSE 刷新 ok')
+}
+
+// ── 12. 老服务端没返回 blocks：客户端补 derive 后再缓存到轮次 ────────────────
+{
+  const key = 'opencode/legacy'
+  const raw = '正文\n→ read: old.txt\n结论'
+  const fetchImpl = async (url) => {
+    const u = new URL(String(url))
+    if (u.pathname === '/dsh-hands/turn') {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: 'old', from: 0, next: raw.length, eof: true, delta: raw }),
+      }
+    }
+    if (u.pathname === '/dsh-hands/turns') {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ key, turns: [{ id: 'old', hand: 'opencode', status: 'OK', startedAt: '2026-11-18T00:00:00.000Z' }] }),
+      }
+    }
+    return { ok: false, status: 404, json: async () => ({}) }
+  }
+  const store = createHandsStore({ fetchImpl, storage: makeStorage() })
+  await store.loadTurnBody('old', 0)
+  await store.loadTurns(key)
+  const old = store.getSnapshot().turnsByKey[key][0]
+  assert.equal(old.blocksDerived, true)
+  assert.deepEqual(old.blocks.map((block) => block.kind), ['text', 'tool', 'text'])
+  assert.equal(old.blocks[1].name, 'read')
+  store.stop()
+  console.log('12) 缺失 blocks 客户端 derive 缓存 ok')
 }
 
 console.log('ok')

@@ -1,6 +1,7 @@
 // 气泡纯函数 + 纯展示组件测试：node acp/test-bubbles.mjs
 // 不挂真 React：用最小 stub 让 h()/hooks 能跑，自己递归把函数组件展开成树。
 import assert from 'node:assert/strict'
+import { deriveBlocksFromText as serverDeriveBlocksFromText } from '../index.js'
 import { RICH_MARKDOWN, STREAM_PARTIAL_FENCE, STREAM_PARTIAL_TABLE, STREAM_PARTIAL_INLINE } from './markdown-fixture.mjs'
 
 globalThis.window = {
@@ -55,6 +56,8 @@ const {
   statusLabelWithQueue,
   turnIsRunning,
   asyncBarState,
+  deriveBlocksFromText,
+  mergeTurnsById,
   BubbleUser,
   BubbleAgent,
   MarkdownLite,
@@ -276,6 +279,71 @@ const t = (key, vars) => {
   assert.equal(mixed.failed, 1, '回传失败仍计数')
 
   console.log('2b) QUEUED 优先级 / 元信息 / 光标 / 异步汇总 ok')
+}
+
+// ── 2c. 轮次 blocks 合并保留 + 结构化渲染 + 可识别降级视图 ──────────────────
+{
+  const blocks = [
+    { kind: 'text', text: '先读文件' },
+    { kind: 'tool', name: 'read', detail: 'a.txt', status: 'completed' },
+    { kind: 'tool', name: 'write', detail: 'b.txt', status: 'completed' },
+    { kind: 'text', text: '后写结论' },
+  ]
+  const cache = new Map()
+  const merged = mergeTurnsById(
+    [{ id: 't1', blocks, localApplied: 17, bodyText: 'cached body', prompt: '旧标题' }],
+    [{ id: 't1', status: 'OK', prompt: '新标题' }],
+    cache,
+  )
+  assert.equal(merged[0].blocks, blocks, '列表刷新保留 blocks 引用')
+  assert.equal(merged[0].localApplied, 17, '本地增量记账保留')
+  assert.equal(merged[0].bodyText, 'cached body', '已取正文保留')
+  assert.equal(merged[0].prompt, '新标题', '列表字段用新值')
+  assert.equal(cache.get('t1').blocks, blocks, 'blocks 同时按 id 缓存')
+
+  const structured = render(h(BubbleAgent, {
+    t,
+    turn: { id: 't1', hand: 'opencode', status: 'OK', blocks },
+    view: { text: 'x'.repeat(5000), source: 'live', cursor: false },
+  }))
+  assert.equal(hasClass(structured, 'dsh-hands-blocks'), true, '切回后仍走 AgentBlocks')
+  assert.equal(hasClass(structured, 'dsh-hands-v2-fallback'), false, '原生 blocks 不显示降级标记')
+  assert.equal(allText(structured).includes('expand'), false, '结构化正文不再出现多余展开按钮')
+  const structuredText = allText(structured)
+  assert.ok(structuredText.indexOf('read') < structuredText.indexOf('write'), '工具顺序保留')
+
+  const parsed = deriveBlocksFromText('正文\n→ read: a.txt\n→ write: b.txt\n结论')
+  assert.deepEqual(parsed, serverDeriveBlocksFromText('正文\n→ read: a.txt\n→ write: b.txt\n结论'), '客户端兜底规则与服务端一致')
+  assert.deepEqual(parsed.map((block) => block.kind), ['text', 'tool', 'tool', 'text'])
+  assert.deepEqual(parsed.filter((block) => block.kind === 'tool').map((block) => block.name), ['read', 'write'])
+
+  const fallback = render(h(BubbleAgent, {
+    t,
+    turn: { id: 'old', hand: 'opencode', status: 'OK' },
+    view: { text: '正文\n→ read: a.txt\n→ write: b.txt\n结论', source: 'live', cursor: false },
+  }))
+  assert.equal(hasClass(fallback, 'dsh-hands-blocks'), true, 'blocks 缺失时先按文本规则解析')
+  assert.equal(hasClass(fallback, 'dsh-hands-v2-fallback'), true, '降级视图有可见标记')
+  const fallbackText = allText(fallback)
+  assert.ok(fallbackText.indexOf('read') < fallbackText.indexOf('write'), '兜底解析同样保留工具顺序')
+
+  const tail = render(h(BubbleAgent, {
+    t,
+    turn: { id: 'tail', hand: 'opencode', status: 'OK' },
+    view: { text: `${'x'.repeat(5000)}\n→ read: tail.txt\n最新结论`, source: 'live', cursor: false },
+  }))
+  assert.ok(allText(tail).includes('read'), '折叠兜底展示尾部，不会从截断原文中段开始')
+  assert.ok(allText(tail).includes('tail.txt'), '最新工具调用可见')
+  assert.equal(hasClass(tail, 'dsh-hands-v2-fallback'), true)
+
+  const derived = render(h(BubbleAgent, {
+    t,
+    turn: { id: 'derived', hand: 'opencode', status: 'OK', blocks: parsed, blocksDerived: true },
+    view: { text: '正文\n→ read: a.txt\n→ write: b.txt\n结论', source: 'live', cursor: false },
+  }))
+  assert.equal(hasClass(derived, 'dsh-hands-blocks'), true, '服务端 derive 的 blocks 也走结构化渲染')
+  assert.equal(hasClass(derived, 'dsh-hands-v2-fallback'), true, '服务端降级来源也标明')
+  console.log('2c) blocks 合并 / 结构化渲染 / 文本降级 ok')
 }
 
 // ── 3. 元信息：耗时 / tokens / cost / exitCode / model ──────────────────────
