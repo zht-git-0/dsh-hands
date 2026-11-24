@@ -251,6 +251,54 @@ export function turnsFor(jobs, running, key, opts = {}) {
   return rows.slice(0, limit)
 }
 
+// ── 历史轮次的 blocks 补渲染：从 job 文件的原始文本里解析「工具行 + 正文」──
+// 老轮次（log 里没有 blocks —— 插件当时没写、或被 interrupted 覆盖掉了）：
+// 面板要看到工具列表，就从 `readJobText` 的原文里解析出来喂给前端。
+// 文本格式见 stream.js 的 line() 调用：`→ name: detail`（opencode、claude）、
+// `[tool] name`（agy）、`$ command` / `✎ path`（codex）、`! error`。
+export function deriveBlocksFromText(text) {
+  const blocks = []
+  let buf = ''
+  const flushText = () => {
+    const t = String(buf || '').trim()
+    if (t) blocks.push({ kind: 'text', text: t })
+    buf = ''
+  }
+  const pushTool = (name, detail = '', status = '') => {
+    flushText()
+    blocks.push({
+      kind: 'tool',
+      name: String(name || 'tool').trim().slice(0, 80) || 'tool',
+      detail: String(detail || '').trim().slice(0, 200),
+      status,
+    })
+  }
+  for (const rawLine of String(text || '').split(/\r?\n/)) {
+    const line = String(rawLine || '')
+    if (line.startsWith('→ ')) {
+      const s = line.slice(2)
+      const cut = s.indexOf(': ')
+      pushTool(cut > 0 ? s.slice(0, cut) : s, cut > 0 ? s.slice(cut + 2) : '')
+      continue
+    }
+    if (line.startsWith('[tool] ')) {
+      pushTool(line.slice('[tool] '.length).trim())
+      continue
+    }
+    if (line.startsWith('$ ') || line.startsWith('✎ ')) {
+      pushTool(line.slice(2).trim())
+      continue
+    }
+    if (line.startsWith('! ')) {
+      pushTool(line.slice(2).trim(), '', 'error')
+      continue
+    }
+    if (line.trim()) buf += (buf ? '\n' : '') + line
+  }
+  flushText()
+  return blocks.slice(-80)
+}
+
 // live 增量记账：只发 text 从 sentLength 起新增的那一段。
 // sentLength 可能来自上一帧的 next，理论上不会越界，但磁盘上的全文会变（截尾 / 重写），
 // 越界时夹到 [0, text.length]，保证 next 永远不往回退。
@@ -2990,10 +3038,14 @@ export function apply(ctx, config = {}) {
                   const text = readJobText(entry)
                   const delta = text.slice(from)
                   const next = from + delta.length
-                  // 第一页顺带把语义分块（思维链/正文/工具）带回去，面板不用多请求一次
-                  const blocks = from === 0 && Array.isArray(entry.blocks) && entry.blocks.length
-                    ? entry.blocks
-                    : undefined
+                  // 第一页顺带把语义分块（思维链/正文/工具）带回去；entry.blocks 优先，
+                  // 老轮次没落盘 blocks 时从 job 文件原文解析，让旧轮次也能显示工具列表。
+                  const blocks =
+                    from === 0 && Array.isArray(entry.blocks) && entry.blocks.length
+                      ? entry.blocks
+                      : from === 0
+                        ? deriveBlocksFromText(text)
+                        : undefined
                   return send(200, {
                     id,
                     from,
