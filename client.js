@@ -950,16 +950,19 @@ window.__ModuleLoader__.load({
         }
       }
 
-      async function archiveSession(key, archived) {
+      async function archiveSession(key, archived, hand = '') {
         const wanted = String(key || '');
         if (!wanted) return { ok: false, error: 'key is required' };
+        // key 形如 opencode/sid:xxx 或 opencode/名字；不能引用组件作用域里的 slice。
+        const wantedHand = String(hand || wanted.split('/')[0] || state.selection.hand || '').trim();
         try {
           const data = await postJson('dsh-hands/archive-session', {
             key: wanted,
-            hand: String(slice.hand || ''),
+            hand: wantedHand,
             archived: archived !== false,
           });
-          await loadSessions(String(slice.hand || ''));
+          if (data?.ok !== true) throw new Error(String(data?.error || 'archive failed'));
+          if (wantedHand) await loadSessions(wantedHand);
           loadAgents();
           return { ok: true, data };
         } catch (error) {
@@ -2620,7 +2623,7 @@ window.__ModuleLoader__.load({
                               event.preventDefault();
                               event.stopPropagation();
                               if (typeof store.archiveSession === 'function') {
-                                store.archiveSession(key, !row.archived);
+                                store.archiveSession(key, !row.archived, String(row.hand || slice.hand || ''));
                               }
                             },
                           }, row.archived ? '↩' : '⤓'),

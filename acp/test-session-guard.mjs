@@ -6,7 +6,7 @@
 // 4) resume 路径：同目录带条目 → 正常返回 id
 
 import assert from 'node:assert/strict'
-import { resolveSession, sameCwd, sameDirSessionsText } from '../index.js'
+import { isArchivedSessionEntry, resolveSession, sameCwd, sameDirSessionsText } from '../index.js'
 
 const INDEX = {
   sessA: { id: 'a1', cwd: '/work/a', updated: '2026-11-20T10:00:00Z' },
@@ -69,6 +69,47 @@ const INDEX = {
     { id: 'a1', reset: false },
   )
   console.log('4) resume 路径 ok')
+}
+
+// ── 5) 归档会话不算正常会话：同目录守卫/清单一律排除 ────────────────────
+{
+  const archivedKeys = ['opencode/sid:a1', 'opencode/sessB']
+  assert.equal(isArchivedSessionEntry('opencode', 'sessA', INDEX.sessA, archivedKeys), true, 'sid 归档键认得')
+  assert.equal(isArchivedSessionEntry('opencode', 'sessB', INDEX.sessB, archivedKeys), true, '名字归档键认得')
+  assert.equal(isArchivedSessionEntry('opencode', 'other', INDEX.other, archivedKeys), false, '别的目录不误伤')
+  assert.equal(
+    sameDirSessionsText(INDEX, 'newname', '/work/a', undefined, archivedKeys, 'opencode'),
+    '',
+    '同目录只剩归档会话 → 清单为空',
+  )
+  assert.deepEqual(
+    resolveSession(
+      INDEX,
+      `archived-only-${Date.now()}`,
+      '/work/a',
+      { sessionMode: 'new' },
+      'opencode',
+      '',
+      archivedKeys,
+    ),
+    { id: null, reset: false },
+    '目录里只有归档会话 → new 免票直接放行',
+  )
+  assert.throws(
+    () =>
+      resolveSession(
+        INDEX,
+        `still-active-${Date.now()}`,
+        '/work/a',
+        { sessionMode: 'new' },
+        'opencode',
+        '',
+        ['opencode/sid:a1'], // 只归档 sessA，sessB 仍在
+      ),
+    /issue_new_session_ticket/,
+    '还有未归档会话 → 仍然要票',
+  )
+  console.log('5) 归档会话不算正常会话 ok')
 }
 
 console.log('session guard ok')

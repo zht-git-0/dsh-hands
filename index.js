@@ -219,8 +219,8 @@ export function turnsFor(jobs, running, key, opts = {}) {
   const seen = new Set()
   const rows = []
   const source = [
-    ...(Array.isArray(jobs) ? jobs : []).map((job) => [job, false]),
     ...(Array.isArray(running) ? running : []).map((item) => [item, true]),
+    ...(Array.isArray(jobs) ? jobs : []).map((job) => [job, false]),
   ]
   for (const [entry, isRunning] of source) {
     if (!entry || !matches(entry)) continue
@@ -869,12 +869,44 @@ export function isProcessAlive(pid) {
   }
 }
 
+// 异步任务是否仍活跃：有 pid 时以进程存活为准（宿主重启后 pid 真死了就收尸）；
+// 没 pid 的旧记录才退回 status=RUNNING（无法确认死亡，不能贸然标中断）。
+export function isAsyncJobActive(record, { isAlive } = {}) {
+  if (!record?.id || record.endedAt) return false
+  const alive = typeof isAlive === 'function' ? isAlive : isProcessAlive
+  const pid = Number(record.pid)
+  if (Number.isInteger(pid) && pid > 0) return alive(pid)
+  return String(record.status || '').toUpperCase() === 'RUNNING'
+}
+
+// 启动对账计划：有 start 没 end，但 asyncState 仍 RUNNING / pid 仍活着的，不收尸。
+// 只有无法证明还活着的才补 INTERRUPTED。纯函数，方便测「插件重启但进程没死」。
+export function planLogReconciliation(records, asyncJobs = {}, { isAlive, runningIds = [] } = {}) {
+  const starts = new Map()
+  const ended = new Set()
+  for (const record of Array.isArray(records) ? records : []) {
+    if (!record?.id) continue
+    const id = String(record.id)
+    if (record.phase === 'start') starts.set(id, record)
+    else if (record.phase === 'end') ended.add(id)
+  }
+  const active = new Set((Array.isArray(runningIds) ? runningIds : []).map(String).filter(Boolean))
+  for (const record of Object.values(asyncJobs || {})) {
+    if (isAsyncJobActive(record, { isAlive })) active.add(String(record.id))
+  }
+  const interrupt = []
+  for (const [id, start] of starts) {
+    if (ended.has(id) || active.has(id)) continue
+    interrupt.push({ id, start })
+  }
+  return { interrupt, active: [...active].filter((id) => starts.has(id) && !ended.has(id)) }
+}
+
 // 重启后该做什么：没跑完的里真死了才标 ORPHAN（进程已经没了），跑完但没投的补投一次。
 // 「没跑完」只有在进程确认不在时才算（见 isProcessAlive）：进程还活着的留 running——
 // 诚实标签，别把「可能还在跑」宣成「已死无结果」。
 // 纯函数，只决定「要不要投 / 标什么」，真投递在外面做 —— 这样能单测。
 export function planAsyncRecovery(state, { isAlive } = {}) {
-  const alive = typeof isAlive === 'function' ? isAlive : isProcessAlive
   const jobs = Object.values(state?.jobs || {})
   const deliver = []
   const orphan = []
@@ -883,7 +915,7 @@ export function planAsyncRecovery(state, { isAlive } = {}) {
     if (!record || !record.id) continue
     if (record.delivery === 'sent') continue
     if (!record.endedAt) {
-      if (alive(record.pid)) running.push(record.id)
+      if (isAsyncJobActive(record, { isAlive })) running.push(record.id)
       else orphan.push(record.id)
       continue
     }
@@ -1172,16 +1204,35 @@ export function sameCwd(a, b) {
   return norm(a) === norm(b)
 }
 const sessionRoot = (name) => String(name || '').trim().toLowerCase().replace(/[\s_\-]*\d+$/, '')
-const findLookalikeSession = (index, name) => {
+function archiveKeySet(archivedKeys) {
+  if (archivedKeys instanceof Set) return archivedKeys
+  return new Set(Array.isArray(archivedKeys) ? archivedKeys.map(String).filter(Boolean) : [])
+}
+// 索引里的名字可能对应两种归档键：hand/名字（没拿到 sid 的旧记录）或 hand/sid:id。
+// 两种都认，避免「归档按钮点的是 sid 行，守卫却还按名字统计」。
+export function isArchivedSessionEntry(hand, name, entry, archivedKeys) {
+  if (entry?.archived === true) return true
+  const keys = archiveKeySet(archivedKeys)
+  const prefix = String(hand || '')
+  if (!prefix) return false
+  if (keys.has(String(entry?.key || '')) || keys.has(String(entry?.sessionKey || ''))) return true
+  if (keys.has(`${prefix}/${String(name || '')}`)) return true
+  const id = String(entry?.id || '')
+  return !!id && keys.has(`${prefix}/sid:${id}`)
+}
+const findLookalikeSession = (index, name, archivedKeys = [], hand = '') => {
   const root = sessionRoot(name)
   if (!root) return []
-  return Object.keys(index || {}).filter((k) => k !== name && sessionRoot(k) === root)
+  return Object.keys(index || {}).filter(
+    (k) => k !== name && sessionRoot(k) === root && !isArchivedSessionEntry(hand, k, index[k], archivedKeys),
+  )
 }
-const sameCwdOthers = (index, name, cwd) => {
+const sameCwdOthers = (index, name, cwd, archivedKeys = [], hand = '') => {
   if (!cwd) return []
   return Object.keys(index || {}).filter((k) => {
     const other = index[k]
     if (k === name || !other || !String(other.cwd || '').trim()) return false
+    if (isArchivedSessionEntry(hand, k, other, archivedKeys)) return false
     return sameCwd(other.cwd, cwd)
   })
 }
@@ -1210,7 +1261,7 @@ function assertFreshName(hand, name, allowNewSession) {
 }
 // 拒绝新建时给「该目录下所有已有会话」的清单（名字 / 最后活跃时间 / 是否运行中）：
 // 让人能直接挑一个 resume，而不是只报一句拒绝。runningNames 缺省取 RUNNING 里当前在跑的会话名。
-export function sameDirSessionsEntries(index, name, cwd, runningNames) {
+export function sameDirSessionsEntries(index, name, cwd, runningNames, archivedKeys = [], hand = '') {
   const running = new Set(
     Array.isArray(runningNames)
       ? runningNames.map(String).filter(Boolean)
@@ -1221,19 +1272,100 @@ export function sameDirSessionsEntries(index, name, cwd, runningNames) {
     if (key === name) continue
     const entry = index[key]
     if (!entry || !sameCwd(entry.cwd, cwd)) continue
+    if (isArchivedSessionEntry(hand, key, entry, archivedKeys)) continue
     rows.push({ name: key, at: String(entry.updated || entry.startedAt || ''), running: running.has(key) })
   }
   return rows
 }
-export function sameDirSessionsText(index, name, cwd, runningNames) {
-  const rows = sameDirSessionsEntries(index, name, cwd, runningNames)
+export function sameDirSessionsText(index, name, cwd, runningNames, archivedKeys = [], hand = '') {
+  const rows = sameDirSessionsEntries(index, name, cwd, runningNames, archivedKeys, hand)
   if (!rows.length) return ''
   return `该目录已有会话：${rows.map((r) => `「${r.name}」（活跃 ${r.at || '未知'}，${r.running ? '运行中' : '未运行'}）`).join('、')}。`
 }
-export function resolveSession(index, name, cwd, args, hand, requesterSessionId) {
+
+// 日志行与索引行合并：取消/失败时日志可能没写 conversationId，先按 hand/name 建了一行；
+// 索引随后带来真实 sid。把别名行并进 sid 行，保留轮次/今日数/最早开始/最新结束状态。
+export function mergeSessionRows(target, alias) {
+  if (!target || !alias) return target
+  target.turns = (Number(target.turns) || 0) + (Number(alias.turns) || 0)
+  target.today = (Number(target.today) || 0) + (Number(alias.today) || 0)
+  const targetStart = String(target.startedAt || '')
+  const aliasStart = String(alias.startedAt || '')
+  if (aliasStart && (!targetStart || aliasStart < targetStart)) target.startedAt = aliasStart
+  const targetAt = String(target.lastAt || '')
+  const aliasAt = String(alias.lastAt || '')
+  if (aliasAt && (!targetAt || aliasAt > targetAt)) {
+    target.lastAt = aliasAt
+    target.status = alias.status
+    target.ok = alias.ok === true
+    target.ms = Number(alias.ms) || 0
+    target.excerpt = String(alias.excerpt || '')
+  }
+  target.running = !!(target.running || alias.running)
+  target.notStarted = !target.turns && !target.running ? !!(target.notStarted && alias.notStarted) : false
+  for (const key of ['conversationId', 'sessionKey', 'name', 'cwd', 'model']) {
+    if (!target[key] && alias[key]) target[key] = alias[key]
+  }
+  return target
+}
+
+export function upsertSessionIndexRow(rows, hand, name, value = {}) {
+  const id = String(value?.id || '')
+  const key = id ? `${hand}/sid:${id}` : `${hand}/${name}`
+  const aliases = []
+  for (const [aliasKey, alias] of rows) {
+    if (aliasKey === key || alias?.hand !== hand || alias?.conversationId) continue
+    const sameName = alias?.sessionKey === `${hand}/${name}` || alias?.name === name
+    const cwdOk = !alias?.cwd || !value?.cwd || sameCwd(alias.cwd, value.cwd)
+    if (sameName && cwdOk) aliases.push([aliasKey, alias])
+  }
+  let row = rows.get(key)
+  const hadRow = !!row
+  if (!row) {
+    row = {
+      key,
+      hand,
+      name: '',
+      sessionKey: '',
+      conversationId: '',
+      turns: 0,
+      today: 0,
+      status: 'NOT_STARTED',
+      ok: false,
+      ms: 0,
+      startedAt: '',
+      lastAt: '',
+      cwd: '',
+      model: '',
+      excerpt: '',
+      running: false,
+      notStarted: true,
+    }
+  }
+  for (const [aliasKey, alias] of aliases) {
+    mergeSessionRows(row, alias)
+    rows.delete(aliasKey)
+  }
+  row.key = key
+  row.hand = hand
+  row.conversationId = id
+  const updated = String(value?.updated || '')
+  if (!hadRow || !row.name || (updated && (!row.lastAt || updated > row.lastAt))) row.name = String(name)
+  row.sessionKey = `${hand}/${row.name || name}`
+  if (!row.cwd) row.cwd = String(value?.cwd || '')
+  if (updated && (!row.lastAt || updated > row.lastAt)) row.lastAt = updated
+  if (!row.turns && !row.running) {
+    row.status = 'NOT_STARTED'
+    row.notStarted = true
+  }
+  rows.set(key, row)
+  return key
+}
+
+export function resolveSession(index, name, cwd, args, hand, requesterSessionId, archivedKeys = []) {
   const mode = String(args?.sessionMode || 'auto')
   const entry = name && index ? index[name] : null
-  const near = name ? findLookalikeSession(index, name) : []
+  const near = name ? findLookalikeSession(index, name, archivedKeys, hand) : []
   const nearHint = near.length ? `（名字相近的已有会话：${near.join('、')}）` : ''
   // allowNewSession 已废弃：改用 issue_new_session_ticket 发票据，传了也不再放行（保留字段避免旧调用方炸裂）
   const allowHint = args?.allowNewSession
@@ -1265,8 +1397,8 @@ export function resolveSession(index, name, cwd, args, hand, requesterSessionId)
     ? validateSessionTicket(args?.ticket, hand, cwd, name, requesterSessionId)
     : { ok: false, record: null, why: '' }
   const hasTicket = creatingNew && String(args?.ticket || '').trim() !== ''
-  const others = sameCwdOthers(index, name, cwd)
-  const list = sameDirSessionsText(index, name, cwd)
+  const others = sameCwdOthers(index, name, cwd, archivedKeys, hand)
+  const list = sameDirSessionsText(index, name, cwd, undefined, archivedKeys, hand)
   const ticketRequired = () =>
     ` 新建前请用 issue_new_session_ticket 发一张票据，或 resume 原会话。${allowHint}`
 
@@ -1408,7 +1540,7 @@ export function issueSessionTicket(fields = {}, opts = {}) {
     cwd,
     name,
     reason,
-    sessions: sameDirSessionsEntries(fields?.index || {}, name, cwd),
+    sessions: sameDirSessionsEntries(fields?.index || {}, name, cwd, undefined, fields?.archivedKeys, hand),
     hint: '先看清单，能 resume 就别新开',
   }
 }
@@ -1460,6 +1592,79 @@ export function consumeSessionTicket(rec, opts = {}) {
 
 // ── 在跑的派活（RUNNING）—— hoist 到模块顶层：sameDirSessionsText（拒绝新建时列清单）要查它 ──
 const RUNNING = new Map()
+
+// 把 start / end / 旧的单行记录合并成「一次派发」。旧日志没有 phase，原样兼容。
+// 纯函数导出：面板状态测试要验证「A 收尾不会改 B」。
+export function mergeJobRecords(records) {
+  const starts = new Map()
+  const jobs = new Map()
+  for (const record of Array.isArray(records) ? records : []) {
+    if (!record?.id) continue
+    const id = String(record.id)
+    if (record.phase === 'start') {
+      starts.set(id, record)
+      continue
+    }
+    if (record.phase === 'end') {
+      const merged = { ...(starts.get(id) || {}), ...record }
+      delete merged.phase
+      delete merged.v
+      jobs.set(id, merged)
+      continue
+    }
+    jobs.set(id, { ...record })
+  }
+  return [...jobs.values()]
+}
+
+// 面板统一状态：历史 end ∪ 当前 RUNNING ∪ asyncState 里仍活跃的恢复任务。
+// 旧版本曾把活进程误补成 INTERRUPTED；只要 asyncState/pid 证明它还活着，就以 RUNNING 覆盖。
+// 已经写了真正 end 的任务不覆盖（收尾记录优先于过期的 asyncState）。
+export function buildPanelDispatchState(records, asyncJobs = {}, running = [], { isAlive } = {}) {
+  const jobs = mergeJobRecords(records)
+  const jobById = new Map(jobs.map((job) => [String(job.id || ''), job]))
+  const starts = new Map()
+  for (const record of Array.isArray(records) ? records : []) {
+    if (record?.phase === 'start' && record?.id) starts.set(String(record.id), record)
+  }
+  const runningMap = new Map()
+  for (const entry of Array.isArray(running) ? running : []) {
+    if (entry?.id) runningMap.set(String(entry.id), entry)
+  }
+  for (const record of Object.values(asyncJobs || {})) {
+    if (!isAsyncJobActive(record, { isAlive })) continue
+    const id = String(record.id || '')
+    if (!id || runningMap.has(id)) continue
+    const job = jobById.get(id)
+    // 真正的收尾记录已经落盘：不能拿旧 asyncState 把它盖回 RUNNING。
+    // INTERRUPTED 即使老数据没带 interrupted 标记，也允许被仍存活的进程纠正。
+    if (job && job.status !== 'INTERRUPTED' && !job.interrupted) continue
+    const start = starts.get(id) || {}
+    const startedMs = Date.parse(start.startedAt || start.at) || Number(record.startedAt) || Date.now()
+    runningMap.set(id, {
+      ...start,
+      id,
+      hand: String(record.hand || start.hand || ''),
+      tool: String(record.tool || start.tool || ''),
+      prompt: String(record.prompt || start.prompt || ''),
+      session: String(start.session || ''),
+      sessionKey: String(start.sessionKey || sessionKeyOf(record.hand || start.hand || '', start.session || '', startedMs)),
+      conversationId: String(start.conversationId || ''),
+      cwd: String(start.cwd || ''),
+      model: String(start.model || ''),
+      startedAt: String(start.startedAt || new Date(startedMs).toISOString()),
+      at: String(start.at || start.startedAt || new Date(startedMs).toISOString()),
+      status: 'RUNNING',
+      running: true,
+      recovered: true,
+      output: '',
+      outputAt: startedMs,
+    })
+  }
+  const activeIds = new Set(runningMap.keys())
+  const visibleJobs = jobs.filter((job) => !activeIds.has(String(job.id || '')))
+  return { jobs: visibleJobs, running: [...runningMap.values()] }
+}
 
 export function apply(ctx, config = {}) {
   // 四家的二进制：配置 > 本机常用安装位置 > 默认值，取第一个真实存在的。
@@ -1622,7 +1827,8 @@ export function apply(ctx, config = {}) {
   // ── 调度日志：谁被派了什么活、跑了多久、成没成、当场说了什么 ──────────────
   //
   // v2 每条派发写两行：spawn 前 {phase:"start"}、收尾 {phase:"end"}。
-  // 启动时只有 start 没有 end 的活补成 INTERRUPTED（宿主重启把内存里的 RUNNING 丢了）。
+  // 启动时只有 start 没有 end、且 asyncState/pid 都不再证明它活着的活才补成 INTERRUPTED。
+  // 插件重启但旧进程还活着时留 RUNNING，等旧进程自己写真正的 end。
   // 日志只留元信息 + excerpt + jobFile；完整输出按 id 写进 hands-jobs/<id>.txt。
   // 流式片段仍然只在内存里滚（createLiveView），不落盘。
   const LOG_FILE = path.join(os.homedir(), '.dsh', 'hands-log.jsonl')
@@ -1693,33 +1899,20 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  // 把 start / end / 旧的单行记录合并成「一次派发」。旧日志没有 phase，原样兼容。
   function mergedJobs(records = readRecords()) {
-    const starts = new Map()
-    const jobs = new Map()
-    for (const record of records) {
-      if (!record?.id) continue
-      const id = String(record.id)
-      if (record.phase === 'start') {
-        starts.set(id, record)
-        continue
-      }
-      if (record.phase === 'end') {
-        const merged = { ...(starts.get(id) || {}), ...record }
-        delete merged.phase
-        delete merged.v
-        jobs.set(id, merged)
-        continue
-      }
-      jobs.set(id, { ...record })
-    }
-    return [...jobs.values()]
+    return mergeJobRecords(records)
   }
 
   function readJobs() {
     return mergedJobs().sort((a, b) =>
       String(b.at || b.startedAt || '').localeCompare(String(a.at || a.startedAt || '')),
     )
+  }
+
+  // 面板专用：把日志、当前 RUNNING、asyncState 里仍活着的任务统一成一份状态。
+  // 历史接口不能只读 end 日志，否则插件重启后仍活的异步任务会凭空变成 INTERRUPTED。
+  function panelDispatchState() {
+    return buildPanelDispatchState(readRecords(), asyncState.jobs, [...RUNNING.values()])
   }
 
   // 日志按行裁，最多 LOG_KEEP 行。start 被裁掉也没关系：end 自带全部元信息。
@@ -1764,19 +1957,12 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  // 宿主重启后的收尸：有 start、没 end 的记录一律补成 INTERRUPTED。
+  // 宿主重启后的收尸：有 start、没 end，且 asyncState/pid 都不再证明它活着的，才补 INTERRUPTED。
   function reconcileLog() {
     const records = readRecords()
-    const starts = new Map()
-    const ended = new Set()
-    for (const record of records) {
-      if (!record?.id) continue
-      if (record.phase === 'start') starts.set(String(record.id), record)
-      else if (record.phase === 'end') ended.add(String(record.id))
-    }
+    const plan = planLogReconciliation(records, asyncState.jobs, { runningIds: [...RUNNING.keys()] })
     const now = Date.now()
-    for (const [id, start] of starts) {
-      if (ended.has(id)) continue
+    for (const { id, start } of plan.interrupt) {
       const startedMs = Date.parse(start.startedAt || start.at) || now
       appendRecord(
         clean({
@@ -1898,45 +2084,32 @@ export function apply(ctx, config = {}) {
         row.running = !!running
         if (record.session) row.name = String(record.session)
       }
+      // 同一会话里只要还有一条在跑，聚合行就必须是 RUNNING，不能被较晚收尾的别的轮次盖掉。
+      if (running) {
+        row.status = 'RUNNING'
+        row.ok = false
+        row.running = true
+        row.ms = Math.max(0, Date.now() - startedMs)
+      }
     }
 
-    for (const job of readJobs()) absorb(job, false)
-    for (const entry of RUNNING.values()) absorb(entry, true)
+    const panel = panelDispatchState()
+    for (const job of panel.jobs) absorb(job, false)
+    for (const entry of panel.running) absorb(entry, true)
 
     for (const [hand, file] of sessionIndexFiles()) {
       if (handFilter && hand !== handFilter) continue
       const index = readJson(file, {})
       if (!index || typeof index !== 'object') continue
       for (const [name, value] of Object.entries(index)) {
-        const id = value && typeof value === 'object' ? String(value.id || '') : ''
-        const key = id ? `${hand}/sid:${id}` : `${hand}/${name}`
-        const row = rows.get(key)
-        if (!row) {
-          const created = ensureRow(key, hand)
-          created.name = String(name)
-          created.sessionKey = `${hand}/${name}`
-          created.conversationId = id
-          created.status = 'NOT_STARTED'
-          created.notStarted = true
-          created.lastAt = String(value?.updated || '')
-          created.cwd = String(value?.cwd || '')
-          continue
-        }
-        // 索引比最后一条派发新（通常是刚改过名字）时，以索引里的名字为准。
-        const updated = String(value?.updated || '')
-        if (updated && (!row.lastAt || updated > row.lastAt)) {
-          row.name = String(name)
-          row.sessionKey = `${hand}/${name}`
-        }
-        if (!row.conversationId && id) row.conversationId = id
-        if (!row.cwd) row.cwd = String(value?.cwd || '')
+        upsertSessionIndexRow(rows, hand, name, value && typeof value === 'object' ? value : {})
       }
     }
 
     const archived = new Set(readArchive())
     // 归档不再单独成视图：给每行打标记，前端在文件夹底部折叠展示
     return [...rows.values()]
-      .map((row) => ({ ...row, archived: archived.has(String(row.key)) }))
+      .map((row) => ({ ...row, archived: isArchivedSessionEntry(row.hand, row.name, row, archived) }))
       .sort((a, b) => String(b.lastAt || '').localeCompare(String(a.lastAt || '')))
   }
 
@@ -2327,7 +2500,7 @@ export function apply(ctx, config = {}) {
 
   function runningList() {
     const now = Date.now()
-    return [...RUNNING.values()]
+    return panelDispatchState().running
       .map((entry) =>
         clean({
           ...entry,
@@ -2343,7 +2516,7 @@ export function apply(ctx, config = {}) {
 
   function historyList(limit = 80) {
     const count = Math.max(1, Math.min(LOG_KEEP, Number(limit) || 80))
-    return readJobs().slice(0, count).map(stripOutput)
+    return panelDispatchState().jobs.slice(0, count).map(stripOutput)
   }
 
   function snapshot(limit = 80) {
@@ -2358,7 +2531,8 @@ export function apply(ctx, config = {}) {
   }
 
   function fullEntry(id) {
-    const live = RUNNING.get(id)
+    const panel = panelDispatchState()
+    const live = panel.running.find((entry) => String(entry.id || '') === String(id || ''))
     if (live) {
       return clean({
         ...live,
@@ -2368,20 +2542,21 @@ export function apply(ctx, config = {}) {
         output: String(live.output || '').slice(-20000),
       })
     }
-    const entry = readJobs().find((job) => job.id === id)
+    const entry = panel.jobs.find((job) => String(job.id || '') === String(id || ''))
     return entry ? clean({ ...entry, output: readJobText(entry) }) : null
   }
 
   // ── v2 面板的组装函数（不碰 req/res，/agents、/sessions、/stream 共用）────────
   function agentsPayload() {
     const checkedAt = new Date().toISOString()
+    const panel = panelDispatchState()
     const runningByHand = Object.create(null)
-    for (const entry of RUNNING.values()) {
+    for (const entry of panel.running) {
       const hand = String(entry.hand || '')
       runningByHand[hand] = (runningByHand[hand] || 0) + 1
     }
     const lastAtByHand = Object.create(null)
-    for (const job of mergedJobs()) {
+    for (const job of panel.jobs) {
       const hand = String(job.hand || '')
       const at = String(job.at || job.startedAt || '')
       if (at && (!lastAtByHand[hand] || at > lastAtByHand[hand])) lastAtByHand[hand] = at
@@ -2392,7 +2567,7 @@ export function apply(ctx, config = {}) {
         label: handDef.label,
         running: runningByHand[hand] || 0,
         today: todayCount(hand),
-        sessions: listSessions(hand).length,
+        sessions: listSessions(hand).filter((row) => row.archived !== true).length,
         lastAt: lastAtByHand[hand] || '',
         // ok / version 走 /health；这里保持旧 /agents 的字段形态，前端不用判空
         ok: false,
@@ -2873,7 +3048,8 @@ export function apply(ctx, config = {}) {
                 const revision = sessionsRevisionOf(hand)
                 lastSessionsRev = revision
                 const payload = sessionsForHand(hand)
-                const fingerprint = JSON.stringify(payload.sessions)
+                // running 行的 ms 每次都会变，不能因此 250ms 推一次；状态/轮次变化才推。
+                const fingerprint = JSON.stringify(payload.sessions.map((row) => row.running ? { ...row, ms: 0 } : row))
                 if (!force && fingerprint === sessionsFingerprint) return
                 sessionsFingerprint = fingerprint
                 writeV2('sessions', { revision, hand, sessions: payload.sessions }, revision)
@@ -2883,8 +3059,10 @@ export function apply(ctx, config = {}) {
                 if (!known) return
                 const revision = turnsRevisionOf(key)
                 lastTurnsRev = revision
-                const turns = turnsFor(mergedJobs(), [...RUNNING.values()], key, { limit: 50 })
-                const fingerprint = JSON.stringify(turns)
+                const panel = panelDispatchState()
+                const turns = turnsFor(panel.jobs, panel.running, key, { limit: 50 })
+                // running 行的 ms 是实时值；指纹里归一，避免每 250ms 重复发同一状态。
+                const fingerprint = JSON.stringify(turns.map((turn) => turn.running ? { ...turn, ms: 0 } : turn))
                 if (!force && fingerprint === turnsFingerprint) return
                 turnsFingerprint = fingerprint
                 // 有新轮次/收尾了，live 要重新挑一次目标
@@ -2895,8 +3073,9 @@ export function apply(ctx, config = {}) {
               // live 只跟这一条 key：在跑的那一轮优先，没有就最近一轮。
               // 历史轮读一次全文发完就 settle，别每 250ms 重复读盘。
               const liveTarget = () => {
+                const panel = panelDispatchState()
                 let best = null
-                for (const entry of RUNNING.values()) {
+                for (const entry of panel.running) {
                   if (!turnMatches(entry, key)) continue
                   if (!best || String(entry.startedAt || '') > String(best.startedAt || '')) best = entry
                 }
@@ -2904,7 +3083,7 @@ export function apply(ctx, config = {}) {
                   historyTargetId = ''
                   return { id: String(best.id || ''), running: true, entry: best }
                 }
-                const job = readJobs().find((item) => turnMatches(item, key))
+                const job = panel.jobs.find((item) => turnMatches(item, key))
                 if (!job) return null
                 historyTargetId = String(job.id || '')
                 return { id: historyTargetId, running: false, entry: job }
@@ -2914,7 +3093,7 @@ export function apply(ctx, config = {}) {
                 // 已经发完的历史轮不用再读盘；除非又有新的一轮在跑
                 if (historyTargetId && settled.has(historyTargetId)) {
                   let anyRunning = false
-                  for (const entry of RUNNING.values()) {
+                  for (const entry of panelDispatchState().running) {
                     if (turnMatches(entry, key)) {
                       anyRunning = true
                       break
@@ -2967,8 +3146,10 @@ export function apply(ctx, config = {}) {
                 if (closed || res.destroyed || res.writableEnded) return
                 if (agentsRevision !== lastAgentsRev) sendAgents()
                 if (!known) return
-                if (sessionsRevisionOf(hand) !== lastSessionsRev) sendSessions()
-                if (turnsRevisionOf(key) !== lastTurnsRev) sendTurns()
+                // 恢复任务可能由重启前的旧进程直接写 end（新进程的 revision 不会 bump）；
+                // 每轮都算指纹，变化才发，保证侧栏行与 turn 的 RUNNING → OK/INTERRUPTED 及时更新。
+                sendSessions()
+                sendTurns()
                 sendLive()
               }, 250)
               timers.push(timer)
@@ -3019,7 +3200,8 @@ export function apply(ctx, config = {}) {
                 if (!key) return fail(400, 'key is required')
                 const before = String(u.searchParams.get('before') || '')
                 const limit = String(u.searchParams.get('limit') || '50')
-                const turns = turnsFor(mergedJobs(), [...RUNNING.values()], key, { before, limit })
+                const panel = panelDispatchState()
+                const turns = turnsFor(panel.jobs, panel.running, key, { before, limit })
                 return send(200, { key, turns })
               } catch (e) {
                 return fail(500, e)
@@ -3244,7 +3426,7 @@ export function apply(ctx, config = {}) {
       const index = loadIndex()
       const label = typeof args?.session === 'string' ? args.session.trim() : ''
       // 统一走守卫：agy_run 以前自己查 index、没走 resolveSession，同目录守卫在它身上失效了
-      const resume = resolveSession(index, label, runCwd, args, 'agy', sessionIdFromExec(exec))
+      const resume = resolveSession(index, label, runCwd, args, 'agy', sessionIdFromExec(exec), readArchive())
       const resumeId = resume.id || (args?.conversationId ? String(args.conversationId) : '')
       if (resumeId) argv.push('--conversation', resumeId)
       else if (args?.continueLast) argv.push('--continue')
@@ -3685,7 +3867,7 @@ export function apply(ctx, config = {}) {
       const name = args?.session ? String(args.session) : ''
       const sandbox = String(args?.sandbox || 'read-only')
       const workdir = resolveRunCwd(args, exec)
-      const resume = resolveSession(index, name, workdir, args, 'codex')
+      const resume = resolveSession(index, name, workdir, args, 'codex', '', readArchive())
       const known = resume.id
       const sessionReset = resume.reset
 
@@ -3999,7 +4181,7 @@ export function apply(ctx, config = {}) {
       const index = readJson(CLAUDE_INDEX, {}) || {}
       const name = args?.session ? String(args.session) : ''
       const runCwd = resolveRunCwd(args, exec)
-      const resume = resolveSession(index, name, runCwd, args, 'claude', sessionIdFromExec(exec))
+      const resume = resolveSession(index, name, runCwd, args, 'claude', sessionIdFromExec(exec), readArchive())
       const known = resume.id
       const sessionReset = resume.reset
 
@@ -4201,7 +4383,7 @@ export function apply(ctx, config = {}) {
       const index = readJson(OPENCODE_INDEX, {}) || {}
       const name = args?.session ? String(args.session) : ''
       const runCwd = resolveRunCwd(args, exec)
-      const resume = resolveSession(index, name, runCwd, args, 'opencode', sessionIdFromExec(exec))
+      const resume = resolveSession(index, name, runCwd, args, 'opencode', sessionIdFromExec(exec), readArchive())
       const known = resume.id
       const sessionReset = resume.reset
       const model = args?.model ? String(args.model) : ''
@@ -4528,7 +4710,7 @@ export function apply(ctx, config = {}) {
     if (!known && name) {
       const index = readJson(handDef.index(), {}) || {}
       // 走守卫：有 session 名就按 auto 语义续已有会话（同目录不匹配 → reset，开新的）
-      const resume = resolveSession(index, name, runCwd, { sessionMode: 'auto' }, handKey, '')
+      const resume = resolveSession(index, name, runCwd, { sessionMode: 'auto' }, handKey, '', readArchive())
       if (resume.id) known = resume.id
     }
     const write = !!job.write
@@ -4644,6 +4826,7 @@ export function apply(ctx, config = {}) {
           ...args,
           hand,
           index: readJson(handDef.index(), {}) || {},
+          archivedKeys: readArchive(),
           requesterSessionId: sessionIdFromExec(exec),
         },
         {},
@@ -4721,7 +4904,7 @@ export function apply(ctx, config = {}) {
       const index = readJson(idxFile, {}) || {}
       const name = args?.session ? String(args.session) : ''
       const runCwd = resolveRunCwd(args, ctx)
-      const resume = resolveSession(index, name, runCwd, args, 'hands_run', sessionIdFromExec(ctx))
+      const resume = resolveSession(index, name, runCwd, args, 'hands_run', sessionIdFromExec(ctx), readArchive())
       const known = resume.id
       const sessionReset = resume.reset
 

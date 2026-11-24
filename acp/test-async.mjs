@@ -192,7 +192,8 @@ import { asyncReportText, createAsyncQueue, findAgentFor, formatDuration, isProc
   assert.equal(isProcessAlive(undefined), false)
   assert.equal(isProcessAlive(null), false)
   assert.deepEqual(planAsyncRecovery({ jobs: { live: { id: 'live', delivery: 'pending', pid: process.pid } } }).running, ['live'], '默认探测下自己的 pid 应判在跑')
-  assert.deepEqual(planAsyncRecovery({ jobs: { dead: { id: 'dead', delivery: 'pending' } } }).orphan, ['dead'], '没记 pid 的按不在处理（遗留数据维持旧行为）')
+  assert.deepEqual(planAsyncRecovery({ jobs: { legacy: { id: 'legacy', delivery: 'pending', status: 'RUNNING' } } }).running, ['legacy'], '无 pid 但状态仍 RUNNING：无法确认死亡，先留 running')
+  assert.deepEqual(planAsyncRecovery({ jobs: { dead: { id: 'dead', delivery: 'pending' } } }).orphan, ['dead'], '没 pid 也没 RUNNING 状态才按不在处理')
   console.log('7) 重启对账 planAsyncRecovery ok')
 }
 

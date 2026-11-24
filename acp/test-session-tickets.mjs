@@ -147,6 +147,24 @@ const INDEX2 = {
   console.log('7) allowNewSession 被忽略 ok')
 }
 
+// ── 7b) 发票据返回的目录清单也排除归档会话 ────────────────────────────────
+{
+  const file = tmpLedger()
+  const issued = issueSessionTicket(
+    {
+      hand: 'opencode',
+      cwd: 'D:/docs',
+      name: `ticket-list-${Date.now()}`,
+      index: INDEX,
+      archivedKeys: ['opencode/sid:a1', 'opencode/sessB'],
+    },
+    { file },
+  )
+  assert.deepEqual(issued.sessions, [], '目录里只有归档会话 → 发票据清单为空')
+  fs.rmSync(path.dirname(file), { recursive: true, force: true })
+  console.log('7b) 票据清单排除归档 ok')
+}
+
 // ── 8) 10 分钟限频：同一 cwd 连续 issue 两次，第二次抛 ───────────────────
 {
   const file = tmpLedger()

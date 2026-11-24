@@ -427,4 +427,49 @@ async function until(check, label, tries = 200) {
   console.log('8) cancel / rerun ok')
 }
 
+// ── 9. archiveSession：POST 参数正确，成功后立刻刷新会话列表 ──────────────
+{
+  const calls = []
+  let archived = false
+  const fetchImpl = async (url, init = {}) => {
+    const u = new URL(String(url))
+    const method = init.method || 'GET'
+    calls.push({ method, path: u.pathname, body: init.body ? JSON.parse(init.body) : null })
+    if (u.pathname === '/dsh-hands/archive-session') {
+      archived = init.body ? JSON.parse(init.body).archived !== false : true
+      return { ok: true, status: 200, json: async () => ({ ok: true, key: 'opencode/alpha', archived, count: archived ? 1 : 0 }) }
+    }
+    if (u.pathname === '/dsh-hands/agents') {
+      return { ok: true, status: 200, json: async () => ({ checkedAt: '', agents: AGENTS }) }
+    }
+    if (u.pathname === '/dsh-hands/sessions') {
+      const hand = u.searchParams.get('hand') || ''
+      const sessions = (SESSIONS[hand] || []).map((row) =>
+        row.key === 'opencode/alpha' ? { ...row, archived } : row,
+      )
+      return { ok: true, status: 200, json: async () => ({ hand, sessions }) }
+    }
+    return { ok: false, status: 404, json: async () => ({}) }
+  }
+  const store = createHandsStore({ fetchImpl, storage: makeStorage() })
+  await store.refreshAll()
+  store.select('opencode', 'opencode/alpha')
+  const result = await store.archiveSession('opencode/alpha', true, 'opencode')
+  assert.equal(result.ok, true, '归档调用成功（不能因 slice 未定义静默失败）')
+  const post = calls.find((call) => call.path === '/dsh-hands/archive-session')
+  assert.equal(post?.method, 'POST')
+  assert.deepEqual(post?.body, { key: 'opencode/alpha', hand: 'opencode', archived: true })
+  assert.ok(
+    calls.some((call) => call.path === '/dsh-hands/sessions' && call.method === 'GET'),
+    '归档成功后刷新会话列表',
+  )
+  assert.equal(
+    store.getSnapshot().sessionsByHand.opencode.find((row) => row.key === 'opencode/alpha')?.archived,
+    true,
+    '列表立刻显示 archived=true',
+  )
+  store.stop()
+  console.log('9) archiveSession POST + 立即刷新 ok')
+}
+
 console.log('ok')
