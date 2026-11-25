@@ -362,6 +362,18 @@ export function deriveBlocksFromText(text) {
   return blocks.slice(-80)
 }
 
+// SSE 用签名判断语义分块是否变化；status/output 变化也必须推帧。
+export function blocksSignature(blocks) {
+  if (!Array.isArray(blocks) || !blocks.length) return ''
+  return `${blocks.length}:${blocks.map((block) => [
+    String(block?.kind || ''),
+    String(block?.text || '').length,
+    String(block?.name || ''),
+    String(block?.status || ''),
+    String(block?.output || '').length,
+  ].join(':')).join('|')}`
+}
+
 // live 增量记账：只发 text 从 sentLength 起新增的那一段。
 // sentLength 可能来自上一帧的 next，理论上不会越界，但磁盘上的全文会变（截尾 / 重写），
 // 越界时夹到 [0, text.length]，保证 next 永远不往回退。
@@ -906,13 +918,23 @@ export function readAsyncState(file = ASYNC_STATE_FILE) {
   return { v: 1, jobs: {} }
 }
 
+function asyncJobStartedMs(value) {
+  const numeric = Number(value)
+  if (Number.isFinite(numeric)) return numeric
+  const parsed = Date.parse(String(value || ''))
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
 export function writeAsyncState(state, file = ASYNC_STATE_FILE) {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true })
     const entries = Object.entries(state?.jobs || {})
-      .sort((a, b) => Number(b[1]?.startedAt || 0) - Number(a[1]?.startedAt || 0))
+      .sort((a, b) => asyncJobStartedMs(b[1]?.startedAt) - asyncJobStartedMs(a[1]?.startedAt))
       .slice(0, 200)
-    fs.writeFileSync(file, JSON.stringify({ v: 1, jobs: Object.fromEntries(entries) }, null, 1), 'utf8')
+    const jobs = Object.fromEntries(entries)
+    fs.writeFileSync(file, JSON.stringify({ v: 1, jobs }, null, 1), 'utf8')
+    // 落盘副本和内存 state 同步裁剪，避免 asyncState.jobs 只增不减。
+    if (state && typeof state === 'object') state.jobs = jobs
     return true
   } catch {
     return false
@@ -1541,6 +1563,29 @@ export function recordSessionName(hand, name, id, cwd) {
     /* 记账失败不影响派活 */
   }
 }
+
+// 会话索引只合并一个 key：写盘前重读最新文件，避免两个并发会话用旧快照互相覆盖。
+export function updateSessionIndex(file, name, entry) {
+  const key = String(name || '').trim()
+  if (!key) return false
+  let tmp = ''
+  try {
+    const latest = readJson(file, {}) || {}
+    latest[key] = { ...(latest[key] && typeof latest[key] === 'object' ? latest[key] : {}), ...(entry || {}) }
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    tmp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(latest, null, 2) + '\n', 'utf8')
+    fs.renameSync(tmp, file)
+    return true
+  } catch {
+    try {
+      if (tmp) fs.unlinkSync(tmp)
+    } catch {
+      /* 临时文件清理失败不影响原索引 */
+    }
+    return false
+  }
+}
 // 新会话必须用一个从没用过的名字：名字一旦用过，即使 allowNewSession 也不许再开
 // （否则面板里会出现两条同名会话，index 只留最新那条，旧的那条就成孤儿）。
 function assertFreshName(hand, name, allowNewSession) {
@@ -1663,7 +1708,7 @@ export function upsertSessionIndexRow(rows, hand, name, value = {}) {
   return key
 }
 
-export function resolveSession(index, name, cwd, args, hand, requesterSessionId, archivedKeys = []) {
+export function resolveSession(index, name, cwd, args, hand, requesterSessionId, archivedKeys = [], opts = {}) {
   const mode = String(args?.sessionMode || 'auto')
   const entry = name && index ? index[name] : null
   const near = name ? findLookalikeSession(index, name, archivedKeys, hand) : []
@@ -1695,9 +1740,11 @@ export function resolveSession(index, name, cwd, args, hand, requesterSessionId,
   //   目录里没有其他会话 → 免票。
   const creatingNew = !entry
   const ticketInfo = creatingNew
-    ? validateSessionTicket(args?.ticket, hand, cwd, name, requesterSessionId)
+    ? opts.ticketApproved === true
+      ? { ok: true, record: null, why: '' }
+      : validateSessionTicket(args?.ticket, hand, cwd, name, requesterSessionId)
     : { ok: false, record: null, why: '' }
-  const hasTicket = creatingNew && String(args?.ticket || '').trim() !== ''
+  const hasTicket = creatingNew && opts.ticketApproved !== true && String(args?.ticket || '').trim() !== ''
   const others = sameCwdOthers(index, name, cwd, archivedKeys, hand)
   const list = sameDirSessionsText(index, name, cwd, undefined, archivedKeys, hand)
   const ticketRequired = () =>
@@ -1724,8 +1771,12 @@ export function resolveSession(index, name, cwd, args, hand, requesterSessionId,
     if (hasTicket && !ticketInfo.ok) {
       throw new Error(`${hand}: 票据校验未通过：${ticketInfo.why}${list ? ` ${list}` : ''}${ticketRequired()}`)
     }
-    if (ticketInfo.ok) consumeSessionTicket(ticketInfo.record)
-    return { id: null, reset: false }
+    if (ticketInfo.ok && opts.consumeTicket !== false) consumeSessionTicket(ticketInfo.record)
+    return {
+      id: null,
+      reset: false,
+      ...(ticketInfo.record ? { ticketExpiresAt: Number(ticketInfo.record.issuedAt) + SESSION_TICKET_TTL_MS } : {}),
+    }
   }
 
   // auto
@@ -1750,8 +1801,12 @@ export function resolveSession(index, name, cwd, args, hand, requesterSessionId,
   if (hasTicket && !ticketInfo.ok) {
     throw new Error(`${hand}: 票据校验未通过：${ticketInfo.why}${list ? ` ${list}` : ''}${ticketRequired()}`)
   }
-  if (ticketInfo.ok) consumeSessionTicket(ticketInfo.record)
-  return { id: null, reset: false }
+  if (ticketInfo.ok && opts.consumeTicket !== false) consumeSessionTicket(ticketInfo.record)
+  return {
+    id: null,
+    reset: false,
+    ...(ticketInfo.record ? { ticketExpiresAt: Number(ticketInfo.record.issuedAt) + SESSION_TICKET_TTL_MS } : {}),
+  }
 }
 function resumeEntry(index, name, cwd) {
   const entry = name && index ? index[name] : null
@@ -1769,6 +1824,14 @@ function resumeEntry(index, name, cwd) {
 //   - allowNewSession 已废弃：传了也不再放行（resolveSession 里拒绝信息里会说）。
 export const SESSION_TICKET_TTL_MS = 10 * 60 * 1000
 export const SESSION_TICKET_RATE_MS = 10 * 60 * 1000
+
+// 票据在入队时已核销，但排队不能把授权窗口拖没；出队前再检查原始截止时间。
+export function assertSessionTicketWindow(expiresAt, now = Date.now()) {
+  const deadline = Number(expiresAt)
+  if (Number.isFinite(deadline) && Number(now) > deadline) {
+    throw new Error('排队期间新建会话票据已过期，请重新签发票据后再派活')
+  }
+}
 export const SESSION_TICKET_LEDGER_FILE = path.join(os.homedir(), '.dsh', 'hands-session-tickets.json')
 const SESSION_TICKETS = new Map() // ticket -> { ticket, hand, cwd, name, reason, requesterSessionId, issuedAt }
 
@@ -2810,6 +2873,42 @@ export function apply(ctx, config = {}) {
     touchAgentDimensions(job)
   }
 
+  // perform 在 startDispatch 之前失败（例如排队期间票据过期/新会话已被前序建出）时，
+  // asyncState 有失败回传，但还必须补一条 end，否则面板里这条 job 会凭空消失。
+  function recordAsyncStartFailure(job, error) {
+    const id = String(job.dispatchId || job.id)
+    const hasStart = readRecords().some((row) => row?.phase === 'start' && String(row.id || '') === id)
+    if (hasStart) return false
+    const now = Date.now()
+    const startedAt = new Date(Number(job.startedAt) || now).toISOString()
+    appendRecord(
+      clean({
+        v: 2,
+        phase: 'end',
+        id,
+        at: new Date(now).toISOString(),
+        startedAt,
+        hand: String(job.hand || ''),
+        tool: String(job.tool || ''),
+        prompt: String(job.prompt || ''),
+        write: !!job.write,
+        session: String(job.session || ''),
+        sessionKey: String(job.sessionKey || ''),
+        conversationId: String(job.conversationId || ''),
+        cwd: String(job.cwd || ''),
+        model: String(job.model || ''),
+        status: 'ERROR',
+        ok: false,
+        ms: Math.max(0, now - (Number(job.startedAt) || now)),
+        excerpt: '',
+        error: String(error?.message ?? error).slice(0, 1200),
+      }),
+    )
+    touchHistory()
+    touchAgentDimensions(job)
+    return true
+  }
+
   // 五条异步派活共用：先按目标会话排队，队首才进入全局并发闸门。
   // 队列满时在写 asyncState 之前直接拒绝，不会留下一个假装 RUNNING 的幽灵 job。
   function startAsyncJob(ctx, job, start, summarize) {
@@ -2834,15 +2933,16 @@ export function apply(ctx, config = {}) {
         if (await settleCancelledQueuedJob(ctx, job, null, value)) return job
         return settleAsyncJob(ctx, job, summarize(value))
       })
-      .catch((error) =>
-        settleAsyncJob(ctx, job, {
+      .catch(async (error) => {
+        recordAsyncStartFailure(job, error)
+        return settleAsyncJob(ctx, job, {
           status: 'ERROR',
           ms: Date.now() - job.startedAt,
           exitCode: null,
           excerpt: '',
           error: String(error?.message ?? error),
-        }),
-      )
+        })
+      })
     return {
       status: job.status,
       queuePosition: job.queuePosition,
@@ -2904,9 +3004,11 @@ export function apply(ctx, config = {}) {
     // 已经投过就别再投一次（同一次派活只该有一条回传）
     if (record.delivery === 'sent') {
       saveAsyncState()
+      releaseSettledAsyncJob(job.id, record)
       return job
     }
     await deliverAsyncWithRetry(ctx, job, record, text)
+    releaseSettledAsyncJob(job.id, record)
     return job
   }
 
@@ -2945,6 +3047,15 @@ export function apply(ctx, config = {}) {
     asyncDeliveryTimers.delete(id)
   }
 
+  // 任务已结束且回传状态已经定案才从内存活跃表移除；重试中的仍要可见。
+  function releaseSettledAsyncJob(id, record = asyncState.jobs[id]) {
+    const job = ASYNC_JOBS.get(String(id || ''))
+    if (!job?.endedAt || !record) return false
+    if (record.delivery === 'retrying' || record.nextRetryAt || asyncDeliveryTimers.has(job.id)) return false
+    if (!['sent', 'failed', 'no-agent', 'skipped'].includes(String(record.delivery || ''))) return false
+    return ASYNC_JOBS.delete(job.id)
+  }
+
   function scheduleAsyncDeliveryRetry(ctx, id, delayMs) {
     clearAsyncDeliveryTimer(id)
     const timer = setTimeout(() => {
@@ -2981,7 +3092,9 @@ export function apply(ctx, config = {}) {
       job.deliveryError = String(error?.message ?? error).slice(0, 400)
       ok = false
     }
-    const next = nextAsyncDelivery(record, ok ? 'sent' : 'failed')
+    const next = job.delivery === 'no-agent'
+      ? { delivery: 'no-agent', attempts, retryAt: 0, delayMs: 0, exhausted: false }
+      : nextAsyncDelivery(record, ok ? 'sent' : 'failed')
     record.delivery = next.delivery
     record.deliveryAttempts = next.attempts
     record.deliveryError = ok ? '' : job.deliveryError || record.deliveryError || ''
@@ -2994,6 +3107,7 @@ export function apply(ctx, config = {}) {
       clearAsyncDeliveryTimer(record.id)
     }
     saveAsyncState()
+    releaseSettledAsyncJob(job.id, record)
     return ok
   }
 
@@ -3399,7 +3513,10 @@ export function apply(ctx, config = {}) {
             // 排查「投没投出去 / 是不是孤儿」就看这里，不用去翻日志。
             if (u.pathname === '/dsh-hands/async') {
               const limit = Math.max(1, Math.min(200, Number(u.searchParams.get('n') || '50')))
-              const live = [...ASYNC_JOBS.values()].map((job) =>
+              const live = [...ASYNC_JOBS.values()]
+                .filter((job) => !job.endedAt || job.delivery === 'retrying' || asyncDeliveryTimers.has(job.id))
+                .sort((a, b) => asyncJobStartedMs(b.startedAt) - asyncJobStartedMs(a.startedAt))
+                .map((job) =>
                 clean({
                   id: job.id,
                   hand: job.hand,
@@ -3420,7 +3537,7 @@ export function apply(ctx, config = {}) {
                 }),
               )
               const persisted = Object.values(asyncState.jobs || {})
-                .sort((a, b) => Number(b.startedAt || 0) - Number(a.startedAt || 0))
+                .sort((a, b) => asyncJobStartedMs(b.startedAt) - asyncJobStartedMs(a.startedAt))
                 .slice(0, limit)
                 .map((record) =>
                   clean({
@@ -3722,9 +3839,7 @@ export function apply(ctx, config = {}) {
                 // 语义分块：只在真的变了才带；老客户端看到多余字段会忽略。
                 // 分块变了但正文没变（比如只多了一条工具记录）也要推一帧。
                 const rawBlocks = Array.isArray(target.entry.blocks) ? target.entry.blocks : []
-                const blocksSig = rawBlocks.length
-                  ? `${rawBlocks.length}:${rawBlocks.map((b) => `${b.kind}${b.text ? b.text.length : 0}${b.name || ''}`).join('|')}`
-                  : ''
+                const blocksSig = blocksSignature(rawBlocks)
                 const blocksChanged = sentBlocks.get(id) !== blocksSig
                 if (!delta.changed && !blocksChanged) {
                   if (!target.running) settled.add(id)
@@ -4043,6 +4158,12 @@ export function apply(ctx, config = {}) {
       // 第三方供应商：缺 key 等问题在跑活前抛清晰错误，别等跑完才报
       const providerCtx = agyProviderContext(args?.provider)
       const runCwd = resolveRunCwd(args, exec)
+      const label = typeof args?.session === 'string' ? args.session.trim() : ''
+      // 入队前完成守卫/票据核销；真正的会话 id 在 perform 里重读最新索引。
+      const plannedSession = resolveSession(
+        loadIndex(), label, runCwd, args, 'agy', sessionIdFromExec(exec), readArchive(),
+      )
+      const ticketExpiresAt = plannedSession.ticketExpiresAt
 
       // runId：异步派活时由外层预分配，保证 jobId 和日志 id 是同一个
       const perform = async (runId = '') => {
@@ -4050,9 +4171,12 @@ export function apply(ctx, config = {}) {
 
       // 三种定位会话的方式，优先级：conversationId > session 名字 > continueLast
       const index = loadIndex()
-      const label = typeof args?.session === 'string' ? args.session.trim() : ''
       // 统一走守卫：agy_run 以前自己查 index、没走 resolveSession，同目录守卫在它身上失效了
-      const resume = resolveSession(index, label, runCwd, args, 'agy', sessionIdFromExec(exec), readArchive())
+      const resume = resolveSession(
+        index, label, runCwd, args, 'agy', sessionIdFromExec(exec), readArchive(),
+        { ticketApproved: Number.isFinite(ticketExpiresAt), consumeTicket: false },
+      )
+      assertSessionTicketWindow(ticketExpiresAt)
       const resumeId = resume.id || (args?.conversationId ? String(args.conversationId) : '')
       if (resumeId) argv.push('--conversation', resumeId)
       else if (args?.continueLast) argv.push('--continue')
@@ -4163,8 +4287,8 @@ export function apply(ctx, config = {}) {
           tool: 'agy_run',
           sessionId: sessionIdFromExec(exec),
           session: String(args?.session || '').trim(),
-          conversationId: String(args?.conversationId || ''),
-          sessionKey: sessionKeyOf('agy', args?.session, Date.now(), args?.conversationId || jobId),
+          conversationId: plannedSession.id || String(args?.conversationId || ''),
+          sessionKey: sessionKeyOf('agy', args?.session, Date.now(), plannedSession.id || args?.conversationId || jobId),
           cwd: runCwd,
           model: String(args?.model || ''),
           prompt,
@@ -4398,10 +4522,6 @@ export function apply(ctx, config = {}) {
     return readJson(CODEX_INDEX, {}) || {}
   }
 
-  function saveCodexIndex(index) {
-    writeJson(CODEX_INDEX, index)
-  }
-
   // codex 会把 "session id: <uuid>" 打在输出开头，拿来续会话
   function pickSessionId(raw) {
     const m = String(raw || '').match(/session id:\s*([0-9a-fA-F-]{16,})/)
@@ -4485,13 +4605,22 @@ export function apply(ctx, config = {}) {
       const prompt = String(args?.prompt ?? '')
       if (!prompt.trim()) throw new Error('prompt is required')
 
+      const name = args?.session ? String(args.session) : ''
+      const workdir = resolveRunCwd(args, exec)
+      const plannedSession = resolveSession(
+        loadCodexIndex(), name, workdir, args, 'codex', sessionIdFromExec(exec), readArchive(),
+      )
+      const ticketExpiresAt = plannedSession.ticketExpiresAt
+
       // runId：异步派活时由外层预分配，保证 jobId 和日志 id 是同一个
       const perform = async (runId = '') => {
       const index = loadCodexIndex()
-      const name = args?.session ? String(args.session) : ''
       const sandbox = String(args?.sandbox || 'read-only')
-      const workdir = resolveRunCwd(args, exec)
-      const resume = resolveSession(index, name, workdir, args, 'codex', '', readArchive())
+      const resume = resolveSession(
+        index, name, workdir, args, 'codex', sessionIdFromExec(exec), readArchive(),
+        { ticketApproved: Number.isFinite(ticketExpiresAt), consumeTicket: false },
+      )
+      assertSessionTicketWindow(ticketExpiresAt)
       const known = resume.id
       const sessionReset = resume.reset
 
@@ -4552,9 +4681,8 @@ export function apply(ctx, config = {}) {
       const sid = collected.sessionId || pickSessionId(raw) || pickSessionId(err) || (resumed ? known : null)
 
       if (name && sid) {
-        index[name] = { id: sid, cwd: workdir, updated: new Date().toISOString() }
         recordSessionName('codex', name, sid, workdir)
-        saveCodexIndex(index)
+        updateSessionIndex(CODEX_INDEX, name, { id: sid, cwd: workdir, updated: new Date().toISOString() })
       }
 
       const verdict = outcome(result, collected.failed ? 'ERROR' : undefined)
@@ -4593,9 +4721,9 @@ export function apply(ctx, config = {}) {
           tool: 'codex_run',
           sessionId: sessionIdFromExec(exec),
           session: String(args?.session || '').trim(),
-          conversationId: String(args?.conversationId || ''),
-          sessionKey: sessionKeyOf('codex', args?.session, Date.now(), args?.conversationId || jobId),
-          cwd: resolveRunCwd(args, exec),
+          conversationId: plannedSession.id || String(args?.conversationId || ''),
+          sessionKey: sessionKeyOf('codex', args?.session, Date.now(), plannedSession.id || args?.conversationId || jobId),
+          cwd: workdir,
           model: String(args?.model || ''),
           prompt,
           startedAt: Date.now(),
@@ -4807,21 +4935,10 @@ export function apply(ctx, config = {}) {
       const index = readJson(CLAUDE_INDEX, {}) || {}
       const name = args?.session ? String(args.session) : ''
       const runCwd = resolveRunCwd(args, exec)
-      const resume = resolveSession(index, name, runCwd, args, 'claude', sessionIdFromExec(exec), readArchive())
-      const known = resume.id
-      const sessionReset = resume.reset
-
-      const argv = [
-        '-p',
-        prompt,
-        '--output-format',
-        'stream-json',
-        '--verbose',
-        '--include-partial-messages',
-      ]
-      if (args?.model) argv.push('--model', String(args.model))
-      if (args?.permissionMode) argv.push('--permission-mode', String(args.permissionMode))
-      if (known) argv.push('--resume', known)
+      const plannedSession = resolveSession(index, name, runCwd, args, 'claude', sessionIdFromExec(exec), readArchive())
+      const ticketExpiresAt = plannedSession.ticketExpiresAt
+      let known = ''
+      let sessionReset = false
 
       const dispatchFields = {
         hand: 'claude',
@@ -4829,7 +4946,6 @@ export function apply(ctx, config = {}) {
         prompt,
         write: args?.permissionMode === 'acceptEdits' || args?.permissionMode === 'auto',
         session: name,
-        conversationId: known || '',
         cwd: runCwd,
         model: args?.model || '',
       }
@@ -4844,9 +4960,8 @@ export function apply(ctx, config = {}) {
 
         const sid = parsed?.session_id || known || ''
         if (name && sid) {
-          index[name] = { id: sid, cwd: runCwd, updated: new Date().toISOString() }
           recordSessionName('claude', name, sid, runCwd)
-          writeJson(CLAUDE_INDEX, index)
+          updateSessionIndex(CLAUDE_INDEX, name, { id: sid, cwd: runCwd, updated: new Date().toISOString() })
         }
 
         const usage = parsed?.usage || {}
@@ -4878,7 +4993,7 @@ export function apply(ctx, config = {}) {
         })
       }
 
-      const spawn = () =>
+      const spawn = (argv) =>
         runProcess(claudeBin, argv, {
           cwd: resolveRunCwd(args, exec),
           timeoutSec: effTimeout(args),
@@ -4887,8 +5002,27 @@ export function apply(ctx, config = {}) {
         })
 
       const perform = async () => {
-        run = startDispatch({ ...dispatchFields, id: forcedDispatchId || undefined })
-        return settle(await spawn())
+        const latest = readJson(CLAUDE_INDEX, {}) || {}
+        const resume = resolveSession(
+          latest, name, runCwd, args, 'claude', sessionIdFromExec(exec), readArchive(),
+          { ticketApproved: Number.isFinite(ticketExpiresAt), consumeTicket: false },
+        )
+        assertSessionTicketWindow(ticketExpiresAt)
+        known = resume.id || ''
+        sessionReset = resume.reset
+        const argv = [
+          '-p',
+          prompt,
+          '--output-format',
+          'stream-json',
+          '--verbose',
+          '--include-partial-messages',
+        ]
+        if (args?.model) argv.push('--model', String(args.model))
+        if (args?.permissionMode) argv.push('--permission-mode', String(args.permissionMode))
+        if (known) argv.push('--resume', known)
+        run = startDispatch({ ...dispatchFields, conversationId: known, id: forcedDispatchId || undefined })
+        return settle(await spawn(argv))
       }
 
       // 异步：立刻返回 jobId，跑完把结果投回调用方会话
@@ -4902,8 +5036,8 @@ export function apply(ctx, config = {}) {
           tool: 'claude_run',
           sessionId: sessionIdFromExec(exec),
           session: name,
-          conversationId: known || '',
-          sessionKey: sessionKeyOf('claude', name, Date.now(), known || jobId),
+          conversationId: plannedSession.id || '',
+          sessionKey: sessionKeyOf('claude', name, Date.now(), plannedSession.id || jobId),
           cwd: runCwd,
           model: String(args?.model || ''),
           prompt,
@@ -5013,9 +5147,10 @@ export function apply(ctx, config = {}) {
       const index = readJson(OPENCODE_INDEX, {}) || {}
       const name = args?.session ? String(args.session) : ''
       const runCwd = resolveRunCwd(args, exec)
-      const resume = resolveSession(index, name, runCwd, args, 'opencode', sessionIdFromExec(exec), readArchive())
-      const known = resume.id
-      const sessionReset = resume.reset
+      const plannedSession = resolveSession(index, name, runCwd, args, 'opencode', sessionIdFromExec(exec), readArchive())
+      const ticketExpiresAt = plannedSession.ticketExpiresAt
+      let known = ''
+      let sessionReset = false
       const model = args?.model ? String(args.model) : ''
       const timeoutSec = effTimeout(args)
 
@@ -5025,7 +5160,6 @@ export function apply(ctx, config = {}) {
         prompt,
         write: !!args?.auto,
         session: name,
-        conversationId: known || '',
         cwd: runCwd,
         model,
       }
@@ -5033,7 +5167,15 @@ export function apply(ctx, config = {}) {
       let forcedDispatchId = ''
 
       const perform = async () => {
-      if (!run) run = startDispatch({ ...dispatchFields, id: forcedDispatchId || undefined })
+      const latest = readJson(OPENCODE_INDEX, {}) || {}
+      const resume = resolveSession(
+        latest, name, runCwd, args, 'opencode', sessionIdFromExec(exec), readArchive(),
+        { ticketApproved: Number.isFinite(ticketExpiresAt), consumeTicket: false },
+      )
+      assertSessionTicketWindow(ticketExpiresAt)
+      known = resume.id || ''
+      sessionReset = resume.reset
+      if (!run) run = startDispatch({ ...dispatchFields, conversationId: known, id: forcedDispatchId || undefined })
       // 开关命中就先走 ACP；拿不到结果（异常 / ok=false）runAcpTurn 已记日志并返回 null，
       // 下面的 CLI 分支就是那次回退，行为与以前完全一致。
       const acp = useAcp('opencode')
@@ -5094,9 +5236,8 @@ export function apply(ctx, config = {}) {
       }
 
       if (name && sid) {
-        index[name] = { id: sid, cwd: runCwd, updated: new Date().toISOString() }
         recordSessionName('opencode', name, sid, runCwd)
-        writeJson(OPENCODE_INDEX, index)
+        updateSessionIndex(OPENCODE_INDEX, name, { id: sid, cwd: runCwd, updated: new Date().toISOString() })
       }
 
       finishDispatch(run, {
@@ -5142,8 +5283,8 @@ export function apply(ctx, config = {}) {
           tool: 'opencode_run',
           sessionId: sessionIdFromExec(exec),
           session: name,
-          conversationId: known || '',
-          sessionKey: sessionKeyOf('opencode', name, Date.now(), known || jobId),
+          conversationId: plannedSession.id || '',
+          sessionKey: sessionKeyOf('opencode', name, Date.now(), plannedSession.id || jobId),
           cwd: runCwd,
           model,
           prompt,
@@ -5531,9 +5672,10 @@ export function apply(ctx, config = {}) {
       const index = readJson(idxFile, {}) || {}
       const name = args?.session ? String(args.session) : ''
       const runCwd = resolveRunCwd(args, ctx)
-      const resume = resolveSession(index, name, runCwd, args, to, sessionIdFromExec(ctx), readArchive())
-      const known = resume.id
-      const sessionReset = resume.reset
+      const plannedSession = resolveSession(index, name, runCwd, args, to, sessionIdFromExec(ctx), readArchive())
+      const ticketExpiresAt = plannedSession.ticketExpiresAt
+      let known = ''
+      let sessionReset = false
 
       const opts = { write: !!args?.write, model: args?.model || '', provider: args?.provider || '' }
       // 第三方供应商：只对 agy 生效；缺 key 等问题在这里抛清晰错误，跑活前停下
@@ -5546,7 +5688,6 @@ export function apply(ctx, config = {}) {
         prompt,
         write: opts.write,
         session: name,
-        conversationId: known || '',
         cwd: runCwd,
         model: opts.model,
       }
@@ -5554,7 +5695,15 @@ export function apply(ctx, config = {}) {
       let forcedDispatchId = ''
 
       const perform = async () => {
-      if (!run) run = startDispatch({ ...dispatchFields, id: forcedDispatchId || undefined })
+      const latest = readJson(idxFile, {}) || {}
+      const resume = resolveSession(
+        latest, name, runCwd, args, to, sessionIdFromExec(ctx), readArchive(),
+        { ticketApproved: Number.isFinite(ticketExpiresAt), consumeTicket: false },
+      )
+      assertSessionTicketWindow(ticketExpiresAt)
+      known = resume.id || ''
+      sessionReset = resume.reset
+      if (!run) run = startDispatch({ ...dispatchFields, conversationId: known, id: forcedDispatchId || undefined })
       // config.acpHands 点名的手下先走 ACP；没命中 / 失败回退 CLI，argv 仍按老配方 build。
       const acp = useAcp(to)
         ? await runAcpTurn(to, {
@@ -5613,9 +5762,8 @@ export function apply(ctx, config = {}) {
       }
 
       if (name && sid && sid !== known) {
-        index[name] = { id: sid, cwd: runCwd, updated: new Date().toISOString() }
         recordSessionName(to, name, sid, runCwd)
-        writeJson(idxFile, index)
+        updateSessionIndex(idxFile, name, { id: sid, cwd: runCwd, updated: new Date().toISOString() })
       }
 
       finishDispatch(run, {
@@ -5665,8 +5813,8 @@ export function apply(ctx, config = {}) {
             sessionIdFromExec(ctx) ||
             String(ctx?.session?.id || ctx?.sessionId || ctx?.agent?.session?.id || ''),
           session: name,
-          conversationId: known || '',
-          sessionKey: sessionKeyOf(to, name, Date.now(), known || jobId),
+          conversationId: plannedSession.id || '',
+          sessionKey: sessionKeyOf(to, name, Date.now(), plannedSession.id || jobId),
           cwd: runCwd,
           model: opts.model,
           prompt,

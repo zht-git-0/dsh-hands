@@ -2,6 +2,7 @@
 // 只测 stream.js 的纯函数：喂代表性的 CLI JSONL，看 blocks 分得对不对、失败有没有回落。
 import assert from 'node:assert/strict'
 import { createLiveView } from '../stream.js'
+import { blocksSignature } from '../index.js'
 
 const feed = (view, hand, events) => {
   for (const event of events) view.feed(JSON.stringify(event) + '\n')
@@ -173,13 +174,17 @@ const feed = (view, hand, events) => {
 {
   const view = createLiveView('claude')
   const long = 'y'.repeat(3000)
-  const blocks = feed(view, 'claude', [
+  const before = feed(view, 'claude', [
     {
       type: 'stream_event',
       event: { type: 'content_block_start', content_block: { type: 'tool_use', id: 'tu1', name: 'Write', input: { file_path: 'a.txt' } } },
     },
+  ])
+  const beforeSig = blocksSignature(before)
+  const blocks = feed(view, 'claude', [
     { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tu1', content: long }] } },
   ])
+  assert.notEqual(blocksSignature(blocks), beforeSig, 'tool status/output 变化必须改变 blocks 签名')
   const tool = blocks.find((b) => b.kind === 'tool')
   assert.ok(tool, 'tool 块存在')
   assert.equal(tool.status, 'completed')

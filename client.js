@@ -3562,6 +3562,7 @@ window.__ModuleLoader__.load({
       const persisted = Array.isArray(snap?.persisted) ? snap.persisted : [];
       const rows = [...live, ...persisted]
         .filter((job, index, list) => job && job.id && list.findIndex((item) => item && item.id === job.id) === index)
+        .filter((job) => turnIsRunning(job) || isQueued(job) || job.delivery === 'failed')
         .slice(0, 20);
       const running = rows.filter((job) => turnIsRunning(job)).length;
       const queued = rows.filter((job) => isQueued(job)).length;

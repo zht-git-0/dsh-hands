@@ -278,6 +278,15 @@ const t = (key, vars) => {
   assert.equal(mixed.queued, 0)
   assert.equal(mixed.failed, 1, '回传失败仍计数')
 
+  const oldJobs = Array.from({ length: 20 }, (_, index) => ({
+    id: `old-${index}`, status: 'OK', running: false, delivery: 'sent', startedAt: index,
+  }))
+  const active = { id: 'new-running', status: 'RUNNING', running: true, delivery: 'pending', startedAt: 999 }
+  const crowded = asyncBarState({ live: oldJobs, persisted: [active] })
+  assert.equal(crowded.running, 1, '20 条老 OK 不会把新 RUNNING 挤出状态条')
+  assert.equal(crowded.visible, true)
+  assert.deepEqual(crowded.rows.map((job) => job.id), ['new-running'])
+
   console.log('2b) QUEUED 优先级 / 元信息 / 光标 / 异步汇总 ok')
 }
 

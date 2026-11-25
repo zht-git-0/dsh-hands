@@ -159,8 +159,14 @@ import { asyncReportText, createAsyncQueue, findAgentFor, formatDuration, isProc
   writeAsyncState(many, file)
   const capped = readAsyncState(file)
   assert.equal(Object.keys(capped.jobs).length, 200, '最多留 200 条')
+  assert.equal(Object.keys(many.jobs).length, 200, '内存 jobs 同步裁剪')
   assert.ok(capped.jobs.j259, '留的是最新的')
   assert.ok(!capped.jobs.j0, '最老的被裁掉')
+
+  const iso = '2026-11-25T12:00:00.000Z'
+  const mixedTimes = { jobs: { low: { startedAt: 1 }, iso: { startedAt: iso }, high: { startedAt: Date.parse(iso) + 1 } } }
+  writeAsyncState(mixedTimes, file)
+  assert.deepEqual(Object.keys(mixedTimes.jobs), ['high', 'iso', 'low'], 'ISO/毫秒时间统一排序')
 
   fs.rmSync(dir, { recursive: true, force: true })
   console.log('5) 落盘状态 + 重启补投计划 ok')

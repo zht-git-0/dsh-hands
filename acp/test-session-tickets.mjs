@@ -14,6 +14,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
+  assertSessionTicketWindow,
   consumeSessionTicket,
   issueSessionTicket,
   readSessionTicketLedger,
@@ -60,11 +61,12 @@ const INDEX2 = {
   const file = tmpLedger()
   const name = `new-job-2-${Date.now()}`
   const { ticket } = issueSessionTicket({ hand: 'opencode', cwd: 'D:/docs', name, index: INDEX }, { file })
-  assert.deepEqual(
-    resolveSession(INDEX, name, 'D:/docs', { sessionMode: 'new', ticket }, 'opencode', ''),
-    { id: null, reset: false },
-    '正常发票→new 通过',
-  )
+  const planned = resolveSession(INDEX, name, 'D:/docs', { sessionMode: 'new', ticket }, 'opencode', '')
+  assert.equal(planned.id, null, '正常发票→new 通过')
+  assert.equal(planned.reset, false)
+  assert.ok(planned.ticketExpiresAt > Date.now(), '返回票据授权截止时间，供排队期间检查')
+  assert.doesNotThrow(() => assertSessionTicketWindow(planned.ticketExpiresAt))
+  assert.throws(() => assertSessionTicketWindow(planned.ticketExpiresAt, planned.ticketExpiresAt + 1), /排队期间新建会话票据已过期/)
   assert.equal(validateSessionTicket(ticket, 'opencode', 'D:/docs', name, '').ok, false, '票据核销一次：再校验就失效')
 
   const name2 = `auto-job-${Date.now()}`
@@ -72,11 +74,10 @@ const INDEX2 = {
     { hand: 'opencode', cwd: 'D:/libs', name: name2, index: INDEX2 },
     { file },
   )
-  assert.deepEqual(
-    resolveSession(INDEX2, name2, 'D:/libs', { sessionMode: 'auto', ticket: ticket2 }, 'opencode', ''),
-    { id: null, reset: false },
-    '换名 auto 建会话通过（目录有其他会话，票据放行）',
-  )
+  const plannedAuto = resolveSession(INDEX2, name2, 'D:/libs', { sessionMode: 'auto', ticket: ticket2 }, 'opencode', '')
+  assert.equal(plannedAuto.id, null, '换名 auto 建会话通过（目录有其他会话，票据放行）')
+  assert.equal(plannedAuto.reset, false)
+  assert.ok(plannedAuto.ticketExpiresAt > Date.now())
   fs.rmSync(path.dirname(file), { recursive: true, force: true })
   console.log('2) 正常发票→new 通过 / auto 换名新建通过 / 核销一次 ok')
 }
