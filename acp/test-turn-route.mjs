@@ -24,6 +24,9 @@ const records = fixtures.map(({ id, text, outputLength, blocks }) => {
   fs.writeFileSync(jobFile, text)
   return { id, hand: 'opencode', tool: 'hands_run', session: id, sessionKey: `opencode/${id}`, conversationId: `sid_${id}`, cwd: 'D:/work', startedAt: at, at, status: 'OK', ok: true, ms: 1, prompt: id, excerpt: text, jobFile, outputLength, ...(blocks ? { blocks } : {}) }
 })
+const binaryText = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB' + 'A'.repeat(600)
+fs.writeFileSync(path.join(jobs, 'claude-binary.txt'), binaryText)
+records.push({ id: 'claude-binary', hand: 'claude', tool: 'hands_run', session: 'claude-binary', sessionKey: 'claude/claude-binary', conversationId: 'sid_claude_binary', cwd: 'D:/work', startedAt: at, at, status: 'OK', ok: true, ms: 1, prompt: 'binary', excerpt: binaryText, jobFile: path.join(jobs, 'claude-binary.txt'), outputLength: binaryText.length, blocks: [{ kind: 'text', text: binaryText }] })
 fs.writeFileSync(path.join(dsh, 'hands-log.jsonl'), records.map(JSON.stringify).join('\n') + '\n')
 const childFile = path.join(root, 'child.mjs')
 fs.writeFileSync(childFile, `
@@ -68,6 +71,8 @@ assert.equal(typeof derived.delta, 'string')
 assert.equal(derived.next, derived.from + derived.delta.length)
 assert.equal(derived.blocksDerived, true)
 assert.ok(derived.blocks.some((block) => block.kind === 'tool'))
+const historicalBinary = await get('claude-binary', 0)
+assert.ok(historicalBinary.blocks[0].text.startsWith('该段输出疑似非文本内容（可能是上游返回异常）'))
 for (const cleanup of cleanups) cleanup()
 console.log('turn route contract ok')
 `)

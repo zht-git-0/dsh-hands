@@ -4,9 +4,45 @@
 
 const MAX_LIVE = 200000
 const MAX_LINE_LENGTH = 65536
+export const NON_TEXT_WARNING = '该段输出疑似非文本内容（可能是上游返回异常）'
 
 function asText(value) {
   return typeof value === 'string' ? value : ''
+}
+
+// Claude/中转站偶尔会把图片 tool_result 当 assistant text 吐出来：可能是 JSON，也可能是裸 base64。
+// 不做解码（无法可靠还原），只在正文前给明确警告，避免用户误以为插件崩了。
+function isSuspiciousNonText(value) {
+  const text = String(value || '').trim()
+  if (!text) return false
+  if (/^data:image\//i.test(text) && /;base64,/i.test(text)) return true
+  if (text.length >= 256) {
+    if (/^(iVBORw0KGgo|\/9j\/|R0lGOD|UklGR)/.test(text)) return true
+    if (/^[A-Za-z0-9+/=\r\n]+$/.test(text) && /[+/=]/.test(text)) return true
+  }
+  if (text.startsWith('{')) {
+    try {
+      const value = JSON.parse(text)
+      const type = String(value?.type || value?.media_type || value?.mimeType || value?.source?.media_type || '')
+      if (type.startsWith('image/')) return true
+    } catch {
+      /* 不是 JSON 就按普通文本 */
+    }
+  }
+  return false
+}
+
+function withNonTextWarning(value) {
+  const text = asText(value)
+  if (!isSuspiciousNonText(text) || text.startsWith(NON_TEXT_WARNING)) return text
+  return `${NON_TEXT_WARNING}\n${text}`
+}
+
+export function markNonTextBlocks(blocks, hand) {
+  if (hand !== 'claude' || !Array.isArray(blocks)) return blocks
+  return blocks.map((block) =>
+    block?.kind === 'text' ? { ...block, text: withNonTextWarning(block.text) } : block,
+  )
 }
 
 function stripAnsi(value) {
@@ -172,16 +208,18 @@ export function createLiveView(hand) {
     }
     return null
   }
-  const pushToolBlock = (name, detail, status, output = '', id = '') => {
+  const pushToolBlock = (name, detail, status, output = '', id = '', input = '') => {
     const tool = String(name || 'tool').trim().slice(0, 80) || 'tool'
     const detailText = String(detail || '').trim().slice(0, 200)
     const outputText = String(output || '').slice(-2000)
+    const inputText = String(input || '').slice(0, 4000)
     const existing = findToolBlock(String(id || ''))
     if (existing) {
       if (tool) existing.name = tool
       if (detailText) existing.detail = detailText
       if (status) existing.status = String(status)
       if (outputText) existing.output = outputText
+      if (inputText) existing.input = inputText
       return
     }
     pushBlock({
@@ -190,6 +228,7 @@ export function createLiveView(hand) {
       detail: detailText,
       status: String(status || ''),
       ...(id ? { toolId: String(id) } : {}),
+      ...(inputText ? { input: inputText } : {}),
       ...(outputText ? { output: outputText } : {}),
     })
   }
@@ -341,7 +380,7 @@ export function createLiveView(hand) {
         return
       }
       if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
-        const value = asText(event.delta.text)
+        const value = withNonTextWarning(event.delta.text)
         if (value) {
           if (!claude.sawDelta) newline()
           append(value)
@@ -357,8 +396,9 @@ export function createLiveView(hand) {
       const skipText = claude.sawDelta && String(ev.message.id || '') === claude.messageId
       for (const part of content) {
         if (part.type === 'text' && part.text && !skipText) {
-          block(part.text)
-          pushTextBlock(part.text, part.id || '')
+          const value = withNonTextWarning(part.text)
+          block(value)
+          pushTextBlock(value, part.id || '')
         }
         if (part.type === 'thinking') pushReasoningBlock(part.thinking || part.text)
         if (part.type === 'tool_use') {
@@ -393,7 +433,7 @@ export function createLiveView(hand) {
       return
     }
     if (ev.type === 'result') {
-      if (!text.trim() && ev.result) block(ev.result)
+      if (!text.trim() && typeof ev.result === 'string') block(withNonTextWarning(ev.result))
     }
   }
 
@@ -421,8 +461,25 @@ export function createLiveView(hand) {
         pushTextBlock(step.text)
       }
       if (step.tool_name) {
-        line(`→ ${step.tool_name}`)
-        pushToolBlock(step.tool_name)
+        const info = step.tool_info && typeof step.tool_info === 'object' ? step.tool_info : {}
+        const rawInput = info.parameters ?? info.args ?? info.arguments ?? info.input ?? step.args ?? step.arguments ?? step.input
+        let input = ''
+        if (rawInput !== undefined && rawInput !== null) {
+          try {
+            input = typeof rawInput === 'string' ? rawInput : JSON.stringify(rawInput, null, 2)
+          } catch {
+            input = String(rawInput)
+          }
+        }
+        const detail =
+          rawInput?.Path || rawInput?.path || rawInput?.FilePath || rawInput?.file_path ||
+          rawInput?.CommandLine || rawInput?.command || rawInput?.query || rawInput?.description || ''
+        const state = String(step.state || '').toUpperCase()
+        const status = state === 'DONE' ? 'completed' : state === 'ERROR' || state === 'FAILED' ? 'failed' : state === 'ACTIVE' ? 'running' : ''
+        const id = step.step_index === undefined ? '' : `agy:${step.step_index}:${step.tool_name}`
+        if (!findToolBlock(id)) line(`→ ${step.tool_name}${detail ? `: ${detail}` : ''}`)
+        const output = typeof info.output === 'string' ? info.output : info.output == null ? '' : JSON.stringify(info.output)
+        pushToolBlock(step.tool_name, detail, status, output, id, input)
       }
       return
     }
@@ -595,9 +652,10 @@ export function collectClaude(raw) {
     const out = { ...result }
     if (!out.session_id && sessionId) out.session_id = sessionId
     if (typeof out.result !== 'string' && text) out.result = text
+    if (typeof out.result === 'string') out.result = withNonTextWarning(out.result)
     return out
   }
-  if (text) return { session_id: sessionId, result: text }
+  if (text) return { session_id: sessionId, result: withNonTextWarning(text) }
   return null
 }
 

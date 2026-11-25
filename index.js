@@ -10,6 +10,7 @@ import {
   collectCodex,
   collectOpencode,
   createLiveView,
+  markNonTextBlocks,
 } from './stream.js'
 import { createAcpSessionPool } from './acp/session-pool.mjs'
 
@@ -3750,7 +3751,13 @@ export function apply(ctx, config = {}) {
       })
     }
     const entry = panel.jobs.find((job) => String(job.id || '') === String(id || ''))
-    return entry ? clean({ ...entry, output: readJobText(entry) }) : null
+    return entry
+      ? clean({
+          ...entry,
+          output: readJobText(entry),
+          ...(Array.isArray(entry.blocks) ? { blocks: markNonTextBlocks(entry.blocks, entry.hand) } : {}),
+        })
+      : null
   }
 
   // ── v2 面板的组装函数（不碰 req/res，/agents、/sessions、/stream 共用）────────
@@ -4380,7 +4387,9 @@ export function apply(ctx, config = {}) {
                 const delta = computeLiveDeltaByLength(text, sentLengths.get(id) || 0, totalLength)
                 // 语义分块：只在真的变了才带；老客户端看到多余字段会忽略。
                 // 分块变了但正文没变（比如只多了一条工具记录）也要推一帧。
-                const rawBlocks = Array.isArray(target.entry.blocks) ? target.entry.blocks : []
+                const rawBlocks = Array.isArray(target.entry.blocks)
+                  ? markNonTextBlocks(target.entry.blocks, target.entry.hand)
+                  : []
                 const blocksSig = blocksSignature(rawBlocks)
                 const blocksChanged = sentBlocks.get(id) !== blocksSig
                 if (!delta.changed && !blocksChanged) {

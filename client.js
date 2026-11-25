@@ -62,6 +62,8 @@ window.__ModuleLoader__.load({
       toolRunning: 'running',
       toolDone: 'done',
       toolFailed: 'failed',
+      toolArgs: 'Arguments',
+      toolOutput: 'Output',
       openFolder: 'Open folder',
       copy: 'Copy',
       copied: 'Copied',
@@ -116,6 +118,8 @@ window.__ModuleLoader__.load({
       v2Collapse: 'Show less',
       v2LoadFull: 'Load full text',
       v2LoadOlder: 'Load older turns',
+      scrollTop: 'Top',
+      scrollBottom: 'Bottom',
       v2Tokens: 'tokens',
       blocksFallback: 'Fallback view',
       blocksFallbackHint: 'Structured blocks are unavailable; showing a text-parsed compatibility view.',
@@ -160,6 +164,8 @@ window.__ModuleLoader__.load({
       toolRunning: '运行中',
       toolDone: '完成',
       toolFailed: '失败',
+      toolArgs: '参数',
+      toolOutput: '输出',
       openFolder: '打开文件夹',
       copy: '复制',
       copied: '已复制',
@@ -214,6 +220,8 @@ window.__ModuleLoader__.load({
       v2Collapse: '收起',
       v2LoadFull: '加载全文',
       v2LoadOlder: '加载更早',
+      scrollTop: '顶部',
+      scrollBottom: '底部',
       v2Tokens: 'tokens',
       blocksFallback: '兼容视图',
       blocksFallbackHint: '结构化 blocks 缺失，当前显示按文本解析的兼容视图。',
@@ -1781,6 +1789,86 @@ window.__ModuleLoader__.load({
       }, [active]);
     }
 
+    // 滚动位置只做轻量提示：原生细滚动条负责拖动，这个小标记负责顶部/中部/底部语义。
+    function scrollMarkerState(element) {
+      if (!element) return { scrollable: false, percent: 0, atTop: true, atBottom: true };
+      const scrollHeight = Math.max(0, Number(element.scrollHeight) || 0);
+      const clientHeight = Math.max(0, Number(element.clientHeight) || 0);
+      const scrollable = scrollHeight - clientHeight > 1;
+      const maxTop = Math.max(0, scrollHeight - clientHeight);
+      const scrollTop = Math.min(maxTop, Math.max(0, Number(element.scrollTop) || 0));
+      return {
+        scrollable,
+        percent: maxTop ? Math.round((scrollTop / maxTop) * 100) : 0,
+        atTop: !scrollable || scrollTop <= 1,
+        atBottom: !scrollable || scrollTop >= maxTop - 1,
+      };
+    }
+
+    function useScrollMarker(ref, resetKey) {
+      const [state, setState] = React.useState({ scrollable: false, percent: 0, atTop: true, atBottom: true, visible: false });
+      const hideTimer = React.useRef(null);
+      const update = React.useCallback((show = true) => {
+        const element = ref.current;
+        const next = scrollMarkerState(element);
+        setState((prev) => ({ ...prev, ...next, visible: !!show && next.scrollable }));
+        if (!element) return;
+        if (hideTimer.current) clearTimeout(hideTimer.current);
+        if (!show) {
+          delete element.dataset.scrolling;
+          return;
+        }
+        element.dataset.scrolling = 'true';
+        hideTimer.current = setTimeout(() => {
+          delete element.dataset.scrolling;
+          setState((prev) => ({ ...prev, visible: false }));
+          hideTimer.current = null;
+        }, 900);
+      }, [ref]);
+      React.useLayoutEffect(() => {
+        update(false);
+        if (typeof window === 'undefined') return undefined;
+        const onResize = () => update(false);
+        window.addEventListener('resize', onResize);
+        return () => {
+          window.removeEventListener('resize', onResize);
+          if (hideTimer.current) clearTimeout(hideTimer.current);
+          delete ref.current?.dataset.scrolling;
+        };
+      }, [ref, resetKey, update]);
+      return { state, onScroll: () => update(true) };
+    }
+
+    function ScrollMarker({ state, t = (key) => key }) {
+      const label = state?.atTop ? t('scrollTop') : state?.atBottom ? t('scrollBottom') : `${state?.percent || 0}%`;
+      return h('span', {
+        className: 'dsh-hands-scrollMarker',
+        'data-visible': state?.visible ? 'true' : 'false',
+        'data-top': state?.atTop ? 'true' : 'false',
+        'data-bottom': state?.atBottom ? 'true' : 'false',
+        'aria-hidden': true,
+      }, label);
+    }
+
+    function ScrollArea({ className, children, elementRef, onScroll, resetKey, t }) {
+      const localRef = React.useRef(null);
+      const ref = elementRef || localRef;
+      const marker = useScrollMarker(ref, resetKey);
+      return h(
+        'div',
+        { className: 'dsh-hands-v2-scrollShell' },
+        h('div', {
+          className,
+          ref,
+          onScroll: (event) => {
+            if (typeof onScroll === 'function') onScroll(event);
+            marker.onScroll();
+          },
+        }, children),
+        h(ScrollMarker, { state: marker.state, t }),
+      );
+    }
+
     // ── 图标（右侧栏引导页也用它）───────────────────────────────────────────
     function HandsIcon({ size = 16 }) {
       return h(
@@ -1918,6 +2006,16 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-iconBtn{flex:none;width:22px;height:22px;padding:0;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;line-height:1;cursor:pointer}
       .dsh-hands-v2-iconBtn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
       .dsh-hands-v2-list{flex:1;min-height:0;display:flex;flex-direction:column;gap:4px;padding:0 6px 8px;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain}
+      .dsh-hands-v2-scrollShell{position:relative;flex:1;min-height:0;display:flex;flex-direction:column}
+      .dsh-hands-v2-scrollShell>.dsh-hands-v2-list,.dsh-hands-v2-scrollShell>.dsh-hands-v2-threadBody{flex:1;min-height:0;scrollbar-width:thin;scrollbar-color:color-mix(in srgb,var(--dsw-alias-label-primary) 30%,transparent) transparent}
+      .dsh-hands-v2-scrollShell>.dsh-hands-v2-list::-webkit-scrollbar,.dsh-hands-v2-scrollShell>.dsh-hands-v2-threadBody::-webkit-scrollbar{width:6px;height:6px}
+      .dsh-hands-v2-scrollShell>.dsh-hands-v2-list::-webkit-scrollbar-track,.dsh-hands-v2-scrollShell>.dsh-hands-v2-threadBody::-webkit-scrollbar-track{background:transparent}
+      .dsh-hands-v2-scrollShell>.dsh-hands-v2-list::-webkit-scrollbar-thumb,.dsh-hands-v2-scrollShell>.dsh-hands-v2-threadBody::-webkit-scrollbar-thumb{border:1px solid transparent;border-radius:999px;background:color-mix(in srgb,var(--dsw-alias-label-primary) 30%,transparent);background-clip:padding-box}
+      .dsh-hands-v2-scrollShell>.dsh-hands-v2-list:hover::-webkit-scrollbar-thumb,.dsh-hands-v2-scrollShell>.dsh-hands-v2-threadBody:hover::-webkit-scrollbar-thumb,.dsh-hands-v2-scrollShell>.dsh-hands-v2-list[data-scrolling=true]::-webkit-scrollbar-thumb,.dsh-hands-v2-scrollShell>.dsh-hands-v2-threadBody[data-scrolling=true]::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--dsw-alias-label-primary) 68%,transparent)}
+      .dsh-hands-v2-scrollShell>.dsh-hands-v2-list[data-scrolling=true],.dsh-hands-v2-scrollShell>.dsh-hands-v2-threadBody[data-scrolling=true]{scrollbar-color:color-mix(in srgb,var(--dsw-alias-label-primary) 68%,transparent) transparent}
+      .dsh-hands-v2-scrollShell>.dsh-hands-v2-list::-webkit-scrollbar-corner,.dsh-hands-v2-scrollShell>.dsh-hands-v2-threadBody::-webkit-scrollbar-corner{background:transparent}
+      .dsh-hands-scrollMarker{position:absolute;right:8px;top:50%;z-index:3;transform:translateY(-50%);pointer-events:none;padding:0 4px;border-radius:999px;background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) 88%,var(--dsw-alias-label-primary));color:var(--dsw-alias-label-secondary);font-size:9px;line-height:14px;font-variant-numeric:tabular-nums;opacity:0;transition:opacity .15s ease}
+      .dsh-hands-scrollMarker[data-visible=true]{opacity:1}
       .dsh-hands-v2-group{display:flex;flex-direction:column;gap:2px;min-width:0}
       .dsh-hands-v2-search{flex:none;padding:0 8px 6px}
       .dsh-hands-v2-check{display:inline-flex;align-items:center;gap:4px;color:var(--dsw-alias-label-secondary);font-size:10.5px;line-height:15px;cursor:pointer}
@@ -2894,8 +2992,12 @@ window.__ModuleLoader__.load({
         ),
         visibleSessions.length
           ? h(
-              'div',
-              { className: 'dsh-hands-v2-list' },
+              ScrollArea,
+              {
+                className: 'dsh-hands-v2-list',
+                t,
+                resetKey: `${query}|${slice.sessions.length}|${Object.keys(collapsed).join('|')}`,
+              },
               groups.map((group) => {
                 const folderKey = group.key;
                 const anyRunning = group.sessions.some((row) => toneOf(row) === 'running');
@@ -3125,8 +3227,13 @@ window.__ModuleLoader__.load({
                 : null,
             ];
             const output = String(block.output || '');
-            // 有输出的工具（改文件/跑命令）：默认折叠，点开看内容
-            if (!output) {
+            const input = String(block.input || '');
+            const sections = [];
+            if (input) sections.push(`${t('toolArgs')}\n${input}`);
+            if (output) sections.push(`${t('toolOutput')}\n${output}`);
+            const body = sections.join('\n\n');
+            // 有参数或输出的工具：默认折叠，点开看 JSON/结果
+            if (!body) {
               return h(
                 'div',
                 { key: `b${index}`, className: 'dsh-hands-blockTool', 'data-status': block.status || '' },
@@ -3137,7 +3244,7 @@ window.__ModuleLoader__.load({
               'details',
               { key: `b${index}`, className: 'dsh-hands-blockTool', 'data-status': block.status || '' },
               h('summary', { className: 'dsh-hands-blockToolHead' }, head),
-              h('pre', { className: 'dsh-hands-blockToolBody' }, output),
+              h('pre', { className: 'dsh-hands-blockToolBody' }, body),
             );
           }
           if (block.kind === 'reasoning') {
@@ -3383,8 +3490,14 @@ window.__ModuleLoader__.load({
       }
 
       return h(
-        'div',
-        { className: 'dsh-hands-v2-threadBody', ref: listRef, onScroll },
+        ScrollArea,
+        {
+          className: 'dsh-hands-v2-threadBody',
+          elementRef: listRef,
+          onScroll,
+          resetKey: sessionKey,
+          t,
+        },
         h(
           'div',
           { className: 'dsh-hands-v2-turns', ref: innerRef },
@@ -4093,6 +4206,9 @@ window.__ModuleLoader__.load({
       HAND_BRAND_PATHS,
       MarkdownLite,
       MarkdownBlock,
+      scrollMarkerState,
+      ScrollMarker,
+      ScrollArea,
     };
   },
 });

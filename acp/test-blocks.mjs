@@ -1,7 +1,7 @@
 // 气泡分块（思维链/正文/工具）测试：node acp/test-blocks.mjs
 // 只测 stream.js 的纯函数：喂代表性的 CLI JSONL，看 blocks 分得对不对、失败有没有回落。
 import assert from 'node:assert/strict'
-import { createLiveView } from '../stream.js'
+import { createLiveView, markNonTextBlocks } from '../stream.js'
 import { blocksSignature } from '../index.js'
 
 const feed = (view, hand, events) => {
@@ -226,6 +226,100 @@ const feed = (view, hand, events) => {
   assert.equal(view.render(), '你好世界！')
   assert.equal(view.totalLength(), view.render().length)
   console.log('13) opencode 累计/增量单调偏移 ok')
+}
+
+// ── 14) claude 疑似图片/base64 文本：正文前给出可见警告 ─────────────────────
+{
+  const warning = '该段输出疑似非文本内容（可能是上游返回异常）'
+  const normal = createLiveView('claude')
+  normal.feed(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '正常中文输出' }] } }) + '\n')
+  normal.flush()
+  assert.equal(normal.render(), '正常中文输出')
+  assert.ok(!normal.blocks().some((block) => block.text?.includes(warning)))
+
+  const base64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB' + 'A'.repeat(600)
+  const binary = createLiveView('claude')
+  binary.feed(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: base64 }] } }) + '\n')
+  binary.flush()
+  assert.ok(binary.render().startsWith(warning), '长 base64 正文前必须有警告')
+  assert.ok(binary.blocks().some((block) => block.text?.startsWith(warning)))
+
+  const imageJson = JSON.stringify({ type: 'image/png', data: 'A'.repeat(600), originalSize: 500 })
+  const image = createLiveView('claude')
+  image.feed(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: imageJson }] } }) + '\n')
+  image.flush()
+  assert.ok(image.render().startsWith(warning), '图片 JSON 正文前必须有警告')
+
+  const buffered = createLiveView('claude')
+  buffered.feed(Buffer.from(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Buffer 中文正常' }] } }) + '\n', 'utf8'))
+  buffered.flush()
+  assert.equal(buffered.render(), 'Buffer 中文正常')
+
+  const toolImage = createLiveView('claude')
+  toolImage.feed(JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'img1', content: { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'A'.repeat(600) } } }] } }) + '\n')
+  toolImage.flush()
+  assert.ok(!toolImage.render().includes('AAAA'), 'user 图片对象不能泄漏成正文')
+  console.log('14) claude 非文本警告 ok')
+}
+
+// ── 15) agy tool_info.parameters：同 step 合并、参数可展开 ──────────────────
+{
+  const view = createLiveView('agy')
+  const blocks = feed(view, 'agy', [
+    { event: 'step_update', step_update: { step_index: 2, state: 'ACTIVE', step_type: 'tool', tool_name: 'read_file', tool_info: { name: 'read_file', parameters: { Path: 'D:/repo/a.txt' } } } },
+    { event: 'step_update', step_update: { step_index: 2, state: 'DONE', step_type: 'tool', tool_name: 'read_file', tool_info: { name: 'read_file', parameters: { Path: 'D:/repo/a.txt' }, output: '1 lines, 13 bytes' } } },
+  ])
+  const tools = blocks.filter((block) => block.kind === 'tool')
+  assert.equal(tools.length, 1, '同一步 ACTIVE/DONE 应更新同一工具块')
+  assert.equal(tools[0].name, 'read_file')
+  assert.match(tools[0].input, /"Path": "D:\/repo\/a.txt"/)
+  assert.equal(tools[0].output, '1 lines, 13 bytes')
+  assert.equal(tools[0].status, 'completed')
+
+  globalThis.window = { __ModuleLoader__: { load(def) { globalThis.__def = def } } }
+  await import('../client.js')
+  const ReactStub = {
+    createElement(type, props, ...children) { return { type, props, children } },
+    useCallback: (fn) => fn,
+    useEffect() {},
+    useLayoutEffect() {},
+    useMemo: (fn) => fn(),
+    useRef: (value) => ({ current: value }),
+    useState: (value) => [value, () => {}],
+    useSyncExternalStore() { return null },
+  }
+  const mod = globalThis.__def.factory((name) => {
+    if (name === 'react') return ReactStub
+    throw new Error(`unexpected require: ${name}`)
+  })
+  const tree = mod.AgentBlocks({
+    t: (key) => key,
+    running: false,
+    blocks: [{ kind: 'tool', name: 'read_file', input: '{"Path":"a.txt"}', status: 'completed' }],
+  })
+  const texts = [];
+  const walk = (node) => {
+    if (node == null || typeof node === 'boolean') return;
+    if (typeof node === 'string' || typeof node === 'number') { texts.push(String(node)); return; }
+    if (Array.isArray(node)) { node.forEach(walk); return; }
+    if (typeof node.type === 'function') { walk(node.type({ ...(node.props || {}), children: node.children })); return; }
+    (node.children || []).forEach(walk);
+  };
+  walk(tree);
+  assert.ok(JSON.stringify(tree).includes('details'), '只有参数也应可展开')
+  assert.ok(texts.join('').includes('"Path":"a.txt"'), '展开区显示参数 JSON')
+  console.log('15) agy 工具参数 ok')
+}
+
+// ── 16) 历史 blocks 同样加警告，不重写磁盘 ─────────────────────────────────
+{
+  const warning = '该段输出疑似非文本内容（可能是上游返回异常）'
+  const blocks = [{ kind: 'text', text: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB' + 'A'.repeat(600) }]
+  const marked = markNonTextBlocks(blocks, 'claude')
+  assert.ok(marked[0].text.startsWith(warning))
+  assert.equal(blocks[0].text.startsWith(warning), false, '不能修改原数组')
+  assert.equal(markNonTextBlocks(blocks, 'opencode')[0].text, blocks[0].text)
+  console.log('16) 历史 claude blocks 警告 ok')
 }
 
 console.log('ok')
