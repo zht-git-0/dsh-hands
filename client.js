@@ -93,6 +93,9 @@ window.__ModuleLoader__.load({
       showMore: 'Show older',
       justNow: 'just now',
       minutesAgo: '{n} min ago',
+      hoursAgo: '{n} hr ago',
+      daysAgo: '{n} days ago',
+      monthsAgo: '{n} months ago',
       durationMinSec: '{m}m {s}s',
       durationMin: '{m}m',
       v2PickSession: 'Select a conversation',
@@ -118,8 +121,7 @@ window.__ModuleLoader__.load({
       v2Collapse: 'Show less',
       v2LoadFull: 'Load full text',
       v2LoadOlder: 'Load older turns',
-      scrollTop: 'Top',
-      scrollBottom: 'Bottom',
+      turnNavigation: 'Jump to turn',
       v2Tokens: 'tokens',
       blocksFallback: 'Fallback view',
       blocksFallbackHint: 'Structured blocks are unavailable; showing a text-parsed compatibility view.',
@@ -195,6 +197,9 @@ window.__ModuleLoader__.load({
       showMore: '显示更早',
       justNow: '刚刚',
       minutesAgo: '{n} 分钟前',
+      hoursAgo: '{n} 小时前',
+      daysAgo: '{n} 天前',
+      monthsAgo: '{n} 个月前',
       durationMinSec: '{m} 分 {s} 秒',
       durationMin: '{m} 分',
       v2PickSession: '选择一条会话',
@@ -220,8 +225,7 @@ window.__ModuleLoader__.load({
       v2Collapse: '收起',
       v2LoadFull: '加载全文',
       v2LoadOlder: '加载更早',
-      scrollTop: '顶部',
-      scrollBottom: '底部',
+      turnNavigation: '跳转到轮次',
       v2Tokens: 'tokens',
       blocksFallback: '兼容视图',
       blocksFallbackHint: '结构化 blocks 缺失，当前显示按文本解析的兼容视图。',
@@ -1789,71 +1793,33 @@ window.__ModuleLoader__.load({
       }, [active]);
     }
 
-    // 滚动位置只做轻量提示：原生细滚动条负责拖动，这个小标记负责顶部/中部/底部语义。
-    function scrollMarkerState(element) {
-      if (!element) return { scrollable: false, percent: 0, atTop: true, atBottom: true };
-      const scrollHeight = Math.max(0, Number(element.scrollHeight) || 0);
-      const clientHeight = Math.max(0, Number(element.clientHeight) || 0);
-      const scrollable = scrollHeight - clientHeight > 1;
-      const maxTop = Math.max(0, scrollHeight - clientHeight);
-      const scrollTop = Math.min(maxTop, Math.max(0, Number(element.scrollTop) || 0));
-      return {
-        scrollable,
-        percent: maxTop ? Math.round((scrollTop / maxTop) * 100) : 0,
-        atTop: !scrollable || scrollTop <= 1,
-        atBottom: !scrollable || scrollTop >= maxTop - 1,
-      };
-    }
-
-    function useScrollMarker(ref, resetKey) {
-      const [state, setState] = React.useState({ scrollable: false, percent: 0, atTop: true, atBottom: true, visible: false });
+    // 原生细滚动条只表示滚动位置；这里仅切滚动时的亮度，不再叠加装饰性百分比。
+    function useScrollActivity(ref, resetKey) {
       const hideTimer = React.useRef(null);
-      const update = React.useCallback((show = true) => {
+      const onScroll = React.useCallback(() => {
         const element = ref.current;
-        const next = scrollMarkerState(element);
-        setState((prev) => ({ ...prev, ...next, visible: !!show && next.scrollable }));
         if (!element) return;
-        if (hideTimer.current) clearTimeout(hideTimer.current);
-        if (!show) {
-          delete element.dataset.scrolling;
-          return;
-        }
         element.dataset.scrolling = 'true';
+        if (hideTimer.current) clearTimeout(hideTimer.current);
         hideTimer.current = setTimeout(() => {
           delete element.dataset.scrolling;
-          setState((prev) => ({ ...prev, visible: false }));
           hideTimer.current = null;
         }, 900);
       }, [ref]);
       React.useLayoutEffect(() => {
-        update(false);
-        if (typeof window === 'undefined') return undefined;
-        const onResize = () => update(false);
-        window.addEventListener('resize', onResize);
+        delete ref.current?.dataset.scrolling;
         return () => {
-          window.removeEventListener('resize', onResize);
           if (hideTimer.current) clearTimeout(hideTimer.current);
           delete ref.current?.dataset.scrolling;
         };
-      }, [ref, resetKey, update]);
-      return { state, onScroll: () => update(true) };
+      }, [ref, resetKey, onScroll]);
+      return onScroll;
     }
 
-    function ScrollMarker({ state, t = (key) => key }) {
-      const label = state?.atTop ? t('scrollTop') : state?.atBottom ? t('scrollBottom') : `${state?.percent || 0}%`;
-      return h('span', {
-        className: 'dsh-hands-scrollMarker',
-        'data-visible': state?.visible ? 'true' : 'false',
-        'data-top': state?.atTop ? 'true' : 'false',
-        'data-bottom': state?.atBottom ? 'true' : 'false',
-        'aria-hidden': true,
-      }, label);
-    }
-
-    function ScrollArea({ className, children, elementRef, onScroll, resetKey, t }) {
+    function ScrollArea({ className, children, elementRef, onScroll, resetKey }) {
       const localRef = React.useRef(null);
       const ref = elementRef || localRef;
-      const marker = useScrollMarker(ref, resetKey);
+      const markScrolling = useScrollActivity(ref, resetKey);
       return h(
         'div',
         { className: 'dsh-hands-v2-scrollShell' },
@@ -1862,10 +1828,108 @@ window.__ModuleLoader__.load({
           ref,
           onScroll: (event) => {
             if (typeof onScroll === 'function') onScroll(event);
-            marker.onScroll();
+            markScrolling();
           },
         }, children),
-        h(ScrollMarker, { state: marker.state, t }),
+      );
+    }
+
+    function relativeTurnTime(value, t = (key) => key, now = Date.now()) {
+      const at = Date.parse(String(value || ''));
+      if (!Number.isFinite(at)) return '';
+      const diff = Math.max(0, now - at);
+      if (diff < 45000) return t('justNow');
+      if (diff < 60 * 60 * 1000) return t('minutesAgo', { n: Math.max(1, Math.floor(diff / 60000)) });
+      if (diff < 24 * 60 * 60 * 1000) return t('hoursAgo', { n: Math.max(1, Math.floor(diff / 3600000)) });
+      const days = Math.max(1, Math.floor(diff / 86400000));
+      if (days < 30) return t('daysAgo', { n: days });
+      return t('monthsAgo', { n: Math.max(1, Math.floor(days / 30)) });
+    }
+
+    function turnTickSummary(turn, limit = 30) {
+      const firstLine = String(turn?.prompt || turn?.excerpt || '').replace(/\r/g, '').split('\n')[0].replace(/\s+/g, ' ').trim();
+      return firstLine.length > limit ? `${firstLine.slice(0, limit)}…` : firstLine;
+    }
+
+    function buildTurnTicks(turns, { currentId = '', maxTicks = 24 } = {}) {
+      const sorted = (Array.isArray(turns) ? turns : [])
+        .filter((turn) => turn?.id)
+        .map((turn, index) => ({ turn, index }))
+        .sort((a, b) => {
+          const at = Date.parse(String(a.turn.startedAt || a.turn.at || ''));
+          const bt = Date.parse(String(b.turn.startedAt || b.turn.at || ''));
+          if (Number.isFinite(at) && Number.isFinite(bt) && at !== bt) return at - bt;
+          return String(a.turn.startedAt || a.turn.at || '').localeCompare(String(b.turn.startedAt || b.turn.at || '')) || a.index - b.index;
+        });
+      if (!sorted.length) return [];
+      const limit = Math.max(2, Math.min(48, Number(maxTicks) || 24));
+      const indexes = new Set([0, sorted.length - 1]);
+      if (sorted.length > limit) {
+        for (let i = 0; i < limit; i += 1) indexes.add(Math.round((i * (sorted.length - 1)) / (limit - 1)));
+      } else {
+        for (let i = 0; i < sorted.length; i += 1) indexes.add(i);
+      }
+      const currentIndex = sorted.findIndex(({ turn }) => String(turn.id) === String(currentId));
+      if (currentIndex >= 0) indexes.add(currentIndex);
+      return [...indexes]
+        .sort((a, b) => a - b)
+        .map((index) => ({
+          ...sorted[index],
+          id: String(sorted[index].turn.id),
+          percent: sorted.length === 1 ? 50 : (index / (sorted.length - 1)) * 100,
+          current: String(sorted[index].turn.id) === String(currentId),
+          summary: turnTickSummary(sorted[index].turn),
+        }));
+    }
+
+    function scrollToTurnElement(list, target) {
+      if (!list || !target?.getBoundingClientRect || !list.getBoundingClientRect) return false;
+      const listRect = list.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      const top = Math.max(0, list.scrollTop + targetRect.top - listRect.top - (list.clientHeight - targetRect.height) / 2);
+      if (typeof list.scrollTo === 'function') list.scrollTo({ top, behavior: 'smooth' });
+      else list.scrollTop = top;
+      return true;
+    }
+
+    function TurnTickBar({ turns, selectedTurnId, t = (key) => key, onJump }) {
+      const ticks = buildTurnTicks(turns, { currentId: selectedTurnId });
+      if (!ticks.length) return null;
+      return h(
+        'div',
+        { className: 'dsh-hands-v2-turnTickBar', role: 'navigation', 'aria-label': t('turnNavigation') },
+        h(
+          'div',
+          { className: 'dsh-hands-v2-turnTickTrack' },
+          ticks.map((tick) => {
+            const id = String(tick.turn.id);
+            const time = relativeTurnTime(tick.turn.startedAt || tick.turn.at, t);
+            const summary = tick.summary || t('noPrompt');
+            const label = `${time} · ${summary}`;
+            return h(
+              'button',
+              {
+                key: id,
+                type: 'button',
+                className: 'dsh-hands-v2-turnTick',
+                'data-turn-id': id,
+                'data-current': tick.current ? 'true' : 'false',
+                'aria-current': tick.current ? 'true' : undefined,
+                'aria-label': label,
+                title: label,
+                style: { left: `${tick.percent}%` },
+                onClick: () => { if (typeof onJump === 'function') onJump(id); },
+              },
+              h('span', { className: 'dsh-hands-v2-turnTickMark', 'aria-hidden': true }),
+              h(
+                'span',
+                { className: 'dsh-hands-v2-turnTickTooltip', role: 'tooltip' },
+                h('span', { className: 'dsh-hands-v2-turnTickTime' }, time),
+                h('span', { className: 'dsh-hands-v2-turnTickSummary' }, summary),
+              ),
+            );
+          }),
+        ),
       );
     }
 
@@ -2014,8 +2078,21 @@ window.__ModuleLoader__.load({
       .dsh-hands-v2-scrollShell>.dsh-hands-v2-list:hover::-webkit-scrollbar-thumb,.dsh-hands-v2-scrollShell>.dsh-hands-v2-threadBody:hover::-webkit-scrollbar-thumb,.dsh-hands-v2-scrollShell>.dsh-hands-v2-list[data-scrolling=true]::-webkit-scrollbar-thumb,.dsh-hands-v2-scrollShell>.dsh-hands-v2-threadBody[data-scrolling=true]::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--dsw-alias-label-primary) 68%,transparent)}
       .dsh-hands-v2-scrollShell>.dsh-hands-v2-list[data-scrolling=true],.dsh-hands-v2-scrollShell>.dsh-hands-v2-threadBody[data-scrolling=true]{scrollbar-color:color-mix(in srgb,var(--dsw-alias-label-primary) 68%,transparent) transparent}
       .dsh-hands-v2-scrollShell>.dsh-hands-v2-list::-webkit-scrollbar-corner,.dsh-hands-v2-scrollShell>.dsh-hands-v2-threadBody::-webkit-scrollbar-corner{background:transparent}
-      .dsh-hands-scrollMarker{position:absolute;right:8px;top:50%;z-index:3;transform:translateY(-50%);pointer-events:none;padding:0 4px;border-radius:999px;background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) 88%,var(--dsw-alias-label-primary));color:var(--dsw-alias-label-secondary);font-size:9px;line-height:14px;font-variant-numeric:tabular-nums;opacity:0;transition:opacity .15s ease}
-      .dsh-hands-scrollMarker[data-visible=true]{opacity:1}
+      .dsh-hands-v2-threadScroll{flex:1;min-width:0;min-height:0;display:flex;flex-direction:column}
+      .dsh-hands-v2-turnTickBar{position:relative;flex:none;height:16px;margin:0 10px 2px;border-top:.5px solid var(--dsw-alias-border-l2);border-bottom:.5px solid var(--dsw-alias-border-l2);background:color-mix(in srgb,var(--dsw-alias-label-primary) 3%,transparent)}
+      .dsh-hands-v2-turnTickTrack{position:absolute;left:4px;right:4px;top:3px;height:10px}
+      .dsh-hands-v2-turnTick{position:absolute;top:0;width:2px;height:10px;padding:0;border:0;background:transparent;transform:translateX(-50%);cursor:pointer}
+      .dsh-hands-v2-turnTick::before{content:'';position:absolute;inset:-3px -3px}
+      .dsh-hands-v2-turnTickMark{display:block;width:2px;height:10px;border-radius:1px;background:color-mix(in srgb,var(--dsw-alias-label-primary) 38%,transparent);transition:height .12s,background .12s}
+      .dsh-hands-v2-turnTick:hover .dsh-hands-v2-turnTickMark,.dsh-hands-v2-turnTick:focus-visible .dsh-hands-v2-turnTickMark{height:12px;margin-top:-1px;background:var(--dsw-alias-label-primary)}
+      .dsh-hands-v2-turnTick[data-current=true] .dsh-hands-v2-turnTickMark{height:12px;margin-top:-1px;background:var(--dsw-alias-brand-primary)}
+      .dsh-hands-v2-turnTick:focus-visible{outline:1px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px;border-radius:2px}
+      .dsh-hands-v2-turnTickTooltip{position:absolute;left:50%;bottom:calc(100% + 7px);z-index:8;display:flex;flex-direction:column;gap:2px;width:max-content;max-width:240px;padding:5px 7px;border:.5px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-family:inherit;font-size:10.5px;line-height:15px;text-align:left;white-space:normal;pointer-events:none;opacity:0;transform:translate(-50%,3px);transition:opacity .12s,transform .12s}
+      .dsh-hands-v2-turnTick:hover .dsh-hands-v2-turnTickTooltip,.dsh-hands-v2-turnTick:focus-visible .dsh-hands-v2-turnTickTooltip{opacity:1;transform:translate(-50%,0)}
+      .dsh-hands-v2-turnTickTime{color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
+      .dsh-hands-v2-turnTickSummary{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .dsh-hands-v2-turn[data-highlighted=true]{animation:dsh-hands-turn-highlight 1.2s ease-out}
+      @keyframes dsh-hands-turn-highlight{0%{outline:2px solid color-mix(in srgb,var(--dsw-alias-brand-primary) 75%,transparent);background:color-mix(in srgb,var(--dsw-alias-brand-primary) 12%,transparent)}100%{outline:2px solid transparent;background:transparent}}
       .dsh-hands-v2-group{display:flex;flex-direction:column;gap:2px;min-width:0}
       .dsh-hands-v2-search{flex:none;padding:0 8px 6px}
       .dsh-hands-v2-check{display:inline-flex;align-items:center;gap:4px;color:var(--dsw-alias-label-secondary);font-size:10.5px;line-height:15px;cursor:pointer}
@@ -3351,7 +3428,7 @@ window.__ModuleLoader__.load({
     }
 
     function Turn(props) {
-      const { store, t, turn, active, autoBody } = props;
+      const { store, t, turn, active, autoBody, highlighted } = props;
       const id = String(turn?.id || '');
       const liveText = useTurnText(store, id);
       // store 把 /turn 的增量按绝对偏移拼进了 liveByTurn，所以第三档留空；
@@ -3372,7 +3449,9 @@ window.__ModuleLoader__.load({
         'div',
         {
           className: 'dsh-hands-v2-turn',
+          'data-turn-id': id,
           'data-active': active ? 'true' : 'false',
+          'data-highlighted': highlighted ? 'true' : 'false',
           'data-source': view.source,
           onClick: () => {
             if (id) store.selectTurn(id);
@@ -3414,6 +3493,8 @@ window.__ModuleLoader__.load({
       const anchorRef = React.useRef(null);
       const loadingRef = React.useRef(false);
       const [loadingOlder, setLoadingOlder] = React.useState(false);
+      const [highlightedId, setHighlightedId] = React.useState('');
+      const highlightTimer = React.useRef(null);
       const ordered = React.useMemo(
         () => (Array.isArray(turns) ? [...turns].reverse() : []),
         [turns],
@@ -3474,6 +3555,28 @@ window.__ModuleLoader__.load({
         if (element.scrollTop < 40) void loadOlder();
       };
 
+      const jumpToTurn = React.useCallback((id) => {
+        const wanted = String(id || '');
+        if (!wanted) return;
+        followRef.current = false;
+        store.selectTurn(wanted);
+        const list = listRef.current;
+        const target = list && typeof list.querySelectorAll === 'function'
+          ? [...list.querySelectorAll('.dsh-hands-v2-turn')].find((node) => node?.dataset?.turnId === wanted)
+          : null;
+        if (target) scrollToTurnElement(list, target);
+        setHighlightedId(wanted);
+        if (highlightTimer.current) clearTimeout(highlightTimer.current);
+        highlightTimer.current = setTimeout(() => {
+          setHighlightedId('');
+          highlightTimer.current = null;
+        }, 1200);
+      }, [store]);
+
+      React.useEffect(() => () => {
+        if (highlightTimer.current) clearTimeout(highlightTimer.current);
+      }, [sessionKey]);
+
       if (!sessionKey) {
         return h(
           'div',
@@ -3490,38 +3593,43 @@ window.__ModuleLoader__.load({
       }
 
       return h(
-        ScrollArea,
-        {
-          className: 'dsh-hands-v2-threadBody',
-          elementRef: listRef,
-          onScroll,
-          resetKey: sessionKey,
-          t,
-        },
+        'div',
+        { className: 'dsh-hands-v2-threadScroll' },
+        h(TurnTickBar, { turns: ordered, selectedTurnId, t, onJump: jumpToTurn }),
         h(
-          'div',
-          { className: 'dsh-hands-v2-turns', ref: innerRef },
-          more
-            ? h(
-                'button',
-                {
-                  type: 'button',
-                  className: 'dsh-hands-v2-older',
-                  disabled: loadingOlder,
-                  onClick: loadOlder,
-                },
-                loadingOlder ? t('loading') : t('v2LoadOlder'),
-              )
-            : null,
-          ordered.map((turn, index) =>
-            h(Turn, {
-              key: String(turn?.id || `turn-${index}`),
-              store,
-              t,
-              turn,
-              active: String(turn?.id || '') === selectedTurnId,
-              autoBody: true,
-            }),
+          ScrollArea,
+          {
+            className: 'dsh-hands-v2-threadBody',
+            elementRef: listRef,
+            onScroll,
+            resetKey: sessionKey,
+          },
+          h(
+            'div',
+            { className: 'dsh-hands-v2-turns', ref: innerRef },
+            more
+              ? h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'dsh-hands-v2-older',
+                    disabled: loadingOlder,
+                    onClick: loadOlder,
+                  },
+                  loadingOlder ? t('loading') : t('v2LoadOlder'),
+                )
+              : null,
+            ordered.map((turn, index) =>
+              h(Turn, {
+                key: String(turn?.id || `turn-${index}`),
+                store,
+                t,
+                turn,
+                active: String(turn?.id || '') === selectedTurnId,
+                highlighted: String(turn?.id || '') === highlightedId,
+                autoBody: true,
+              }),
+            ),
           ),
         ),
       );
@@ -4206,8 +4314,11 @@ window.__ModuleLoader__.load({
       HAND_BRAND_PATHS,
       MarkdownLite,
       MarkdownBlock,
-      scrollMarkerState,
-      ScrollMarker,
+      relativeTurnTime,
+      turnTickSummary,
+      buildTurnTicks,
+      scrollToTurnElement,
+      TurnTickBar,
       ScrollArea,
     };
   },
