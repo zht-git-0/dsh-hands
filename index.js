@@ -56,6 +56,65 @@ function moveIntoTrash(source, id, label) {
   }
 }
 
+const fileReadCache = new Map()
+const fileCacheVersions = new Map()
+export const fileReadStats = { reads: 0, hits: 0, stats: 0 }
+
+function fileCacheSignature(file) {
+  try {
+    const stat = fs.statSync(file)
+    return { mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, size: stat.size, ino: stat.ino }
+  } catch {
+    return { mtimeMs: null, size: -1 }
+  }
+}
+
+export function cachedRead(file, loader, fallback) {
+  const key = path.resolve(String(file))
+  const cached = fileReadCache.get(key)
+  if (cached) {
+    fileReadStats.hits += 1
+    return cached.value
+  }
+  fileReadStats.reads += 1
+  const signature = fileCacheSignature(key)
+  let value = fallback
+  try {
+    value = loader()
+  } catch {
+    value = fallback
+  }
+  fileCacheVersions.set(key, (fileCacheVersions.get(key) || 0) + 1)
+  fileReadCache.set(key, { ...signature, value })
+  return value
+}
+
+export function invalidateFileReadCache(file) {
+  const key = path.resolve(String(file))
+  if (fileReadCache.delete(key)) fileCacheVersions.set(key, (fileCacheVersions.get(key) || 0) + 1)
+}
+
+export function fileCacheVersion(file) {
+  return fileCacheVersions.get(path.resolve(String(file))) || 0
+}
+
+// 外部改盘兜底：只 stat，不变则不读文件、不 parse。
+export function refreshFileReadCache() {
+  for (const [file, cached] of fileReadCache) {
+    fileReadStats.stats += 1
+    const signature = fileCacheSignature(file)
+    if (signature.mtimeMs !== cached.mtimeMs || signature.ctimeMs !== cached.ctimeMs || signature.size !== cached.size || signature.ino !== cached.ino) invalidateFileReadCache(file)
+  }
+}
+
+export function resetFileReadCache() {
+  fileReadCache.clear()
+  fileCacheVersions.clear()
+  fileReadStats.reads = 0
+  fileReadStats.hits = 0
+  fileReadStats.stats = 0
+}
+
 function readJson(file, fallback) {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf8'))
@@ -68,6 +127,7 @@ function writeJson(file, value) {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.writeFileSync(file, JSON.stringify(value, null, 2), 'utf8')
+    invalidateFileReadCache(file)
     return true
   } catch {
     return false
@@ -75,8 +135,8 @@ function writeJson(file, value) {
 }
 
 function loadIndex() {
-  const raw = readJson(INDEX_FILE, {})
-  return raw && typeof raw === 'object' ? raw : {}
+  const raw = cachedRead(INDEX_FILE, () => readJson(INDEX_FILE, {}), {})
+  return raw && typeof raw === 'object' ? { ...raw } : {}
 }
 
 function saveIndex(index) {
@@ -1771,6 +1831,7 @@ export function updateSessionIndex(file, name, entry) {
     tmp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`
     fs.writeFileSync(tmp, JSON.stringify(latest, null, 2) + '\n', 'utf8')
     fs.renameSync(tmp, file)
+    invalidateFileReadCache(file)
     return true
   } catch {
     try {
@@ -2456,7 +2517,7 @@ export function apply(ctx, config = {}) {
   const JOBS_DIR = path.join(os.homedir(), '.dsh', 'hands-jobs')
   const ARCHIVE_FILE = path.join(os.homedir(), '.dsh', 'hands-archive.json')
   const readArchive = () => {
-    const raw = readJson(ARCHIVE_FILE, { keys: [] }) || {}
+    const raw = cachedRead(ARCHIVE_FILE, () => readJson(ARCHIVE_FILE, { keys: [] }), { keys: [] }) || {}
     return Array.isArray(raw.keys) ? raw.keys.map(String) : []
   }
   const writeArchive = (keys) => writeJson(ARCHIVE_FILE, { keys: [...new Set(keys.map(String))] })
@@ -2468,6 +2529,7 @@ export function apply(ctx, config = {}) {
   // v2 /stream?key= 的三份 revision：agents 维度、每个 hand 的 sessions、每个 key 的 turns。
   // 旧的 runningRevision / historyRevision 原样留给无 key 分支，两边互不干扰。
   let agentsRevision = 0
+  let asyncRevision = 0
   let revisionSeq = 0
   const handRevisions = new Map()
   const keyRevisions = new Map()
@@ -2502,10 +2564,11 @@ export function apply(ctx, config = {}) {
     for (const key of keys) keyRevisions.set(key, nextRevision())
   }
 
+  let logLineCount = -1
   function readRecords() {
-    try {
+    const loaded = cachedRead(LOG_FILE, () => {
       const lines = fs.readFileSync(LOG_FILE, 'utf8').split(NL).filter(Boolean)
-      return lines
+      const records = lines
         .map((line) => {
           try {
             const value = JSON.parse(line)
@@ -2515,9 +2578,10 @@ export function apply(ctx, config = {}) {
           }
         })
         .filter(Boolean)
-    } catch {
-      return []
-    }
+      return { records, lineCount: lines.length }
+    }, { records: [], lineCount: 0 })
+    logLineCount = loaded.lineCount
+    return loaded.records
   }
 
   function mergedJobs(records = readRecords()) {
@@ -2530,12 +2594,31 @@ export function apply(ctx, config = {}) {
     )
   }
 
+  let panelCache = { signature: '', value: null }
+  function panelDataSignature() {
+    return [
+      fileCacheVersion(LOG_FILE),
+      ...sessionIndexFiles().map(([, file]) => fileCacheVersion(file)),
+      fileCacheVersion(ARCHIVE_FILE),
+      asyncRevision,
+      localDateKey(),
+    ].join('|')
+  }
+  function panelInputSignature() {
+    return `${panelDataSignature()}|${runningRevision}`
+  }
+
   // 面板专用：把日志、当前 RUNNING、asyncState 里仍活着的任务统一成一份状态。
   // 历史接口不能只读 end 日志，否则插件重启后仍活的异步任务会凭空变成 INTERRUPTED。
-  function panelDispatchState(sessionIndexes = readSessionIndexes()) {
-    return buildPanelDispatchState(readRecords(), asyncState.jobs, [...RUNNING.values()], {
+  function panelDispatchState(opts = {}) {
+    const signature = panelInputSignature()
+    if (panelCache.signature === signature && panelCache.value) return panelCache.value
+    const sessionIndexes = opts.sessionIndexes || readSessionIndexes()
+    const value = buildPanelDispatchState(readRecords(), asyncState.jobs, [...RUNNING.values()], {
       sessionIndexes,
     })
+    panelCache = { signature, value }
+    return value
   }
 
   // 日志按行裁，最多 LOG_KEEP 行。start 被裁掉也没关系：end 自带全部元信息。
@@ -2543,9 +2626,15 @@ export function apply(ctx, config = {}) {
     try {
       fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true })
       fs.appendFileSync(LOG_FILE, JSON.stringify(record) + NL, 'utf8')
-      const lines = fs.readFileSync(LOG_FILE, 'utf8').split(NL).filter(Boolean)
-      if (lines.length > LOG_KEEP) {
+      invalidateFileReadCache(LOG_FILE)
+      if (logLineCount < 0) readRecords()
+      else logLineCount += 1
+      // 近似计数超过 LOG_KEEP+200 才全量读一次；正常派发不再每行重读整份日志。
+      if (logLineCount > LOG_KEEP + 200) {
+        const lines = fs.readFileSync(LOG_FILE, 'utf8').split(NL).filter(Boolean)
         fs.writeFileSync(LOG_FILE, lines.slice(-LOG_KEEP).join(NL) + NL, 'utf8')
+        logLineCount = Math.min(lines.length, LOG_KEEP)
+        invalidateFileReadCache(LOG_FILE)
       }
     } catch {
       /* 日志写失败不影响干活 */
@@ -2651,17 +2740,28 @@ export function apply(ctx, config = {}) {
   function readSessionIndexes() {
     const indexes = {}
     for (const [hand, file] of sessionIndexFiles()) {
-      const value = readJson(file, {})
+      const value = cachedRead(file, () => readJson(file, {}), {})
       if (value && typeof value === 'object') indexes[hand] = value
     }
     return indexes
   }
 
+  function readHandSessionIndex(hand) {
+    const file = HANDS[hand]?.index?.()
+    if (!file) return {}
+    const value = cachedRead(file, () => readJson(file, {}), {})
+    return value && typeof value === 'object' ? { ...value } : {}
+  }
+
+  let listSessionCache = new Map()
   function listSessions(handFilter = '', opts = {}) {
     const wantArchived = !!opts.archived
     ensureToday()
     const rows = new Map()
-    const sessionIndexes = readSessionIndexes()
+    const sessionIndexes = opts.sessionIndexes || readSessionIndexes()
+    const panel = opts.panel || panelDispatchState({ sessionIndexes })
+    const cacheKey = `${handFilter}|${wantArchived ? 1 : 0}|${today.date}|${panelCache.signature}`
+    if (!panel.running.length && listSessionCache.has(cacheKey)) return listSessionCache.get(cacheKey)
     const ensureRow = (key, hand) => {
       let row = rows.get(key)
       if (!row) {
@@ -2733,7 +2833,6 @@ export function apply(ctx, config = {}) {
       }
     }
 
-    const panel = panelDispatchState(sessionIndexes)
     for (const job of panel.jobs) {
       if (String(job.status || '').toUpperCase() !== 'QUEUED') absorb(job, false)
     }
@@ -2763,13 +2862,71 @@ export function apply(ctx, config = {}) {
 
     const archived = new Set(readArchive())
     // 归档不再单独成视图：给每行打标记，前端在文件夹底部折叠展示
-    return [...rows.values()]
+    const result = [...rows.values()]
       .map((row) => {
         const named = recoverSessionMetadata(row, sessionIndexes)
         return { ...named, archived: isArchivedSessionEntry(row.hand, named.name, named, archived) }
       })
       .sort((a, b) => String(b.lastAt || '').localeCompare(String(a.lastAt || '')))
+    if (!panel.running.length) {
+      listSessionCache.set(cacheKey, result)
+      if (listSessionCache.size > 32) listSessionCache.delete(listSessionCache.keys().next().value)
+    }
+    return result
   }
+
+  // 外部进程可能直接改盘；2 秒节拍只 stat，有变化才重读并推对应 revision。
+  function refreshExternalFiles() {
+    const beforeLog = readRecords()
+    const beforeArchive = readArchive()
+    readSessionIndexes()
+    const tracked = [LOG_FILE, ARCHIVE_FILE, ...sessionIndexFiles().map(([, file]) => file)]
+    const beforeVersions = new Map(tracked.map((file) => [file, fileCacheVersion(file)]))
+    refreshFileReadCache()
+    const changed = (file) => beforeVersions.get(file) !== fileCacheVersion(file)
+    if (changed(LOG_FILE)) {
+      const afterLog = readRecords()
+      const beforeById = new Map(beforeLog.map((row) => [String(row.id || ''), row]))
+      const afterById = new Map(afterLog.map((row) => [String(row.id || ''), row]))
+      const touched = new Set()
+      for (const [id, row] of afterById) {
+        const old = beforeById.get(id)
+        if (!old || String(old.at) !== String(row.at) || String(old.status) !== String(row.status)) touched.add(row)
+      }
+      for (const id of beforeById.keys()) if (!afterById.has(id)) touched.add(beforeById.get(id))
+      if (touched.size) {
+        touchRunning()
+        touchHistory()
+        for (const row of touched) touchAgentDimensions(row)
+      }
+    }
+    if (changed(ARCHIVE_FILE)) {
+      const before = new Set(beforeArchive)
+      const after = new Set(readArchive())
+      for (const key of new Set([...before, ...after])) {
+        if (before.has(key) !== after.has(key)) touchAgentDimensions({ hand: String(key.split('/')[0] || ''), sessionKey: key })
+      }
+    }
+    for (const [hand, file] of sessionIndexFiles()) {
+      if (!changed(file)) continue
+      touchAgentDimensions({ hand })
+      const index = readHandSessionIndex(hand)
+      for (const [name, entry] of Object.entries(index)) {
+        touchAgentDimensions({ hand, session: name, sessionKey: `${hand}/${name}`, conversationId: entry?.id || '', cwd: entry?.cwd || '' })
+        if (entry?.id) {
+          const nameKey = asyncSessionLockKeys({ hand, session: name, cwd: entry.cwd })[0]
+          const idKey = asyncSessionLockKeys({ hand, conversationId: entry.id })[0]
+          sessionQueue.addAliases(nameKey, [idKey])
+        }
+      }
+    }
+  }
+
+  ctx.effect(() => {
+    const timer = setInterval(refreshExternalFiles, 2000)
+    timer.unref?.()
+    return () => clearInterval(timer)
+  }, 'dsh-hands: file cache refresh')
 
   // 历史记录不把整段输出塞进每次快照：默认只带摘录，点开某一行时再单独取。
   function stripOutput(entry) {
@@ -2976,7 +3133,10 @@ export function apply(ctx, config = {}) {
   const ASYNC_JOBS = new Map() // jobId -> 内存状态（正在跑的那几秒用）
   // 落盘状态：谁跑完了、谁还没投、谁投过。重启后靠它补投 / 收尸。
   const asyncState = readAsyncState()
-  const saveAsyncState = () => writeAsyncState(asyncState)
+  const saveAsyncState = () => {
+    asyncRevision += 1
+    return writeAsyncState(asyncState)
+  }
 
   function beginAsyncJob(job, run) {
     if (run) Object.assign(job, dispatchJobMetadata(run))
@@ -3402,6 +3562,16 @@ export function apply(ctx, config = {}) {
       }
     }
     saveAsyncState()
+    const changed = [
+      ...(plan.queued || []),
+      ...plan.orphan,
+      ...plan.running,
+    ].map((id) => asyncState.jobs[id]).filter(Boolean)
+    if (changed.length) {
+      touchRunning()
+      touchHistory()
+      for (const record of changed) touchAgentDimensions(record)
+    }
     return { delivered, orphans: plan.orphan.length, running: plan.running.length, discardedQueued: (plan.queued || []).length }
   }
 
@@ -3485,7 +3655,15 @@ export function apply(ctx, config = {}) {
   // ── v2 面板的组装函数（不碰 req/res，/agents、/sessions、/stream 共用）────────
   function agentsPayload() {
     const checkedAt = new Date().toISOString()
-    const panel = panelDispatchState()
+    const sessionIndexes = readSessionIndexes()
+    const panel = panelDispatchState({ sessionIndexes })
+    const sessions = listSessions('', { panel, sessionIndexes })
+    const sessionCountByHand = Object.create(null)
+    for (const row of sessions) {
+      if (row.archived === true) continue
+      const hand = String(row.hand || '')
+      sessionCountByHand[hand] = (sessionCountByHand[hand] || 0) + 1
+    }
     const runningByHand = Object.create(null)
     const queuedByHand = Object.create(null)
     for (const entry of panel.running) {
@@ -3509,7 +3687,7 @@ export function apply(ctx, config = {}) {
         running: runningByHand[hand] || 0,
         queued: queuedByHand[hand] || 0,
         today: todayCount(hand),
-        sessions: listSessions(hand).filter((row) => row.archived !== true).length,
+        sessions: sessionCountByHand[hand] || 0,
         lastAt: lastAtByHand[hand] || '',
         // ok / version 走 /health；这里保持旧 /agents 的字段形态，前端不用判空
         ok: false,
@@ -3725,6 +3903,12 @@ export function apply(ctx, config = {}) {
   reconcileLog()
   seedToday(readJobs())
 
+  const activeSseConnections = new Set()
+  ctx.effect(() => () => {
+    for (const close of [...activeSseConnections]) close()
+    activeSseConnections.clear()
+  }, 'dsh-hands: sse connections')
+
   ctx.effect(
     () =>
       ctx.webServer.register({
@@ -3905,7 +4089,9 @@ export function apply(ctx, config = {}) {
               let closed = false
               const timers = []
               const cleanup = () => {
+                if (closed) return
                 closed = true
+                activeSseConnections.delete(cleanup)
                 for (const timer of timers) clearInterval(timer)
                 try {
                   res.end()
@@ -3913,6 +4099,7 @@ export function apply(ctx, config = {}) {
                   /* 已经断了 */
                 }
               }
+              activeSseConnections.add(cleanup)
               req.on('close', cleanup)
               res.on('close', cleanup)
 
@@ -3921,7 +4108,7 @@ export function apply(ctx, config = {}) {
                 try {
                   res.write(chunk)
                 } catch {
-                  closed = true
+                  cleanup()
                 }
               }
 
@@ -3930,7 +4117,7 @@ export function apply(ctx, config = {}) {
                   try {
                     res.write(': ping' + NL + NL)
                   } catch {
-                    closed = true
+                    cleanup()
                   }
                 }
               }, 15000)
@@ -3995,6 +4182,9 @@ export function apply(ctx, config = {}) {
               let lastAgentsRev = -1
               let lastSessionsRev = -1
               let lastTurnsRev = -1
+              let lastRunningRev = -1
+              let lastDataSignature = ''
+              let liveRunning = false
               let agentsFingerprint = ''
               let sessionsFingerprint = ''
               let turnsFingerprint = ''
@@ -4051,11 +4241,13 @@ export function apply(ctx, config = {}) {
                 }
                 if (best) {
                   historyTargetId = ''
+                  liveRunning = true
                   return { id: String(best.id || ''), running: true, entry: best }
                 }
                 const job = panel.jobs.find((item) => turnMatches(item, key))
                 if (!job) return null
                 historyTargetId = String(job.id || '')
+                liveRunning = false
                 return { id: historyTargetId, running: false, entry: job }
               }
 
@@ -4111,26 +4303,43 @@ export function apply(ctx, config = {}) {
                 sendTurns(true)
                 sendLive()
               }
+              lastRunningRev = runningRevision
+              lastDataSignature = panelDataSignature()
 
               const timer = setInterval(() => {
                 if (closed || res.destroyed || res.writableEnded) return
-                if (agentsRevision !== lastAgentsRev) sendAgents()
-                if (!validHand) return
-                if (!known) {
+                const agentsChanged = agentsRevision !== lastAgentsRev
+                const sessionsRev = validHand ? sessionsRevisionOf(hand) : -1
+                const turnsRev = known ? turnsRevisionOf(key) : -1
+                const sessionsChanged = validHand && sessionsRev !== lastSessionsRev
+                const turnsChanged = known && turnsRev !== lastTurnsRev
+                const runningChanged = runningRevision !== lastRunningRev
+                const dataSignature = panelDataSignature()
+                const dataChanged = dataSignature !== lastDataSignature
+                if (!agentsChanged && !sessionsChanged && !turnsChanged && !runningChanged && !dataChanged) return
+
+                // key 尚未落盘时，只有 hand/data revision 变化才重查，避免空转。
+                if (!known && validHand && (sessionsChanged || dataChanged)) {
                   known = sessionsForHand(hand).sessions.some((row) => row.key === key || row.sessionKey === key)
                   if (known) {
                     sendSessions(true)
                     sendTurns(true)
                     sendLive()
+                    lastRunningRev = runningRevision
+                    lastDataSignature = dataSignature
                     return
                   }
                 }
-                // 恢复任务可能由重启前的旧进程直接写 end（新进程的 revision 不会 bump）；
-                // 每轮都算指纹，变化才发，保证侧栏行与 turn 的 RUNNING → OK/INTERRUPTED 及时更新。
-                sendSessions()
-                if (!known) return
-                sendTurns()
-                sendLive()
+                if (agentsChanged) sendAgents()
+                if (validHand && (sessionsChanged || dataChanged)) sendSessions()
+                if (known) {
+                  if (turnsChanged || dataChanged) sendTurns()
+                  const livePending = !liveRunning && !settled.has(historyTargetId)
+                  // 历史已 settled 后，只有输出/轮次变化才进 liveTarget 扫描。
+                  if (runningChanged || turnsChanged || livePending) sendLive()
+                }
+                lastRunningRev = runningRevision
+                lastDataSignature = dataSignature
               }, 250)
               timers.push(timer)
               return
@@ -4235,8 +4444,8 @@ export function apply(ctx, config = {}) {
                 const keys = readArchive()
                 const next = archived ? [...keys.filter((k) => k !== key), key] : keys.filter((k) => k !== key)
                 writeArchive(next)
-                const hand = String(body.hand || '')
-                if (hand) handRevisions.set(hand, (handRevisions.get(hand) || 0) + 1)
+                const hand = String(body.hand || key.split('/')[0] || '')
+                if (hand) touchAgentDimensions({ hand, sessionKey: key })
                 return send(200, { ok: true, key, archived, count: next.length })
               } catch (error) {
                 return fail(400, String(error?.message ?? error))
@@ -4542,6 +4751,13 @@ export function apply(ctx, config = {}) {
           updated: new Date().toISOString(),
         }
         saveIndex(idx)
+        touchAgentDimensions({
+          hand: 'agy',
+          session: label,
+          sessionKey: `agy/${label}`,
+          conversationId: String(out.conversationId),
+          cwd: runCwd,
+        })
         out.session = label
       }
       // /cancel 杀掉进程后只会得到一个失败码；回传要如实写 CANCELLED
@@ -4643,6 +4859,7 @@ export function apply(ctx, config = {}) {
         index[name] = { id, cwd: index[label]?.cwd ?? null, updated: new Date().toISOString() }
         if (label && label !== name) delete index[label]
         saveIndex(index)
+        touchAgentDimensions({ hand: 'agy', session: name, sessionKey: `agy/${name}`, conversationId: id, cwd: index[name]?.cwd || '' })
         return { ok: true, action, conversationId: id, session: name }
       }
 
@@ -4653,6 +4870,7 @@ export function apply(ctx, config = {}) {
         index[name] = { ...index[label], id, updated: new Date().toISOString() }
         delete index[label]
         saveIndex(index)
+        touchAgentDimensions({ hand: 'agy', session: name, sessionKey: `agy/${name}`, conversationId: id, cwd: index[name]?.cwd || '' })
         return { ok: true, action, conversationId: id, from: label, to: name }
       }
 
@@ -4694,6 +4912,13 @@ export function apply(ctx, config = {}) {
           }
         }
         saveIndex(index)
+        touchAgentDimensions({
+          hand: 'agy',
+          session: droppedLabels[0] || label,
+          sessionKey: `agy/${droppedLabels[0] || label}`,
+          conversationId: id,
+          cwd: row.cwd || '',
+        })
 
         let purged = false
         if (args?.purge) {
@@ -4798,7 +5023,7 @@ export function apply(ctx, config = {}) {
   const CODEX_INDEX = path.join(os.homedir(), '.dsh', 'codex-sessions.json')
 
   function loadCodexIndex() {
-    return readJson(CODEX_INDEX, {}) || {}
+    return readHandSessionIndex('codex')
   }
 
   // codex 会把 "session id: <uuid>" 打在输出开头，拿来续会话
@@ -5212,7 +5437,7 @@ export function apply(ctx, config = {}) {
       const prompt = String(args?.prompt ?? '')
       if (!prompt.trim()) throw new Error('prompt is required')
 
-      const index = readJson(CLAUDE_INDEX, {}) || {}
+      const index = readHandSessionIndex('claude')
       const name = args?.session ? String(args.session) : ''
       const runCwd = resolveRunCwd(args, exec)
       const plannedSession = resolveSession(index, name, runCwd, args, 'claude', sessionIdFromExec(exec), readArchive())
@@ -5283,7 +5508,7 @@ export function apply(ctx, config = {}) {
         })
 
       const perform = async () => {
-        const latest = readJson(CLAUDE_INDEX, {}) || {}
+        const latest = readHandSessionIndex('claude')
         const resume = resolveSession(
           latest, name, runCwd, args, 'claude', sessionIdFromExec(exec), readArchive(),
           { ticketApproved: Number.isFinite(ticketExpiresAt), consumeTicket: false },
@@ -5425,7 +5650,7 @@ export function apply(ctx, config = {}) {
       const prompt = String(args?.prompt ?? '')
       if (!prompt.trim()) throw new Error('prompt is required')
 
-      const index = readJson(OPENCODE_INDEX, {}) || {}
+      const index = readHandSessionIndex('opencode')
       const name = args?.session ? String(args.session) : ''
       const runCwd = resolveRunCwd(args, exec)
       const plannedSession = resolveSession(index, name, runCwd, args, 'opencode', sessionIdFromExec(exec), readArchive())
@@ -5448,7 +5673,7 @@ export function apply(ctx, config = {}) {
       let forcedDispatchId = ''
 
       const perform = async () => {
-      const latest = readJson(OPENCODE_INDEX, {}) || {}
+      const latest = readHandSessionIndex('opencode')
       const resume = resolveSession(
         latest, name, runCwd, args, 'opencode', sessionIdFromExec(exec), readArchive(),
         { ticketApproved: Number.isFinite(ticketExpiresAt), consumeTicket: false },
@@ -5758,7 +5983,7 @@ export function apply(ctx, config = {}) {
     const runCwd = job.cwd ? path.resolve(String(job.cwd)) : process.cwd()
     let known = String(job.conversationId || '')
     if (!known && name) {
-      const index = readJson(handDef.index(), {}) || {}
+      const index = readHandSessionIndex(handKey)
       // 走守卫：有 session 名就按 auto 语义续已有会话（同目录不匹配 → reset，开新的）
       const resume = resolveSession(index, name, runCwd, { sessionMode: 'auto' }, handKey, '', readArchive())
       if (resume.id) known = resume.id
@@ -5797,9 +6022,10 @@ export function apply(ctx, config = {}) {
         const err = String(result.stderr ?? '')
         const sid = handDef.pick(raw, runCwd) || handDef.pick(err, runCwd) || known || ''
         if (name && sid && sid !== known) {
-          const index = readJson(handDef.index(), {}) || {}
+          const index = readHandSessionIndex(handKey)
           index[name] = { id: sid, cwd: job.cwd || '', updated: new Date().toISOString() }
           writeJson(handDef.index(), index)
+          touchAgentDimensions({ hand: handKey, session: name, sessionKey: `${handKey}/${name}`, conversationId: sid, cwd: job.cwd || '' })
         }
         const answer =
           extractAnswer(handKey, raw) ||
@@ -5875,7 +6101,7 @@ export function apply(ctx, config = {}) {
         {
           ...args,
           hand,
-          index: readJson(handDef.index(), {}) || {},
+          index: readHandSessionIndex(hand),
           archivedKeys: readArchive(),
           requesterSessionId: sessionIdFromExec(exec),
         },
@@ -5954,7 +6180,7 @@ export function apply(ctx, config = {}) {
       if (!prompt.trim()) throw new Error('prompt is required')
 
       const idxFile = hand.index()
-      const index = readJson(idxFile, {}) || {}
+      const index = readHandSessionIndex(to)
       const name = args?.session ? String(args.session) : ''
       const runCwd = resolveRunCwd(args, ctx)
       const plannedSession = resolveSession(index, name, runCwd, args, to, sessionIdFromExec(ctx), readArchive())
@@ -5980,7 +6206,7 @@ export function apply(ctx, config = {}) {
       let forcedDispatchId = ''
 
       const perform = async () => {
-      const latest = readJson(idxFile, {}) || {}
+      const latest = readHandSessionIndex(to)
       const resume = resolveSession(
         latest, name, runCwd, args, to, sessionIdFromExec(ctx), readArchive(),
         { ticketApproved: Number.isFinite(ticketExpiresAt), consumeTicket: false },

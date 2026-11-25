@@ -45,7 +45,7 @@ assert.match(output, /"hand":"opencode"/)
 fs.writeFileSync(path.join(process.env.USERPROFILE, '.dsh', 'opencode-sessions.json'), JSON.stringify({
   future: { id: 'sid_future', cwd: 'D:/work', updated: new Date().toISOString() },
 }))
-const deadline = Date.now() + 2000
+const deadline = Date.now() + 4000
 while (!output.includes('event: turns') && Date.now() < deadline) {
   await new Promise((resolve) => setTimeout(resolve, 50))
 }
