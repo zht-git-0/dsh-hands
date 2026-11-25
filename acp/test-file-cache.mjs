@@ -25,6 +25,19 @@ try {
   invalidateFileReadCache(jsonFile)
   assert.deepEqual(cachedRead(jsonFile, load, null), { value: 2 })
   assert.equal(fileReadStats.reads, 3)
+
+  const transientFile = path.join(root, 'transient.json')
+  fs.writeFileSync(transientFile, '{"value":1}')
+  resetFileReadCache()
+  let fail = true
+  const transientLoad = () => {
+    if (fail) throw new Error('transient read failure')
+    return JSON.parse(fs.readFileSync(transientFile, 'utf8'))
+  }
+  assert.deepEqual(cachedRead(transientFile, transientLoad, { failed: true }), { failed: true })
+  fail = false
+  assert.deepEqual(cachedRead(transientFile, transientLoad, { failed: true }), { value: 1 })
+  assert.equal(fileReadStats.reads, 2, '读取失败不得写入缓存')
   console.log('file cache unit ok')
 
   async function runChild(mode) {
@@ -39,6 +52,9 @@ try {
         at: new Date(Date.now() - 60_000 + index).toISOString(),
       })).join('\n') + '\n'
       fs.writeFileSync(path.join(dsh, 'hands-log.jsonl'), rows)
+    } else if (mode === 'reconcile-retry') {
+      // 用目录让 apply() 启动时的 reconcileLog 读取真实失败，随后替换成有效日志。
+      fs.mkdirSync(path.join(dsh, 'hands-log.jsonl'))
     } else {
       fs.writeFileSync(path.join(dsh, 'opencode-sessions.json'), JSON.stringify({ old: { id: 'sid_old', cwd: 'D:/work', updated: new Date().toISOString() } }))
     }
@@ -70,6 +86,15 @@ if (${JSON.stringify(mode)} === 'trim') {
   const lines = fs.readFileSync(path.join(process.env.USERPROFILE, '.dsh', 'hands-log.jsonl'), 'utf8').split(/\\r?\\n/).filter(Boolean)
   assert.ok(lines.length <= 1200, '超过 LOG_KEEP+200 后必须裁剪，实际 ' + lines.length)
   assert.ok(lines.length < 2398, '裁剪确实生效')
+} else if (${JSON.stringify(mode)} === 'reconcile-retry') {
+  const logFile = path.join(process.env.USERPROFILE, '.dsh', 'hands-log.jsonl')
+  fs.rmdirSync(logFile)
+  const at = new Date().toISOString()
+  const row = { v: 2, phase: 'end', id: 'fixed', hand: 'opencode', tool: 'hands_run', prompt: 'fixed', session: 'fixed', sessionKey: 'opencode/fixed', startedAt: at, at, status: 'OK', ok: true }
+  fs.writeFileSync(logFile, JSON.stringify(row) + '\\n')
+  const fixed = await call('/dsh-hands/log')
+  assert.equal(fixed.entries.length, 1, 'reconcileLog 的失败读取不得缓存，修好后立即可读')
+  assert.equal(fixed.entries[0].id, 'fixed')
 } else {
   const first = await call('/dsh-hands/sessions?hand=opencode')
   assert.equal(first.sessions[0].name, 'old')
@@ -101,6 +126,7 @@ console.log('file cache child ok')
   }
   await runChild('panel')
   await runChild('trim')
+  await runChild('reconcile-retry')
   console.log('file cache integration ok')
 } finally {
   fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })

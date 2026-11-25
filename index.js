@@ -78,11 +78,13 @@ export function cachedRead(file, loader, fallback) {
   }
   fileReadStats.reads += 1
   const signature = fileCacheSignature(key)
-  let value = fallback
+  let value
   try {
     value = loader()
   } catch {
-    value = fallback
+    // 失败不是有效快照：保留 fallback 返回值，但绝不缓存，下一次立即重试。
+    fileCacheVersions.set(key, (fileCacheVersions.get(key) || 0) + 1)
+    return fallback
   }
   fileCacheVersions.set(key, (fileCacheVersions.get(key) || 0) + 1)
   fileReadCache.set(key, { ...signature, value })
@@ -137,10 +139,6 @@ function writeJson(file, value) {
 function loadIndex() {
   const raw = cachedRead(INDEX_FILE, () => readJson(INDEX_FILE, {}), {})
   return raw && typeof raw === 'object' ? { ...raw } : {}
-}
-
-function saveIndex(index) {
-  writeJson(INDEX_FILE, index)
 }
 
 function listKnownSessions() {
@@ -1819,17 +1817,23 @@ export function recordSessionName(hand, name, id, cwd) {
   }
 }
 
-// 会话索引只合并一个 key：写盘前重读最新文件，避免两个并发会话用旧快照互相覆盖。
-export function updateSessionIndex(file, name, entry) {
-  const key = String(name || '').trim()
-  if (!key) return false
+// 会话索引只合并一个 key：写盘前清缓存并重读最新文件，避免两个并发会话用旧快照互相覆盖。
+// 也接受 updater(latest)，供 archive 这种数组结构做原子 read-modify-write。
+export function updateSessionIndex(file, nameOrUpdater, entry) {
+  const key = typeof nameOrUpdater === 'string' ? nameOrUpdater.trim() : ''
   let tmp = ''
   try {
+    invalidateFileReadCache(file)
     const latest = readJson(file, {}) || {}
-    latest[key] = { ...(latest[key] && typeof latest[key] === 'object' ? latest[key] : {}), ...(entry || {}) }
+    const next = typeof nameOrUpdater === 'function'
+      ? nameOrUpdater(latest)
+      : (() => {
+          if (key) latest[key] = { ...(latest[key] && typeof latest[key] === 'object' ? latest[key] : {}), ...(entry || {}) }
+          return latest
+        })()
     fs.mkdirSync(path.dirname(file), { recursive: true })
     tmp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`
-    fs.writeFileSync(tmp, JSON.stringify(latest, null, 2) + '\n', 'utf8')
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', 'utf8')
     fs.renameSync(tmp, file)
     invalidateFileReadCache(file)
     return true
@@ -2520,7 +2524,6 @@ export function apply(ctx, config = {}) {
     const raw = cachedRead(ARCHIVE_FILE, () => readJson(ARCHIVE_FILE, { keys: [] }), { keys: [] }) || {}
     return Array.isArray(raw.keys) ? raw.keys.map(String) : []
   }
-  const writeArchive = (keys) => writeJson(ARCHIVE_FILE, { keys: [...new Set(keys.map(String))] })
   const LOG_KEEP = 1000
   const JOB_MAX_BYTES = 1024 * 1024
   const NL = String.fromCharCode(10)
@@ -2567,7 +2570,15 @@ export function apply(ctx, config = {}) {
   let logLineCount = -1
   function readRecords() {
     const loaded = cachedRead(LOG_FILE, () => {
-      const lines = fs.readFileSync(LOG_FILE, 'utf8').split(NL).filter(Boolean)
+      let text
+      try {
+        text = fs.readFileSync(LOG_FILE, 'utf8')
+      } catch (error) {
+        // 首次启动没有日志是正常空状态，可以缓存；其它读取失败必须下次重试。
+        if (error?.code === 'ENOENT') return { records: [], lineCount: 0 }
+        throw error
+      }
+      const lines = text.split(NL).filter(Boolean)
       const records = lines
         .map((line) => {
           try {
@@ -3180,6 +3191,61 @@ export function apply(ctx, config = {}) {
     const token = sessionQueue.reserve(asyncSessionLockKeys(record))
     if (token) recoveredSessionLocks.set(String(record.id), { token, pid })
   }
+  // 恢复对账和恢复锁共用同一条补 end 路径：日志已有同 dispatch 的 end 时以它为准，
+  // 否则才补一条。endedAt 只表示 asyncState 收过尾，不能阻止日志补 end。
+  function ensureRecoveredAsyncEnd(record, { status = 'ORPHAN', error = '', recoverNote = '' } = {}) {
+    if (!record?.id) return { appended: false, changed: false, end: null, id: '' }
+    const records = readRecords()
+    const start = findAsyncDispatchStart(record, records)
+    const id = String(start?.id || record.dispatchId || record.id || '')
+    const existingEnd = records.findLast((row) => row?.phase === 'end' && String(row.id || '') === id)
+    if (existingEnd) {
+      const finalStatus = String(existingEnd.status || record.status || status).toUpperCase()
+      const endedAt = String(existingEnd.at || record.endedAt || new Date().toISOString())
+      const changed = record.status !== finalStatus || record.endedAt !== endedAt
+      record.status = finalStatus
+      record.endedAt = endedAt
+      return { appended: false, changed, end: existingEnd, id }
+    }
+
+    const endedAt = new Date().toISOString()
+    const startedMs = Date.parse(record.startedAt || '') || Date.parse(endedAt)
+    record.status = status
+    record.endedAt = endedAt
+    record.delivery = record.delivery === 'sent' ? 'sent' : 'skipped'
+    record.deliveryError = error
+    record.recoverNote = recoverNote
+    appendRecord(
+      clean({
+        ...(start || {
+          v: 2,
+          id,
+          hand: String(record.hand || ''),
+          tool: String(record.tool || ''),
+          prompt: String(record.prompt || ''),
+          write: !!record.write,
+          session: String(record.session || ''),
+          sessionKey: String(record.sessionKey || ''),
+          conversationId: String(record.conversationId || ''),
+          cwd: String(record.cwd || ''),
+          model: String(record.model || ''),
+          startedAt: new Date(startedMs).toISOString(),
+        }),
+        id,
+        v: 2,
+        phase: 'end',
+        at: endedAt,
+        startedAt: String(start?.startedAt || start?.at || new Date(startedMs).toISOString()),
+        status,
+        ok: false,
+        ms: Math.max(0, Date.parse(endedAt) - startedMs),
+        excerpt: '',
+        error,
+      }),
+    )
+    return { appended: true, changed: true, end: null, id }
+  }
+
   ctx.effect(() => {
     if (!recoveredSessionLocks.size) return () => {}
     const timer = setInterval(() => {
@@ -3189,42 +3255,22 @@ export function apply(ctx, config = {}) {
         if (!sessionQueue.release(locked.token)) continue
         recoveredSessionLocks.delete(id)
         const record = asyncState.jobs[id]
-        if (record && !record.endedAt) {
-          const endedAt = new Date().toISOString()
-          const startedMs = Date.parse(record.startedAt || '') || Date.now()
-          const start = findAsyncDispatchStart(record, readRecords())
-          record.status = 'ORPHAN'
-          record.endedAt = endedAt
-          record.delivery = record.delivery === 'sent' ? 'sent' : 'skipped'
-          record.deliveryError = 'DSH 重启后恢复的进程已经退出'
-          record.recoverNote = `恢复锁在 pid ${locked.pid} 退出后释放`
-          if (start) {
-            appendRecord(
-              clean({
-                ...start,
-                id: String(start.id),
-                v: 2,
-                phase: 'end',
-                at: endedAt,
-                startedAt: String(start.startedAt || start.at || new Date(startedMs).toISOString()),
-                status: 'ORPHAN',
-                ok: false,
-                ms: Math.max(0, Date.parse(endedAt) - startedMs),
-                excerpt: '',
-                error: '重启后进程已退出（恢复进程 orphan）',
-              }),
-            )
-          }
-          saveAsyncState()
-          touchRunning()
-          touchHistory()
-          touchAgentDimensions({
-            ...(start || {}),
-            ...record,
-            id: String(start?.id || record.dispatchId || record.id),
-            status: 'ORPHAN',
-          })
-        }
+        if (!record) continue
+        const result = ensureRecoveredAsyncEnd(record, {
+          status: 'ORPHAN',
+          error: '重启后进程已退出（恢复进程 orphan）',
+          recoverNote: `恢复锁在 pid ${locked.pid} 退出后释放`,
+        })
+        if (!result.changed) continue
+        saveAsyncState()
+        touchRunning()
+        touchHistory()
+        touchAgentDimensions({
+          ...(findAsyncDispatchStart(record, readRecords()) || {}),
+          ...record,
+          id: result.id,
+          status: record.status,
+        })
       }
     }, 5000)
     timer.unref?.()
@@ -3525,10 +3571,11 @@ export function apply(ctx, config = {}) {
     for (const id of plan.orphan) {
       const record = asyncState.jobs[id]
       if (!record) continue
-      record.status = 'ORPHAN'
-      record.endedAt = record.endedAt || new Date().toISOString()
-      record.delivery = record.delivery === 'sent' ? 'sent' : 'skipped'
-      record.deliveryError = 'DSH 重启时这个任务还在跑，进程已经没了'
+      ensureRecoveredAsyncEnd(record, {
+        status: 'ORPHAN',
+        error: 'DSH 重启时这个任务还在跑，进程已经没了',
+        recoverNote: '启动对账确认恢复进程已经退出',
+      })
     }
     for (const id of plan.running) {
       const record = asyncState.jobs[id]
@@ -4424,7 +4471,7 @@ export function apply(ctx, config = {}) {
                     from,
                     next: delta.next,
                     eof: delta.next >= totalLength,
-                    delta,
+                    delta: delta.delta,
                     ...(blocks ? { blocks, blocksDerived } : {}),
                   })
                 }
@@ -4441,9 +4488,12 @@ export function apply(ctx, config = {}) {
                 const key = String(body.key || '').trim()
                 if (!key) return fail(400, 'key is required')
                 const archived = body.archived !== false
-                const keys = readArchive()
-                const next = archived ? [...keys.filter((k) => k !== key), key] : keys.filter((k) => k !== key)
-                writeArchive(next)
+                let next = []
+                if (!updateSessionIndex(ARCHIVE_FILE, (latest) => {
+                  const current = Array.isArray(latest.keys) ? latest.keys.map(String) : []
+                  next = archived ? [...new Set([...current, key])] : current.filter((item) => item !== key)
+                  return { ...latest, keys: next }
+                })) throw new Error('failed to update archive index')
                 const hand = String(body.hand || key.split('/')[0] || '')
                 if (hand) touchAgentDimensions({ hand, sessionKey: key })
                 return send(200, { ok: true, key, archived, count: next.length })
@@ -4744,20 +4794,19 @@ export function apply(ctx, config = {}) {
 
       // 记名字索引：下次用同一个 session 就能接上这次
       if (label && out.conversationId) {
-        const idx = loadIndex()
-        idx[label] = {
+        if (updateSessionIndex(INDEX_FILE, label, {
           id: String(out.conversationId),
           cwd: runCwd,
           updated: new Date().toISOString(),
+        })) {
+          touchAgentDimensions({
+            hand: 'agy',
+            session: label,
+            sessionKey: `agy/${label}`,
+            conversationId: String(out.conversationId),
+            cwd: runCwd,
+          })
         }
-        saveIndex(idx)
-        touchAgentDimensions({
-          hand: 'agy',
-          session: label,
-          sessionKey: `agy/${label}`,
-          conversationId: String(out.conversationId),
-          cwd: runCwd,
-        })
         out.session = label
       }
       // /cancel 杀掉进程后只会得到一个失败码；回传要如实写 CANCELLED
@@ -4856,10 +4905,14 @@ export function apply(ctx, config = {}) {
       if (action === 'label') {
         const name = String(args?.newLabel ?? '').trim()
         if (!name) throw new Error('newLabel is required for action "label"')
-        index[name] = { id, cwd: index[label]?.cwd ?? null, updated: new Date().toISOString() }
-        if (label && label !== name) delete index[label]
-        saveIndex(index)
-        touchAgentDimensions({ hand: 'agy', session: name, sessionKey: `agy/${name}`, conversationId: id, cwd: index[name]?.cwd || '' })
+        let cwd = index[label]?.cwd ?? null
+        if (!updateSessionIndex(INDEX_FILE, (latest) => {
+          cwd = latest[label]?.cwd ?? cwd
+          if (label && label !== name) delete latest[label]
+          latest[name] = { id, cwd, updated: new Date().toISOString() }
+          return latest
+        })) throw new Error('failed to update agy session index')
+        touchAgentDimensions({ hand: 'agy', session: name, sessionKey: `agy/${name}`, conversationId: id, cwd: cwd || '' })
         return { ok: true, action, conversationId: id, session: name }
       }
 
@@ -4867,10 +4920,15 @@ export function apply(ctx, config = {}) {
         const name = String(args?.newLabel ?? '').trim()
         if (!label) throw new Error('session (the old name) is required for action "rename"')
         if (!name) throw new Error('newLabel is required for action "rename"')
-        index[name] = { ...index[label], id, updated: new Date().toISOString() }
-        delete index[label]
-        saveIndex(index)
-        touchAgentDimensions({ hand: 'agy', session: name, sessionKey: `agy/${name}`, conversationId: id, cwd: index[name]?.cwd || '' })
+        let cwd = index[label]?.cwd ?? null
+        if (!updateSessionIndex(INDEX_FILE, (latest) => {
+          cwd = latest[label]?.cwd ?? cwd
+          const previous = latest[label] || {}
+          delete latest[label]
+          latest[name] = { ...previous, id, cwd, updated: new Date().toISOString() }
+          return latest
+        })) throw new Error('failed to update agy session index')
+        touchAgentDimensions({ hand: 'agy', session: name, sessionKey: `agy/${name}`, conversationId: id, cwd: cwd || '' })
         return { ok: true, action, conversationId: id, from: label, to: name }
       }
 
@@ -4903,15 +4961,17 @@ export function apply(ctx, config = {}) {
           }
           if (dirty) writeJson(LAST_FILE, last)
         }
-        // 抹掉我自己的名字索引
-        let droppedLabels = []
-        for (const [name, entry] of Object.entries(index)) {
-          if (entry?.id === id) {
-            delete index[name]
-            droppedLabels.push(name)
+        // 抹掉我自己的名字索引：实时重读后删除所有指向该 id 的别名。
+        const droppedLabels = []
+        if (!updateSessionIndex(INDEX_FILE, (latest) => {
+          for (const [name, entry] of Object.entries(latest)) {
+            if (entry?.id === id) {
+              delete latest[name]
+              droppedLabels.push(name)
+            }
           }
-        }
-        saveIndex(index)
+          return latest
+        })) throw new Error('failed to update agy session index')
         touchAgentDimensions({
           hand: 'agy',
           session: droppedLabels[0] || label,
@@ -6022,10 +6082,9 @@ export function apply(ctx, config = {}) {
         const err = String(result.stderr ?? '')
         const sid = handDef.pick(raw, runCwd) || handDef.pick(err, runCwd) || known || ''
         if (name && sid && sid !== known) {
-          const index = readHandSessionIndex(handKey)
-          index[name] = { id: sid, cwd: job.cwd || '', updated: new Date().toISOString() }
-          writeJson(handDef.index(), index)
-          touchAgentDimensions({ hand: handKey, session: name, sessionKey: `${handKey}/${name}`, conversationId: sid, cwd: job.cwd || '' })
+          if (updateSessionIndex(handDef.index(), name, { id: sid, cwd: job.cwd || '', updated: new Date().toISOString() })) {
+            touchAgentDimensions({ hand: handKey, session: name, sessionKey: `${handKey}/${name}`, conversationId: sid, cwd: job.cwd || '' })
+          }
         }
         const answer =
           extractAnswer(handKey, raw) ||
