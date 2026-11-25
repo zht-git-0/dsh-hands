@@ -933,6 +933,8 @@ window.__ModuleLoader__.load({
         const hasNext = next !== null && next !== undefined && next !== '' && Number.isFinite(Number(next));
         if (hasNext) {
           const nextAt = Math.max(0, Math.trunc(Number(next)));
+          // 空输出的首帧也是有效偏移：记下 0，后续轮询才能继续从 0 拉。
+          if (nextAt === 0 && !liveApplied.has(turnId)) liveApplied.set(turnId, 0);
           if (nextAt <= applied) return false;
           const hasFrom = from !== null && from !== undefined && from !== '' && Number.isFinite(Number(from));
           const startAt = hasFrom ? Math.max(0, Math.trunc(Number(from))) : nextAt - piece.length;
@@ -1044,7 +1046,12 @@ window.__ModuleLoader__.load({
           else from += delta.length;
           if (data.eof || !delta) break;
         }
-        bodyDone.add(id);
+        // RUNNING/QUEUED 的 eof 只说明「此刻没有更多输出」，不是最终完成。
+        // 只有确实已结束的轮次才记 bodyDone；列表里还没出现的 id 也不锁死。
+        const row = Object.values(state.turnsByKey)
+          .flatMap((rows) => (Array.isArray(rows) ? rows : []))
+          .find((item) => String(item?.id || '') === id);
+        if (row && !turnIsRunning(row) && !isQueued(row)) bodyDone.add(id);
         return true;
       }
 
@@ -1299,8 +1306,9 @@ window.__ModuleLoader__.load({
           for (const turn of Array.isArray(turns) ? turns : []) {
             if (!turnIsRunning(turn)) continue;
             const id = String(turn.id || '');
-            const from = Number(liveApplied.get(id));
-            if (id && Number.isFinite(from)) loadTurnBody(id, from);
+            const applied = Number(liveApplied.get(id));
+            const from = Number.isFinite(applied) ? applied : 0;
+            if (id) loadTurnBody(id, from);
           }
         });
       }

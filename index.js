@@ -2754,13 +2754,40 @@ export function apply(ctx, config = {}) {
         recoveredSessionLocks.delete(id)
         const record = asyncState.jobs[id]
         if (record && !record.endedAt) {
+          const endedAt = new Date().toISOString()
+          const startedMs = Date.parse(record.startedAt || '') || Date.now()
+          const start = findAsyncDispatchStart(record, readRecords())
           record.status = 'ORPHAN'
-          record.endedAt = new Date().toISOString()
+          record.endedAt = endedAt
           record.delivery = record.delivery === 'sent' ? 'sent' : 'skipped'
           record.deliveryError = 'DSH 重启后恢复的进程已经退出'
           record.recoverNote = `恢复锁在 pid ${locked.pid} 退出后释放`
+          if (start) {
+            appendRecord(
+              clean({
+                ...start,
+                id: String(start.id),
+                v: 2,
+                phase: 'end',
+                at: endedAt,
+                startedAt: String(start.startedAt || start.at || new Date(startedMs).toISOString()),
+                status: 'ORPHAN',
+                ok: false,
+                ms: Math.max(0, Date.parse(endedAt) - startedMs),
+                excerpt: '',
+                error: '重启后进程已退出（恢复进程 orphan）',
+              }),
+            )
+          }
           saveAsyncState()
           touchRunning()
+          touchHistory()
+          touchAgentDimensions({
+            ...(start || {}),
+            ...record,
+            id: String(start?.id || record.dispatchId || record.id),
+            status: 'ORPHAN',
+          })
         }
       }
     }, 5000)

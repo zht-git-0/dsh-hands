@@ -359,9 +359,17 @@ async function until(check, label, tries = 200) {
         json: async () => ({ id: 'c1', from, next, eof: next >= FULL.length, delta }),
       }
     }
+    if (u.pathname === '/dsh-hands/turns') {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ key: 'opencode/c1', turns: [{ id: 'c1', hand: 'opencode', status: 'OK', running: false, startedAt: '2026-11-18T00:00:00.000Z' }] }),
+      }
+    }
     return { ok: false, status: 404, json: async () => ({}) }
   }
   const store = createHandsStore({ fetchImpl, storage: makeStorage() })
+  await store.loadTurns('opencode/c1')
   const [firstA, firstB] = await Promise.all([
     store.ensureTurnBody('c1'),
     store.ensureTurnBody('c1'),
@@ -369,9 +377,9 @@ async function until(check, label, tries = 200) {
   assert.equal(firstA, true)
   assert.equal(firstB, true, '并发调用共享同一份 promise')
   assert.equal(store.snapshotSlice('live').liveByTurn.c1, FULL, '分三页拼成全文')
-  assert.equal(calls.length, 3, '每页 4 字，12 字共 3 次请求')
+  assert.equal(calls.filter((call) => call.startsWith('/dsh-hands/turn?')).length, 3, '每页 4 字，12 字共 3 次请求')
   await store.ensureTurnBody('c1')
-  assert.equal(calls.length, 3, '同一轮成功后再调不再发请求')
+  assert.equal(calls.filter((call) => call.startsWith('/dsh-hands/turn?')).length, 3, '同一轮成功后再调不再发请求')
   store.stop()
   console.log('7) ensureTurnBody 分页补齐 + 只拉一次 ok')
 }
@@ -656,6 +664,88 @@ async function until(check, label, tries = 200) {
   assert.equal(old.blocks[1].name, 'read')
   store.stop()
   console.log('12) 缺失 blocks 客户端 derive 缓存 ok')
+}
+
+// ── 13. RUNNING 空输出不标 bodyDone；next=0 记账；轮询缺失偏移回落 0 ────────
+{
+  const key = 'opencode/running-empty'
+  const calls = []
+  let output = ''
+  let running = true
+  const row = {
+    id: 'r1', hand: 'opencode', tool: 'opencode_run', status: running ? 'RUNNING' : 'OK',
+    running, startedAt: '2026-11-18T00:00:00.000Z', prompt: 'running', excerpt: '',
+  }
+  const fetchImpl = async (url) => {
+    const u = new URL(String(url))
+    calls.push(`${u.pathname}${u.search}`)
+    if (u.pathname === '/dsh-hands/agents') {
+      return { ok: true, status: 200, json: async () => ({ checkedAt: '', agents: [{ hand: 'opencode' }] }) }
+    }
+    if (u.pathname === '/dsh-hands/sessions') {
+      return { ok: true, status: 200, json: async () => ({ hand: 'opencode', sessions: [{ key, hand: 'opencode', lastAt: row.startedAt }] }) }
+    }
+    if (u.pathname === '/dsh-hands/turns') {
+      return { ok: true, status: 200, json: async () => ({ key, turns: [{ ...row, status: running ? 'RUNNING' : 'OK', running }] }) }
+    }
+    if (u.pathname === '/dsh-hands/turn') {
+      const from = Math.max(0, Number(u.searchParams.get('from')) || 0)
+      const delta = output.slice(from)
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ id: 'r1', from, next: from + delta.length, eof: true, delta, blocks: [] }),
+      }
+    }
+    return { ok: false, status: 404, json: async () => ({}) }
+  }
+  const store = createHandsStore({ fetchImpl, storage: makeStorage() })
+  await store.loadTurns(key)
+  assert.equal(await store.ensureTurnBody('r1'), true)
+  assert.equal(store.debug().liveApplied.get('r1'), 0, '空输出 next=0 也要记账')
+  assert.equal(calls.filter((call) => call.startsWith('/dsh-hands/turn?')).length, 1)
+
+  output = '迟到输出'
+  assert.equal(await store.ensureTurnBody('r1'), true, 'RUNNING 不因首轮 eof 被 bodyDone 挡住')
+  assert.equal(store.getSnapshot().liveByTurn.r1, '迟到输出')
+  assert.equal(calls.filter((call) => call.startsWith('/dsh-hands/turn?')).length, 2)
+
+  running = false
+  await store.loadTurns(key)
+  await store.ensureTurnBody('r1')
+  const terminalCalls = calls.filter((call) => call.startsWith('/dsh-hands/turn?')).length
+  await store.ensureTurnBody('r1')
+  assert.equal(calls.filter((call) => call.startsWith('/dsh-hands/turn?')).length, terminalCalls, '真正结束后仍可标 bodyDone')
+  store.stop()
+
+  // 轮询时从未拉过正文：liveApplied 缺失也必须从 0 请求，不能跳过。
+  FakeEventSource.instances.length = 0
+  const pollCalls = []
+  const pollFetch = async (url) => {
+    const u = new URL(String(url))
+    pollCalls.push(`${u.pathname}${u.search}`)
+    if (u.pathname === '/dsh-hands/agents') {
+      return { ok: true, status: 200, json: async () => ({ checkedAt: '', agents: [{ hand: 'opencode' }] }) }
+    }
+    if (u.pathname === '/dsh-hands/sessions') {
+      return { ok: true, status: 200, json: async () => ({ hand: 'opencode', sessions: [{ key, hand: 'opencode', lastAt: row.startedAt }] }) }
+    }
+    if (u.pathname === '/dsh-hands/turns') {
+      return { ok: true, status: 200, json: async () => ({ key, turns: [{ ...row, status: 'RUNNING', running: true }] }) }
+    }
+    if (u.pathname === '/dsh-hands/turn') {
+      return { ok: true, status: 200, json: async () => ({ id: 'r1', from: 0, next: 0, eof: true, delta: '', blocks: [] }) }
+    }
+    return { ok: false, status: 404, json: async () => ({}) }
+  }
+  const polling = createHandsStore({
+    fetchImpl: pollFetch,
+    storage: makeStorage({ 'dsh.hands.sel': JSON.stringify({ hand: 'opencode', key, turnId: 'r1', at: '' }) }),
+  })
+  polling.start()
+  await until(() => pollCalls.includes('/dsh-hands/turn?id=r1&from=0'), 'poll running turn from zero')
+  polling.stop()
+  console.log('13) RUNNING 空输出 / next=0 / 轮询偏移 ok')
 }
 
 console.log('ok')
