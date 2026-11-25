@@ -835,4 +835,16 @@ async function until(check, label, tries = 200) {
   console.log('15) 空 key agents 事件刷新 ok')
 }
 
+// ── 16. SSE 滑窗越过本地游标时替换窗口，不重复拼接 ─────────────────────────
+{
+  const store = createHandsStore({ fetchImpl: makeFetch().fetchImpl, storage: makeStorage() })
+  store.select('opencode', 'opencode/alpha')
+  store.appendLive('opencode/alpha', 'gap', 'old', 3, 0)
+  store.appendLive('opencode/alpha', 'gap', 'window', 9, 5)
+  assert.equal(store.getSnapshot().liveByTurn.gap, 'window')
+  assert.equal(store.debug().liveApplied.get('gap'), 9)
+  store.stop()
+  console.log('16) SSE 滑窗 gap 替换 ok')
+}
+
 console.log('ok')

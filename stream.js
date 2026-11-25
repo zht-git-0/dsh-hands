@@ -3,6 +3,7 @@
 // 纯函数，不碰文件系统，方便单独喂样本测。
 
 const MAX_LIVE = 200000
+const MAX_LINE_LENGTH = 65536
 
 function asText(value) {
   return typeof value === 'string' ? value : ''
@@ -115,10 +116,12 @@ export function mapAcpUpdate(update, state) {
  */
 export function createLiveView(hand) {
   let text = ''
+  let totalLength = 0
   const pending = { stdout: '', stderr: '' }
-  let lastPart = { id: '', length: 0 }
+  const discardingLine = { stdout: false, stderr: false }
   let claude = { messageId: '', sawDelta: false }
   let agy = { step: null, last: '' }
+  const opencodeParts = new Map()
   // ACP 的结构化状态：工具 id → 标题，以及 thought / usage 留给以后用
   const acp = { toolCalls: new Map(), toolStatus: new Map(), thought: '', usage: null }
 
@@ -191,10 +194,11 @@ export function createLiveView(hand) {
     })
   }
 
-  const append = (value) => {
+  const append = (value, advance = String(value || '').length) => {
     const chunk = asText(value)
     if (!chunk) return
     text += chunk
+    totalLength += Math.max(0, Number(advance) || 0)
     if (text.length > MAX_LIVE) text = text.slice(-MAX_LIVE)
   }
   const newline = () => {
@@ -219,18 +223,35 @@ export function createLiveView(hand) {
       return
     }
     if (ev.type === 'text' && ev.part && typeof ev.part.text === 'string') {
-      const value = ev.part.text
+      const valueText = String(ev.part.text)
       const id = String(ev.part.id || '')
       // 有的版本同一 part 会反复发累计文本，后到的版本发增量；两种都兼容。
-      if (id && id === lastPart.id) {
-        text = text.slice(0, Math.max(0, text.length - lastPart.length))
-        append(value)
-        lastPart.length = value.length
+      // flat text 只追加不重写，保证 totalLength 与滑窗起点始终一致。
+      const previous = id ? opencodeParts.get(id) : null
+      if (previous) {
+        const previousLength = Number(previous.length) || 0
+        const cumulative = previousLength > 0 && valueText.length >= previousLength && valueText.startsWith(previous.prefix)
+        const piece = cumulative ? valueText.slice(previousLength) : valueText
+        if (piece) append(piece)
+        const next = {
+          length: previousLength + piece.length,
+          prefix: cumulative ? valueText.slice(0, 256) : (previous.prefix + valueText).slice(0, 256),
+          blockText: cumulative ? valueText.slice(-MAX_BLOCK_TEXT) : (previous.blockText + valueText).slice(-MAX_BLOCK_TEXT),
+        }
+        opencodeParts.set(id, next)
+        pushTextBlock(next.blockText, id)
       } else {
-        block(value)
-        lastPart = { id, length: value.length }
+        block(valueText)
+        if (id) {
+          opencodeParts.set(id, {
+            length: valueText.length,
+            prefix: valueText.slice(0, 256),
+            blockText: valueText.slice(-MAX_BLOCK_TEXT),
+          })
+          if (opencodeParts.size > 20) opencodeParts.delete(opencodeParts.keys().next().value)
+        }
+        pushTextBlock(valueText, id)
       }
-      pushTextBlock(value, id)
       return
     }
     if (ev.type === 'tool_use' || ev.part?.type === 'tool') {
@@ -465,7 +486,7 @@ export function createLiveView(hand) {
     feedEvent(update) {
       const mapped = mapAcpUpdate(update, acp)
       if (mapped.thought) {
-        acp.thought += mapped.thought
+        acp.thought = (acp.thought + mapped.thought).slice(-4000)
         pushReasoningBlock(mapped.thought)
       }
       if (mapped.usage !== undefined) acp.usage = mapped.usage
@@ -477,26 +498,36 @@ export function createLiveView(hand) {
       return mapped
     },
     feed(chunk, source = 'stdout') {
-      const data = String(chunk || '')
+      let data = String(chunk || '')
       if (!data) return
       const key = source === 'stderr' ? 'stderr' : 'stdout'
+      if (discardingLine[key]) {
+        const newline = data.indexOf('\n')
+        if (newline < 0) return
+        discardingLine[key] = false
+        data = data.slice(newline + 1)
+        pending[key] = ''
+      }
       pending[key] += data
       let index = pending[key].indexOf('\n')
       while (index >= 0) {
         const rawLine = pending[key].slice(0, index)
         pending[key] = pending[key].slice(index + 1)
-        handleLine(rawLine, key)
+        // 超长单行直接丢弃，绝不把半截 JSON 当正文吐出来。
+        if (rawLine.length <= MAX_LINE_LENGTH) handleLine(rawLine, key)
         index = pending[key].indexOf('\n')
       }
-      // 一整行异常长时先吃掉，别把内存撑爆
-      if (pending[key].length > 65536) {
-        handleLine(pending[key], key)
+      if (pending[key].length > MAX_LINE_LENGTH) {
         pending[key] = ''
+        discardingLine[key] = true
       }
     },
     flush() {
       for (const key of ['stdout', 'stderr']) {
-        if (pending[key]) {
+        if (discardingLine[key]) {
+          pending[key] = ''
+          discardingLine[key] = false
+        } else if (pending[key]) {
           handleLine(pending[key], key)
           pending[key] = ''
         }
@@ -504,6 +535,9 @@ export function createLiveView(hand) {
     },
     render() {
       return text
+    },
+    totalLength() {
+      return totalLength
     },
     // 语义分块（思维链/正文/工具）。老调用方只读 render()，不受影响。
     blocks() {

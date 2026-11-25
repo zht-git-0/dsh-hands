@@ -3,7 +3,7 @@
 // 真跑一个手下要走模型，不放在这里。
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { asyncReportText, createAsyncQueue, findAgentFor, formatDuration, isProcessAlive, pickBin, planAsyncRecovery, readAsyncState, sessionIdFromExec, writeAsyncState } from '../index.js'
+import { asyncReportText, createAsyncQueue, findAgentFor, formatDuration, isAsyncJobActive, isProcessAlive, pickBin, planAsyncRecovery, readAsyncState, sessionIdFromExec, writeAsyncState } from '../index.js'
 
 // ── 0) 二进制路径：按顺序找第一个真实存在的 ──────────────────────────────────
 {
@@ -265,6 +265,33 @@ import { asyncReportText, createAsyncQueue, findAgentFor, formatDuration, isProc
   assert.equal(createAsyncQueue(999).stats().limit, 16, '太大夹到 16')
   assert.equal(createAsyncQueue(undefined).stats().limit, 3, '默认 3')
   console.log('6) 并发闸门 ok')
+}
+
+// ── 9) PID 复用：启动时间不符即使 kill(0) 成功也判死 ────────────────────────
+{
+  const now = Date.now()
+  const record = {
+    id: 'reused', status: 'RUNNING', pid: 12345,
+    startedAt: now - 1000, pidStartedAt: now - 900, pidStartVerified: true,
+  }
+  assert.equal(isAsyncJobActive(record, {
+    isAlive: () => true,
+    inspectProcess: () => now - 900,
+    now,
+  }), true, '启动时间一致才认')
+  assert.equal(isAsyncJobActive(record, {
+    isAlive: () => true,
+    inspectProcess: () => now - 60_000,
+    now,
+  }), false, 'pid 复用启动时间不符判死')
+  const plan = planAsyncRecovery({ jobs: { reused: record } }, {
+    isAlive: () => true,
+    inspectProcess: () => now - 60_000,
+    now,
+  })
+  assert.deepEqual(plan.running, [])
+  assert.deepEqual(plan.orphan, ['reused'])
+  console.log('9) PID 复用识别 ok')
 }
 
 console.log('ok')

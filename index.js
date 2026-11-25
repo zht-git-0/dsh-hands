@@ -362,15 +362,28 @@ export function deriveBlocksFromText(text) {
   return blocks.slice(-80)
 }
 
+function shortTextHash(value) {
+  let hash = 2166136261
+  const text = String(value || '')
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  return hash >>> 0
+}
+
 // SSE 用签名判断语义分块是否变化；status/output 变化也必须推帧。
 export function blocksSignature(blocks) {
   if (!Array.isArray(blocks) || !blocks.length) return ''
   return `${blocks.length}:${blocks.map((block) => [
     String(block?.kind || ''),
     String(block?.text || '').length,
+    shortTextHash(block?.text),
     String(block?.name || ''),
     String(block?.status || ''),
     String(block?.output || '').length,
+    shortTextHash(block?.output),
+    String(block?.detail || ''),
   ].join(':')).join('|')}`
 }
 
@@ -389,6 +402,21 @@ export function computeLiveDelta(text, sentLength) {
   if (sent > full.length) sent = full.length
   const delta = full.slice(sent)
   return { delta, next: sent + delta.length, changed: delta.length > 0 }
+}
+
+// 实时文本是尾部滑窗时，用单调 totalLength 作为绝对偏移，窗口滑动才不会冻结增量。
+export function computeLiveDeltaByLength(text, sentLength, totalLength) {
+  const full = String(text ?? '')
+  let sent = Number(sentLength)
+  if (!Number.isFinite(sent) || sent < 0) sent = 0
+  sent = Math.trunc(sent)
+  let total = Number(totalLength)
+  if (!Number.isFinite(total) || total < 0) total = full.length
+  total = Math.trunc(total)
+  const next = Math.max(sent, total)
+  const count = Math.max(0, next - sent)
+  const delta = count ? full.slice(-count) : ''
+  return { delta, from: next - delta.length, next, changed: delta.length > 0 }
 }
 
 // /health 的 30s 缓存 + in-flight 合并：并发请求共享同一次探测，别同时起四份。
@@ -434,6 +462,21 @@ function tailUtf8(value, maxBytes) {
   let start = buf.length - maxBytes
   while (start < buf.length && (buf[start] & 0xc0) === 0x80) start += 1
   return buf.subarray(start).toString('utf8')
+}
+
+export const MAX_PROCESS_OUTPUT_BYTES = 2 * 1024 * 1024
+const PROCESS_OUTPUT_HEAD_BYTES = 128 * 1024
+
+// 头部保留 init/session id，尾部保留最终 result；中间超长输出截掉。
+function capProcessOutput(value) {
+  const text = String(value || '')
+  const buf = Buffer.from(text, 'utf8')
+  if (buf.length <= MAX_PROCESS_OUTPUT_BYTES) return text
+  let headEnd = Math.min(PROCESS_OUTPUT_HEAD_BYTES, MAX_PROCESS_OUTPUT_BYTES)
+  while (headEnd > 0 && headEnd < buf.length && (buf[headEnd] & 0xc0) === 0x80) headEnd -= 1
+  const head = buf.subarray(0, headEnd).toString('utf8')
+  const tail = tailUtf8(text, Math.max(0, MAX_PROCESS_OUTPUT_BYTES - headEnd - 1))
+  return head + '\n' + tail
 }
 
 // 杀一整棵进程树。只针对我们自己 spawn 出来的 pid，绝不按镜像名连坐。
@@ -623,6 +666,9 @@ export function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk, o
   return new Promise((resolve) => {
     const started = Date.now()
     let child
+    let settled = false
+    let hardTimer = null
+    let exitGraceTimer = null
     // cwd 不存在时 spawn 会报成「spawn cmd.exe ENOENT」，完全看不出真正原因，先自己说清楚
     if (cwd && !fs.existsSync(cwd)) {
       resolve({ code: -1, stdout: '', stderr: `cwd 不存在：${cwd}`, ms: 0, timedOut: false })
@@ -649,6 +695,7 @@ export function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk, o
       })
       if (input) child.stdin.end(input)
       else child.stdin.end()
+      child.stdin?.on('error', () => {})
       // spawn 成功就把句柄交出去记账（RUNNING_PROCS）；这里出错不能影响进程本体
       try {
         onSpawn?.(child)
@@ -661,7 +708,28 @@ export function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk, o
     }
     let stdout = ''
     let stderr = ''
+    let stdoutBytes = 0
+    let stderrBytes = 0
     let timedOut = false
+    const appendOutput = (key, value) => {
+      if (!value) return
+      const bytes = Buffer.byteLength(String(value), 'utf8')
+      if (key === 'stderr') {
+        stderr += value
+        stderrBytes += bytes
+        if (stderrBytes > MAX_PROCESS_OUTPUT_BYTES) {
+          stderr = capProcessOutput(stderr)
+          stderrBytes = Buffer.byteLength(stderr, 'utf8')
+        }
+      } else {
+        stdout += value
+        stdoutBytes += bytes
+        if (stdoutBytes > MAX_PROCESS_OUTPUT_BYTES) {
+          stdout = capProcessOutput(stdout)
+          stdoutBytes = Buffer.byteLength(stdout, 'utf8')
+        }
+      }
+    }
     // 子进程的 chunk 可能从多字节字符中间切开；直接 toString('utf8') 会把中文变成 �??
     const outDecoder = new StringDecoder('utf8')
     const errDecoder = new StringDecoder('utf8')
@@ -671,28 +739,39 @@ export function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk, o
       decodersFlushed = true
       const outTail = outDecoder.end()
       const errTail = errDecoder.end()
-      if (outTail) {
-        stdout += outTail
-        try {
-          onChunk?.(outTail, 'stdout')
-        } catch {
-          /* 实时视图失败不能影响手下干活 */
-        }
+      appendOutput('stdout', outTail)
+      appendOutput('stderr', errTail)
+      try {
+        onChunk?.(outTail, 'stdout')
+      } catch {
+        /* 实时视图失败不能影响手下干活 */
       }
-      if (errTail) {
-        stderr += errTail
-        try {
-          onChunk?.(errTail, 'stderr')
-        } catch {
-          /* 同上 */
-        }
+      try {
+        onChunk?.(errTail, 'stderr')
+      } catch {
+        /* 同上 */
       }
     }
-    const timer = timeoutSec > 0 ? setTimeout(() => {
+    const finish = (code, errorText = '') => {
+      if (settled) return
+      settled = true
+      clearTimeout(hardTimer)
+      clearTimeout(exitGraceTimer)
+      flushDecoders()
+      if (errorText) appendOutput('stderr', errorText)
+      resolve({ code, stdout, stderr, ms: Date.now() - started, timedOut })
+    }
+    hardTimer = timeoutSec > 0 ? setTimeout(() => {
       timedOut = true
+      const forceFinish = () => {
+        child.stdout?.destroy()
+        child.stderr?.destroy()
+        finish(-1)
+      }
       try {
         if (process.platform === 'win32' && child.pid) {
-          spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true })
+          const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
+          killer.on('error', forceFinish)
         } else {
           try {
             process.kill(-child.pid, 'SIGKILL')
@@ -703,11 +782,14 @@ export function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk, o
       } catch {
         /* 尽力而为 */
       }
+      // 杀进程失败也不能让队列槽位永久占死。
+      exitGraceTimer = setTimeout(forceFinish, 2000)
     }, Math.max(5, timeoutSec) * 1000) : null
 
     child.stdout?.on('data', (chunk) => {
+      if (settled) return
       const text = outDecoder.write(chunk)
-      stdout += text
+      appendOutput('stdout', text)
       try {
         onChunk?.(text, 'stdout')
       } catch {
@@ -715,24 +797,29 @@ export function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk, o
       }
     })
     child.stderr?.on('data', (chunk) => {
+      if (settled) return
       const text = errDecoder.write(chunk)
-      stderr += text
+      appendOutput('stderr', text)
       try {
         onChunk?.(text, 'stderr')
       } catch {
         /* 同上 */
       }
     })
-    child.on('error', (error) => {
-      clearTimeout(timer)
-      flushDecoders()
-      resolve({ code: -1, stdout, stderr: `${stderr}${error?.message ?? error}`, ms: Date.now() - started, timedOut })
+    child.on('error', (error) => finish(-1, error?.message ?? String(error)))
+    child.on('exit', (code) => {
+      if (settled) return
+      clearTimeout(hardTimer)
+      clearTimeout(exitGraceTimer)
+      // Windows 孙进程可能继续持有 stdout/stderr 管道，让 close 永远不来。
+      // 主进程退出后给管道 2 秒收尾；不再对已退出的 pid 调 taskkill，避免误伤复用 pid。
+      exitGraceTimer = setTimeout(() => {
+        child.stdout?.destroy()
+        child.stderr?.destroy()
+        finish(code)
+      }, 2000)
     })
-    child.on('close', (code) => {
-      clearTimeout(timer)
-      flushDecoders()
-      resolve({ code, stdout, stderr, ms: Date.now() - started, timedOut })
-    })
+    child.on('close', (code) => finish(code))
   })
 }
 
@@ -946,28 +1033,92 @@ export function writeAsyncState(state, file = ASYNC_STATE_FILE) {
   }
 }
 
-// 进程在不在：pid 合法且存活。用 signal 0 探测（Windows/POSIX 都支持）：
-// 存在但无权叫活的（EPERM）算在——那进程还活着。
+// EPERM 只说明没权限探测，不能证明进程还活着；普通权限下按不存活处理。
 export function isProcessAlive(pid) {
   const target = Number(pid)
   if (!Number.isInteger(target) || target <= 0) return false
   try {
     process.kill(target, 0)
     return true
-  } catch (error) {
-    return String(error?.code || '') === 'EPERM'
+  } catch {
+    return false
   }
+}
+
+export const MAX_RECOVERED_PROCESS_AGE_MS = 24 * 60 * 60 * 1000
+export const PROCESS_START_TOLERANCE_MS = 5_000
+
+// 尽力读取进程启动时间（Unix ms）。Windows 走 PowerShell，Linux 读 /proc，其它 POSIX 用 ps。
+function readProcessStartTimeUncached(pid) {
+  const target = Number(pid)
+  if (!Number.isInteger(target) || target <= 0) return null
+  try {
+    if (process.platform === 'win32') {
+      const result = spawnSync('powershell.exe', [
+        '-NoProfile', '-NonInteractive', '-Command',
+        `(Get-Process -Id ${target} -ErrorAction Stop).StartTime.ToFileTimeUtc()`,
+      ], { encoding: 'utf8', timeout: 1500, windowsHide: true })
+      if (result.status !== 0) return null
+      const fileTime = Number(String(result.stdout || '').trim())
+      return Number.isFinite(fileTime) ? Math.trunc(fileTime / 10000) - 11644473600000 : null
+    }
+    if (process.platform === 'linux') {
+      const stat = fs.readFileSync(`/proc/${target}/stat`, 'utf8')
+      const close = stat.lastIndexOf(')')
+      if (close < 0) return null
+      const fields = stat.slice(close + 2).trim().split(/\s+/)
+      const ticks = Number(fields[19])
+      const boot = fs.readFileSync('/proc/stat', 'utf8').match(/^btime\s+(\d+)/m)
+      const tickRate = Number(spawnSync('getconf', ['CLK_TCK'], { encoding: 'utf8', timeout: 500 }).stdout) || 100
+      if (!Number.isFinite(ticks) || !boot) return null
+      return Number(boot[1]) * 1000 + Math.trunc((ticks / tickRate) * 1000)
+    }
+    const result = spawnSync('ps', ['-p', String(target), '-o', 'lstart='], { encoding: 'utf8', timeout: 1000 })
+    if (result.status !== 0) return null
+    const at = Date.parse(String(result.stdout || '').trim())
+    return Number.isFinite(at) ? at : null
+  } catch {
+    return null
+  }
+}
+
+const processStartCache = new Map()
+export function getProcessStartTime(pid) {
+  const target = Number(pid)
+  const cached = processStartCache.get(target)
+  if (cached && Date.now() - cached.at < 2000) return cached.value
+  const value = readProcessStartTimeUncached(target)
+  processStartCache.set(target, { at: Date.now(), value })
+  if (processStartCache.size > 50) processStartCache.delete(processStartCache.keys().next().value)
+  return value
 }
 
 // 异步任务是否仍活跃：有 pid 时以进程存活为准（宿主重启后 pid 真死了就收尸）；
 // 没 pid 的旧记录才退回 status=RUNNING（无法确认死亡，不能贸然标中断）。
-export function isAsyncJobActive(record, { isAlive } = {}) {
+export function isAsyncJobActive(record, {
+  isAlive,
+  inspectProcess = getProcessStartTime,
+  now = Date.now(),
+  maxAgeMs = MAX_RECOVERED_PROCESS_AGE_MS,
+  startToleranceMs = PROCESS_START_TOLERANCE_MS,
+} = {}) {
   if (!record?.id || record.endedAt) return false
   // QUEUED 明确表示进程从未启动，不能因为旧版本没有 pid 就误判成 RUNNING。
   if (String(record.status || '').toUpperCase() === 'QUEUED') return false
   const alive = typeof isAlive === 'function' ? isAlive : isProcessAlive
   const pid = Number(record.pid)
-  if (Number.isInteger(pid) && pid > 0) return alive(pid)
+  if (Number.isInteger(pid) && pid > 0) {
+    if (!alive(pid)) return false
+    const expectedStart = Number(record.pidStartedAt)
+    if (record.pidStartVerified === true && Number.isFinite(expectedStart)) {
+      const currentStart = Number(inspectProcess(pid))
+      if (Number.isFinite(currentStart)) return Math.abs(currentStart - expectedStart) <= startToleranceMs
+    }
+    // 没拿到可信启动时间（旧记录/平台不支持）时才用最大寿命兜底。
+    const startedAt = Number(record.startedAt)
+    const taskStartedMs = Number.isFinite(startedAt) ? startedAt : Date.parse(String(record.startedAt || ''))
+    return !Number.isFinite(taskStartedMs) || Number(now) - taskStartedMs <= maxAgeMs
+  }
   return String(record.status || '').toUpperCase() === 'RUNNING'
 }
 
@@ -1012,7 +1163,7 @@ export function findAsyncDispatchStart(record, recordsOrStarts) {
 
 // 启动对账计划：有 start 没 end，但 asyncState 仍 RUNNING / pid 仍活着的，不收尸。
 // 只有无法证明还活着的才补 INTERRUPTED。纯函数，方便测「插件重启但进程没死」。
-export function planLogReconciliation(records, asyncJobs = {}, { isAlive, runningIds = [] } = {}) {
+export function planLogReconciliation(records, asyncJobs = {}, { isAlive, inspectProcess, now, maxAgeMs, startToleranceMs, runningIds = [] } = {}) {
   const starts = new Map()
   const ended = new Set()
   for (const record of Array.isArray(records) ? records : []) {
@@ -1023,7 +1174,7 @@ export function planLogReconciliation(records, asyncJobs = {}, { isAlive, runnin
   }
   const active = new Set((Array.isArray(runningIds) ? runningIds : []).map(String).filter(Boolean))
   for (const record of Object.values(asyncJobs || {})) {
-    if (!isAsyncJobActive(record, { isAlive })) continue
+    if (!isAsyncJobActive(record, { isAlive, inspectProcess, now, maxAgeMs, startToleranceMs })) continue
     const start = findAsyncDispatchStart(record, starts)
     active.add(String(start?.id || record.dispatchId || record.id || ''))
   }
@@ -1039,7 +1190,7 @@ export function planLogReconciliation(records, asyncJobs = {}, { isAlive, runnin
 // 「没跑完」只有在进程确认不在时才算（见 isProcessAlive）：进程还活着的留 running——
 // 诚实标签，别把「可能还在跑」宣成「已死无结果」。
 // 纯函数，只决定「要不要投 / 标什么」，真投递在外面做 —— 这样能单测。
-export function planAsyncRecovery(state, { isAlive } = {}) {
+export function planAsyncRecovery(state, { isAlive, inspectProcess, now, maxAgeMs, startToleranceMs } = {}) {
   const jobs = Object.values(state?.jobs || {})
   const deliver = []
   const orphan = []
@@ -1053,7 +1204,7 @@ export function planAsyncRecovery(state, { isAlive } = {}) {
       continue
     }
     if (!record.endedAt) {
-      if (isAsyncJobActive(record, { isAlive })) running.push(record.id)
+      if (isAsyncJobActive(record, { isAlive, inspectProcess, now, maxAgeMs, startToleranceMs })) running.push(record.id)
       else orphan.push(record.id)
       continue
     }
@@ -1181,11 +1332,9 @@ export function asyncSessionLockKeys(job = {}) {
   const hand = String(job.hand || '').trim().toLowerCase()
   const conversationId = String(job.conversationId || '').trim()
   const session = String(job.session || '').trim()
-  const cwd = normalizeAsyncSessionCwd(job.cwd)
-  const keys = []
-  if (conversationId) keys.push(`v1:${hand}:id:${conversationId}`)
-  keys.push(`v1:${hand}:name:${session}:cwd:${cwd}`)
-  return [...new Set(keys)]
+  if (conversationId) return [`v1:${hand}:id:${conversationId}`]
+  if (session) return [`v1:${hand}:name:${session}:cwd:${normalizeAsyncSessionCwd(job.cwd)}`]
+  return [`v1:${hand}:job:${String(job.id || '')}`]
 }
 
 // 目标会话级串行队列：每个 lane 同时只允许一个任务进入全局并发闸门。
@@ -1516,8 +1665,14 @@ export function resolveAgyProviderCredentials(provider, providers = readAgyProvi
   }
 }
 
+export function isSafeAgyConversationId(id) {
+  const value = String(id || '').trim()
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) && value !== '.' && value !== '..'
+}
+
 export function agyProviderSettingsFile(provider, profilesRoot = AGY_PROFILES_ROOT) {
   const name = agyClean(provider).replace(/[^\w.-]+/g, '_') || 'provider'
+  if (name === '.' || name === '..') throw new Error('agy provider name must not be a path segment')
   return path.join(profilesRoot, name, 'settings.json')
 }
 
@@ -2024,7 +2179,7 @@ export function mergeJobRecords(records) {
 // 面板统一状态：历史 end ∪ 当前 RUNNING ∪ asyncState 里仍活跃的恢复任务。
 // 旧版本曾把活进程误补成 INTERRUPTED；只要 asyncState/pid 证明它还活着，就以 RUNNING 覆盖。
 // 已经写了真正 end 的任务不覆盖（收尾记录优先于过期的 asyncState）。
-export function buildPanelDispatchState(records, asyncJobs = {}, running = [], { isAlive, sessionIndexes = {} } = {}) {
+export function buildPanelDispatchState(records, asyncJobs = {}, running = [], { isAlive, inspectProcess, now, maxAgeMs, startToleranceMs, sessionIndexes = {} } = {}) {
   const jobs = mergeJobRecords(records)
   const jobById = new Map(jobs.map((job) => [String(job.id || ''), job]))
   const starts = new Map()
@@ -2077,7 +2232,7 @@ export function buildPanelDispatchState(records, asyncJobs = {}, running = [], {
       }
       continue
     }
-    if (!isAsyncJobActive(record, { isAlive })) continue
+    if (!isAsyncJobActive(record, { isAlive, inspectProcess, now, maxAgeMs, startToleranceMs })) continue
     const start = findAsyncDispatchStart(record, starts)
     const id = String(start?.id || record.dispatchId || record.id || '')
     if (!id || runningMap.has(id)) continue
@@ -2644,6 +2799,12 @@ export function apply(ctx, config = {}) {
         Object.values(asyncState.jobs).find((job) => String(job.dispatchId || '') === String(id))
       if (record && child?.pid) {
         record.pid = child.pid
+        record.pidRecordedAt = Date.now()
+        const pidStartedAt = getProcessStartTime(child.pid)
+        if (Number.isFinite(pidStartedAt)) {
+          record.pidStartedAt = pidStartedAt
+          record.pidStartVerified = true
+        }
         saveAsyncState()
       }
     } catch {
@@ -2675,6 +2836,7 @@ export function apply(ctx, config = {}) {
       cwd: String(fields.cwd || ''),
       model: String(fields.model || ''),
       output: '',
+      outputLength: 0,
       outputAt: startedMs,
     }
     appendRecord(
@@ -2716,17 +2878,21 @@ export function apply(ctx, config = {}) {
       cancelled: !!ASYNC_JOBS.get(id)?.cancelled,
       finished: false,
       push(chunk, source) {
+        if (run.finished) return
         live.feed(chunk, source)
         entry.output = live.render()
         entry.blocks = live.blocks()
+        entry.outputLength = live.totalLength()
         entry.outputAt = Date.now()
         touchRunning()
       },
       // ACP 的结构化更新走同一套 live view（feedEvent 内部丢弃 replay:true 的历史块）
       feedEvent(update) {
+        if (run.finished) return
         live.feedEvent(update)
         entry.output = live.render()
         entry.blocks = live.blocks()
+        entry.outputLength = live.totalLength()
         entry.outputAt = Date.now()
         touchRunning()
       },
@@ -2734,6 +2900,7 @@ export function apply(ctx, config = {}) {
         live.flush()
         entry.output = live.render()
         entry.blocks = live.blocks()
+        entry.outputLength = live.totalLength()
       },
     }
   }
@@ -2774,6 +2941,7 @@ export function apply(ctx, config = {}) {
         model: run.entry.model,
         exitCode: fields.exitCode,
         excerpt: String(fields.excerpt || output).slice(0, 1200),
+        outputLength: Number(run.entry.outputLength) || 0,
         jobFile: jobFile || undefined,
         tokens: fields.tokens,
         cost: fields.cost,
@@ -2848,7 +3016,7 @@ export function apply(ctx, config = {}) {
   for (const record of Object.values(asyncState.jobs || {})) {
     if (!record?.id || record.endedAt || String(record.status || '').toUpperCase() !== 'RUNNING') continue
     const pid = Number(record.pid)
-    if (!Number.isInteger(pid) || pid <= 0 || !isProcessAlive(pid)) continue
+    if (!Number.isInteger(pid) || pid <= 0 || !isAsyncJobActive(record)) continue
     const token = sessionQueue.reserve(asyncSessionLockKeys(record))
     if (token) recoveredSessionLocks.set(String(record.id), { token, pid })
   }
@@ -2856,7 +3024,8 @@ export function apply(ctx, config = {}) {
     if (!recoveredSessionLocks.size) return () => {}
     const timer = setInterval(() => {
       for (const [id, locked] of recoveredSessionLocks) {
-        if (isProcessAlive(locked.pid)) continue
+        const current = asyncState.jobs[id]
+        if (current && isAsyncJobActive(current)) continue
         if (!sessionQueue.release(locked.token)) continue
         recoveredSessionLocks.delete(id)
         const record = asyncState.jobs[id]
@@ -3907,7 +4076,8 @@ export function apply(ctx, config = {}) {
                 const id = target.id
                 if (!target.running && settled.has(id)) return
                 const text = target.running ? String(target.entry.output || '') : readJobText(target.entry)
-                const delta = computeLiveDelta(text, sentLengths.get(id) || 0)
+                const totalLength = Number(target.entry.outputLength) || text.length
+                const delta = computeLiveDeltaByLength(text, sentLengths.get(id) || 0, totalLength)
                 // 语义分块：只在真的变了才带；老客户端看到多余字段会忽略。
                 // 分块变了但正文没变（比如只多了一条工具记录）也要推一帧。
                 const rawBlocks = Array.isArray(target.entry.blocks) ? target.entry.blocks : []
@@ -3926,12 +4096,13 @@ export function apply(ctx, config = {}) {
                   key,
                   id,
                   delta: delta.changed ? delta.delta : '',
+                  from: delta.from ?? delta.next - delta.delta.length,
                   next: delta.next,
                   outputAt,
                   idleMs: Math.max(0, Date.now() - outputAt),
                   ...(blocksChanged && rawBlocks.length ? { blocks: rawBlocks } : {}),
                 })
-                if (!target.running && delta.next >= text.length) settled.add(id)
+                if (!target.running && delta.next >= totalLength) settled.add(id)
               }
 
               sendAgents(true)
@@ -4025,24 +4196,25 @@ export function apply(ctx, config = {}) {
                 // 带 from 只回正文增量；next / eof 一律服务端算好，前端别自己拼。
                 // id 校验和 jobFile 的路径穿越都沿用 fullEntry / readJobText。
                 if (u.searchParams.has('from')) {
-                  const from = Math.max(0, Number(u.searchParams.get('from')) || 0)
+                  const rawFrom = Number(u.searchParams.get('from'))
+                  const requestedFrom = Number.isFinite(rawFrom) ? Math.max(0, Math.trunc(rawFrom)) : 0
                   const text = readJobText(entry)
-                  const delta = text.slice(from)
-                  const next = from + delta.length
-                  // 第一页顺带把语义分块（思维链/正文/工具）带回去；entry.blocks 优先，
-                  // 老轮次没落盘 blocks 时从 job 文件原文解析，让旧轮次也能显示工具列表。
-                  const blocks =
-                    from === 0 && Array.isArray(entry.blocks) && entry.blocks.length
-                      ? entry.blocks
-                      : from === 0
-                        ? deriveBlocksFromText(text)
-                        : undefined
-                  const blocksDerived = from === 0 && !(Array.isArray(entry.blocks) && entry.blocks.length)
+                  const totalLength = Number(entry.outputLength) || text.length
+                  const delta = computeLiveDeltaByLength(text, requestedFrom, totalLength)
+                  const from = delta.from
+                  // 第一页或游标已落进滑窗时带语义分块；entry.blocks 优先。
+                  const hasNativeBlocks = Array.isArray(entry.blocks) && entry.blocks.length
+                  const blocks = hasNativeBlocks
+                    ? entry.blocks
+                    : from <= Math.max(0, totalLength - text.length)
+                      ? deriveBlocksFromText(text)
+                      : undefined
+                  const blocksDerived = !hasNativeBlocks && !!blocks
                   return send(200, {
                     id,
                     from,
-                    next,
-                    eof: next >= text.length,
+                    next: delta.next,
+                    eof: delta.next >= totalLength,
                     delta,
                     ...(blocks ? { blocks, blocksDerived } : {}),
                   })
@@ -4485,6 +4657,9 @@ export function apply(ctx, config = {}) {
       }
 
       if (action === 'delete') {
+        if (!isSafeAgyConversationId(id)) {
+          throw new Error('conversationId contains unsafe path characters')
+        }
         const paths = sessionPaths(id)
         const moved = []
         for (const [kind, source] of Object.entries(paths)) {

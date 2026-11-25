@@ -954,7 +954,12 @@ window.__ModuleLoader__.load({
           const tail = piece.slice(Math.min(Math.max(0, applied - startAt), piece.length));
           liveApplied.set(turnId, nextAt);
           if (!tail) return false;
-          emit({ liveByTurn: { ...state.liveByTurn, [turnId]: (state.liveByTurn[turnId] || '') + tail } });
+          if (startAt > applied) {
+            // 重连时服务端滑窗已越过本地游标：整段替换，避免把旧窗口再拼一遍。
+            emit({ liveByTurn: { ...state.liveByTurn, [turnId]: tail } });
+          } else {
+            emit({ liveByTurn: { ...state.liveByTurn, [turnId]: (state.liveByTurn[turnId] || '') + tail } });
+          }
           return true;
         }
         if (!piece) return false;
@@ -963,11 +968,11 @@ window.__ModuleLoader__.load({
         return true;
       }
 
-      function appendLive(key, id, delta, next) {
+      function appendLive(key, id, delta, next, from) {
         const wantedKey = String(key || '');
         // 服务端只推选中 key；万一切 key 时收到旧连接残留的帧，丢掉
         if (wantedKey && state.selection.key && wantedKey !== state.selection.key) return false;
-        return applyDelta(id, delta, next);
+        return applyDelta(id, delta, next, from);
       }
 
       function queuedTurnId(id) {
@@ -1428,7 +1433,7 @@ window.__ModuleLoader__.load({
       function handleLiveEvent(event) {
         const data = parseEvent(event);
         if (!data) return;
-        appendLive(data.key, data.id, data.delta, data.next);
+        appendLive(data.key, data.id, data.delta, data.next, data.from);
         if (Array.isArray(data.blocks)) applyBlocksToTurn(data.id, data.blocks);
       }
 

@@ -17,6 +17,7 @@ import {
   CC_SWITCH_DB,
   agyProviderContext,
   agyProviderSettingsFile,
+  isSafeAgyConversationId,
   ensureAgyProvidersFile,
   readAgyProviders,
   readCcSwitchAgyEnv,
@@ -146,6 +147,10 @@ function withEnv(name, value, fn) {
   const file = writeAgyProviderSettings('znbcode', 'Gemini 4 Neon (XHigh)', root)
   assert.equal(file, path.join(root, 'znbcode', 'settings.json'))
   assert.equal(agyProviderSettingsFile('znbcode', root), file)
+  assert.throws(() => agyProviderSettingsFile('..', root), /path segment/)
+  assert.throws(() => agyProviderSettingsFile('.', root), /path segment/)
+  assert.equal(isSafeAgyConversationId('ses_abc-123'), true)
+  for (const id of ['', '.', '..', '../x', 'a/b', 'a\\b']) assert.equal(isSafeAgyConversationId(id), false)
   const settings = JSON.parse(fs.readFileSync(file, 'utf8'))
   assert.equal(settings.modelProvider, 'gemini')
   assert.equal(settings.model, 'Gemini 4 Neon (XHigh)')

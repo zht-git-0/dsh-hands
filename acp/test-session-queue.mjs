@@ -32,8 +32,10 @@ const deferred = () => {
   const named = asyncSessionLockKeys({ hand: 'opencode', session: 'same', cwd: 'D:/Work/Repo' })
   const byId = asyncSessionLockKeys({ hand: 'opencode', conversationId: 'ses_1', session: 'same', cwd: 'D:/Work/Repo' })
   assert.deepEqual(named, ['v1:opencode:name:same:cwd:d:/work/repo'])
-  assert.deepEqual(byId, ['v1:opencode:id:ses_1', 'v1:opencode:name:same:cwd:d:/work/repo'])
+  assert.deepEqual(byId, ['v1:opencode:id:ses_1'])
   assert.notDeepEqual(asyncSessionLockKeys({ hand: 'codex', conversationId: 'ses_1' }), byId)
+  assert.deepEqual(asyncSessionLockKeys({ hand: 'agy', id: 'one', cwd: 'D:/same' }), ['v1:agy:job:one'])
+  assert.deepEqual(asyncSessionLockKeys({ hand: 'agy', id: 'two', cwd: 'D:/same' }), ['v1:agy:job:two'])
   console.log('1) 锁键与规范化 ok')
 }
 
@@ -233,6 +235,24 @@ const deferred = () => {
   assert.equal(b.status, 'RUNNING')
   await b.promise
   console.log('9) 会话队首出队未启动取消 ok')
+}
+
+// 10) 同目录不同 conversationId 使用独立 lane，不互相排队。
+{
+  const queue = createSessionQueue()
+  const starts = []
+  const gateA = deferred()
+  const gateB = deferred()
+  const a = queue.enqueue({ key: 'A', keys: asyncSessionLockKeys({ hand: 'opencode', conversationId: 'sid-A', cwd: 'D:/same' }), start: () => gateA.promise, onStart: () => starts.push('A') })
+  const b = queue.enqueue({ key: 'B', keys: asyncSessionLockKeys({ hand: 'opencode', conversationId: 'sid-B', cwd: 'D:/same' }), start: () => gateB.promise, onStart: () => starts.push('B') })
+  assert.equal(a.status, 'RUNNING')
+  assert.equal(b.status, 'RUNNING')
+  await flush()
+  assert.deepEqual(starts, ['A', 'B'])
+  gateA.resolve({ status: 'OK' })
+  gateB.resolve({ status: 'OK' })
+  await Promise.all([a.promise, b.promise])
+  console.log('10) 不同 conversationId 同目录并行 ok')
 }
 
 console.log('ok')

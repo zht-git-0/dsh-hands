@@ -204,4 +204,28 @@ const feed = (view, hand, events) => {
   console.log('11) ACP 工具去重 ok')
 }
 
+// ── 12) 超长单行整体丢弃，不把半截 JSON 当正文 ──────────────────────────────
+{
+  const view = createLiveView('opencode')
+  view.feed('x'.repeat(70000))
+  assert.equal(view.render(), '')
+  view.feed('\n' + JSON.stringify({ type: 'text', part: { text: '有效正文' } }) + '\n')
+  assert.equal(view.render(), '有效正文')
+  view.feed('y'.repeat(70000))
+  view.flush()
+  assert.equal(view.render(), '有效正文', 'flush 也不能吐出被丢弃的超长残行')
+  console.log('12) 超长单行丢弃 ok')
+}
+
+// ── 13) opencode 同 part 的累计/增量都保持 flat text 只追加 ──────────────────
+{
+  const view = createLiveView('opencode')
+  view.feed(JSON.stringify({ type: 'text', part: { id: 'p1', text: '你好' } }) + '\n')
+  view.feed(JSON.stringify({ type: 'text', part: { id: 'p1', text: '你好世界' } }) + '\n')
+  view.feed(JSON.stringify({ type: 'text', part: { id: 'p1', text: '！' } }) + '\n')
+  assert.equal(view.render(), '你好世界！')
+  assert.equal(view.totalLength(), view.render().length)
+  console.log('13) opencode 累计/增量单调偏移 ok')
+}
+
 console.log('ok')
