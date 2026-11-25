@@ -25,7 +25,7 @@ const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
 
   assert.deepEqual(q.stats(), { limit: 1, active: 1, waiting: 1 }, '第二个在排队')
   assert.equal(q.cancel('j-second'), true, '排队中的能取消')
-  assert.deepEqual(await second, { cancelled: true }, '取消后 promise 以 cancelled 结算')
+  assert.deepEqual(await second, { cancelled: true, cancelledPhase: 'queued' }, '取消后 promise 以 cancelled 结算')
   assert.deepEqual(q.stats(), { limit: 1, active: 1, waiting: 0 }, 'waiting 立即减少')
 
   release()
@@ -33,6 +33,22 @@ const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
   await tick()
   assert.deepEqual(ran, ['first'], '被取消的任务 start 一次都没跑')
   console.log('1) 取消排队中的任务 ok')
+}
+
+// ── 1b) 已出队但 start 微任务尚未执行：取消也要成功，start 不再运行 ────────
+{
+  const q = createAsyncQueue(1)
+  let ran = false
+  const task = q.run(() => {
+    ran = true
+    return 'late'
+  }, 'pre-start')
+  assert.equal(q.cancel('pre-start'), true, '出队未启动可取消')
+  assert.deepEqual(await task, { cancelled: true, cancelledPhase: 'queued' })
+  await tick()
+  assert.equal(ran, false, '取消后 perform 不执行')
+  assert.deepEqual(q.stats(), { limit: 1, active: 0, waiting: 0 })
+  console.log('1b) 出队未启动取消 ok')
 }
 
 // ── 2) 取消不存在 / 正在跑的 key：都返回 false，不谎报 ──────────────────────
@@ -47,6 +63,7 @@ const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
     return 'ok'
   }, 'j-active')
 
+  await tick()
   assert.equal(q.cancel('j-nope'), false, '不存在的 key')
   assert.equal(q.cancel('j-active'), false, '已在跑的不能从队列层取消（进程由 /cancel 杀）')
   release()
@@ -82,7 +99,7 @@ const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
   await c
   await tick()
   assert.deepEqual(order, ['a', 'c'], 'b 被摘掉后剩下的顺序不变')
-  assert.deepEqual(await b, { cancelled: true })
+  assert.deepEqual(await b, { cancelled: true, cancelledPhase: 'queued' })
   console.log('3) 取消后 FIFO 不乱 ok')
 }
 

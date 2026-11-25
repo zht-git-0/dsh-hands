@@ -611,6 +611,16 @@ window.__ModuleLoader__.load({
       });
     }
 
+    // 最新页刷新时保留已经加载、且早于本页最老一条的历史页。
+    function mergeTurnPage(existing, incoming, blockCache) {
+      const previous = Array.isArray(existing) ? existing : [];
+      const merged = mergeTurnsById(previous, Array.isArray(incoming) ? incoming : [], blockCache);
+      const ids = new Set(merged.map((row) => String(row?.id || '')).filter(Boolean));
+      return merged
+        .concat(previous.filter((row) => !ids.has(String(row?.id || ''))))
+        .sort((a, b) => String(b.startedAt || '').localeCompare(String(a.startedAt || '')));
+    }
+
     // v2 的唯一状态源。SSE 优先，4s 无首包退轮询；轮询期间继续每隔一会儿试 SSE。
     // options 只给测试注入（fetch / storage / EventSource / now），生产不传。
     function createHandsStore(options = {}) {
@@ -660,6 +670,7 @@ window.__ModuleLoader__.load({
       const bodyQueue = [];
       const bodyWaiters = new Map();
       let bodyDraining = false;
+      let refreshingEmptySelection = false;
 
       let started = false;
       // 同一个 store 可能被两处同时挂载（顶层面板 + 右侧栏 tab）：
@@ -667,6 +678,7 @@ window.__ModuleLoader__.load({
       let startDepth = 0;
       let mode = 'idle'; // idle | sse | poll
       let streamKey = '';
+      let streamHand = '';
       let source = null;
       let watchdog = null;
       let pollAgentsTimer = null;
@@ -897,8 +909,9 @@ window.__ModuleLoader__.load({
           );
           if (life !== lifeToken) return [];
           if (turnSeq.get(wanted) !== seq) return [];
-          const turns = mergeTurnsById(state.turnsByKey[wanted] || [], Array.isArray(data?.turns) ? data.turns : [], turnBlocksById);
-          turnsMore.set(wanted, turns.length >= TURN_PAGE);
+          const incoming = Array.isArray(data?.turns) ? data.turns : [];
+          const turns = mergeTurnPage(state.turnsByKey[wanted] || [], incoming, turnBlocksById);
+          if (turnsMore.get(wanted) !== false) turnsMore.set(wanted, incoming.length >= TURN_PAGE);
           emit({
             turnsByKey: { ...state.turnsByKey, [wanted]: turns },
             connected: true,
@@ -1010,10 +1023,7 @@ window.__ModuleLoader__.load({
           if (olderSeq.get(wanted) !== seq) return [];
           const incoming = Array.isArray(data?.turns) ? data.turns : [];
           const existing = state.turnsByKey[wanted] || [];
-          const incomingIds = new Set(incoming.map((row) => String(row?.id || '')).filter(Boolean));
-          const older = existing.filter((row) => !incomingIds.has(String(row?.id || '')));
-          const merged = mergeTurnsById(older, incoming, turnBlocksById)
-            .sort((a, b) => String(b.startedAt || '').localeCompare(String(a.startedAt || '')));
+          const merged = mergeTurnPage(existing, incoming, turnBlocksById);
           turnsMore.set(wanted, incoming.length >= TURN_PAGE);
           emit({ turnsByKey: { ...state.turnsByKey, [wanted]: merged }, error: null });
           return merged;
@@ -1159,12 +1169,13 @@ window.__ModuleLoader__.load({
         const prev = state.selection;
         if (prev.hand === hand && prev.key === key && prev.turnId === turnId) return;
         const keyChanged = prev.key !== key;
+      const streamChanged = keyChanged || prev.hand !== hand;
         emit({ selection: { hand, key, turnId } });
         writeSavedSelection();
         if (hand && state.sessionsByHand[hand] === undefined) loadSessions(hand);
         const pending =
           key && (keyChanged || state.turnsByKey[key] === undefined) ? loadTurns(key) : null;
-        if (keyChanged) restartStream();
+        if (streamChanged) restartStream();
         return pending;
       }
 
@@ -1344,6 +1355,20 @@ window.__ModuleLoader__.load({
           phase: 'ready',
           error: null,
         });
+        // 空 key 的 SSE 连接只收 agents；用事件里的 agents 直接解析，不再依赖 REST /agents。
+        if (!state.selection.key && !refreshingEmptySelection && started) {
+          refreshingEmptySelection = true;
+          const life = lifeToken;
+          const selectionRev = rev.selection;
+          resolveSelection(readSavedSelection())
+            .then((resolved) => {
+              if (life !== lifeToken || rev.selection !== selectionRev || state.selection.key || !resolved) return;
+              applySelection(resolved);
+            })
+            .finally(() => {
+              refreshingEmptySelection = false;
+            });
+        }
       }
 
       function handleSessionsEvent(event) {
@@ -1356,6 +1381,10 @@ window.__ModuleLoader__.load({
           phase: 'ready',
           error: null,
         });
+        if (hand === state.selection.hand && !state.selection.key) {
+          const latest = latestSession(data.sessions);
+          if (latest) applySelection({ hand, key: String(latest.key || ''), turnId: '' });
+        }
       }
 
       function handleTurnsEvent(event) {
@@ -1363,7 +1392,7 @@ window.__ModuleLoader__.load({
         if (!data || !Array.isArray(data.turns)) return;
         const key = String(data.key || state.selection.key);
         if (!key) return;
-        const turns = mergeTurnsById(state.turnsByKey[key] || [], data.turns, turnBlocksById);
+        const turns = mergeTurnPage(state.turnsByKey[key] || [], data.turns, turnBlocksById);
         emit({ turnsByKey: { ...state.turnsByKey, [key]: turns } });
         if (state.selection.key === key) {
           const nextTurn = resolveTurnId(turns, state.selection.turnId);
@@ -1407,7 +1436,9 @@ window.__ModuleLoader__.load({
         if (!started) return;
         closeSource();
         const key = state.selection.key;
+        const hand = state.selection.hand;
         streamKey = key;
+        streamHand = hand;
         if (!EventSourceImpl) {
           startPolling();
           return;
@@ -1415,7 +1446,7 @@ window.__ModuleLoader__.load({
         let nextSource;
         try {
           nextSource = new EventSourceImpl(
-            endpointOf(`dsh-hands/stream?key=${encodeURIComponent(key)}`),
+            endpointOf(`dsh-hands/stream?hand=${encodeURIComponent(hand)}&key=${encodeURIComponent(key)}`),
           );
         } catch {
           startPolling();
@@ -1480,7 +1511,7 @@ window.__ModuleLoader__.load({
 
       function restartStream() {
         if (!started) return;
-        if (mode === 'sse' && source && streamKey === state.selection.key) return;
+        if (mode === 'sse' && source && streamKey === state.selection.key && streamHand === state.selection.hand) return;
         connectStream();
       }
 

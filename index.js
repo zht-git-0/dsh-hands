@@ -645,6 +645,7 @@ export function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk, o
         env: env || process.env,
         stdio: ['pipe', 'pipe', 'pipe'],
         shell: needsShell,
+        detached: process.platform !== 'win32',
       })
       if (input) child.stdin.end(input)
       else child.stdin.end()
@@ -693,7 +694,11 @@ export function runProcess(bin, args, { cwd, timeoutSec = 900, input, onChunk, o
         if (process.platform === 'win32' && child.pid) {
           spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true })
         } else {
-          child.kill('SIGKILL')
+          try {
+            process.kill(-child.pid, 'SIGKILL')
+          } catch {
+            child.kill('SIGKILL')
+          }
         }
       } catch {
         /* 尽力而为 */
@@ -1096,15 +1101,25 @@ export function createAsyncQueue(limit = 3) {
   let active = 0
   let seq = 0
   const waiting = []
+  const activeTasks = new Map()
+  const cancelledIds = new Set()
 
   function pump() {
     while (active < max && waiting.length) {
       const task = waiting.shift()
+      task.started = false
       active += 1
+      activeTasks.set(task.key, task)
       Promise.resolve()
-        .then(task.start)
+        .then(() => {
+          if (cancelledIds.has(task.key)) return { cancelled: true, cancelledPhase: 'queued' }
+          task.started = true
+          return task.start()
+        })
         .then(task.resolve, task.reject)
         .finally(() => {
+          activeTasks.delete(task.key)
+          cancelledIds.delete(task.key)
           active -= 1
           pump()
         })
@@ -1122,10 +1137,19 @@ export function createAsyncQueue(limit = 3) {
     },
     cancel(key) {
       const index = waiting.findIndex((task) => task.key === key)
-      if (index < 0) return false
+      if (index < 0) {
+        const task = activeTasks.get(key)
+        if (!task || task.started) return false
+        cancelledIds.add(key)
+        task.resolve({ cancelled: true, cancelledPhase: 'queued' })
+        return true
+      }
       const [task] = waiting.splice(index, 1)
-      task.resolve({ cancelled: true })
+      task.resolve({ cancelled: true, cancelledPhase: 'queued' })
       return true
+    },
+    isCancelled(key) {
+      return cancelledIds.has(key)
     },
     stats() {
       return { limit: max, active, waiting: waiting.length }
@@ -1169,6 +1193,7 @@ export function asyncSessionLockKeys(job = {}) {
 export function createSessionQueue(limit = 3) {
   const max = normalizeSessionQueueLimit(limit)
   const lanes = new Map()
+  const cancelledIds = new Set()
 
   const findLane = (keys) => {
     for (const key of keys) {
@@ -1197,6 +1222,7 @@ export function createSessionQueue(limit = 3) {
   }
   const startTask = (lane, task) => {
     lane.active = task
+    task.started = false
     try {
       task.onStart?.({ status: 'RUNNING', position: 0 })
     } catch (error) {
@@ -1206,9 +1232,14 @@ export function createSessionQueue(limit = 3) {
       return
     }
     Promise.resolve()
-      .then(task.start)
+      .then(() => {
+        if (cancelledIds.has(task.key)) return { cancelled: true, cancelledPhase: 'queued' }
+        task.started = true
+        return task.start()
+      })
       .then(task.resolve, task.reject)
       .finally(() => {
+        cancelledIds.delete(task.key)
         if (lane.active === task) lane.active = null
         pump(lane)
       })
@@ -1257,14 +1288,23 @@ export function createSessionQueue(limit = 3) {
       const wanted = String(key ?? '')
       for (const lane of new Set(lanes.values())) {
         const index = lane.waiting.findIndex((task) => task.key === wanted)
-        if (index < 0) continue
-        const [task] = lane.waiting.splice(index, 1)
-        task.resolve({ cancelled: true })
-        notifyWaiting(lane)
-        if (!lane.active) pump(lane)
-        return true
+        if (index >= 0) {
+          const [task] = lane.waiting.splice(index, 1)
+          task.resolve({ cancelled: true, cancelledPhase: 'queued' })
+          notifyWaiting(lane)
+          if (!lane.active) pump(lane)
+          return true
+        }
+        if (lane.active?.key === wanted && lane.active.resolve && !lane.active.started) {
+          cancelledIds.add(wanted)
+          lane.active.resolve({ cancelled: true, cancelledPhase: 'queued' })
+          return true
+        }
       }
       return false
+    },
+    isCancelled(key) {
+      return cancelledIds.has(String(key ?? ''));
     },
     addAliases(key, keys = []) {
       const allKeys = [String(key || ''), ...(Array.isArray(keys) ? keys : [])].filter(Boolean)
@@ -2591,6 +2631,10 @@ export function apply(ctx, config = {}) {
 
   function trackProc(id, child, run) {
     if (!id) return
+    if (run?.cancelled || run?.finished) {
+      void killProcessTree(child?.pid)
+      return
+    }
     RUNNING_PROCS.set(String(id), { child, startedAt: Date.now(), run })
     // 把 pid 落盘：重启对账用它判「进程还在不在」，比凭无 endedAt 就宣告 ORPHAN 诚实。
     // 只有异步 job 有对应记录；同步派活不进 asyncState。
@@ -2669,7 +2713,7 @@ export function apply(ctx, config = {}) {
       id,
       startedMs,
       entry,
-      cancelled: false,
+      cancelled: !!ASYNC_JOBS.get(id)?.cancelled,
       finished: false,
       push(chunk, source) {
         live.feed(chunk, source)
@@ -2875,7 +2919,7 @@ export function apply(ctx, config = {}) {
 
   // perform 在 startDispatch 之前失败（例如排队期间票据过期/新会话已被前序建出）时，
   // asyncState 有失败回传，但还必须补一条 end，否则面板里这条 job 会凭空消失。
-  function recordAsyncStartFailure(job, error) {
+  function recordAsyncStartFailure(job, error, { status = 'ERROR', excerpt = '' } = {}) {
     const id = String(job.dispatchId || job.id)
     const hasStart = readRecords().some((row) => row?.phase === 'start' && String(row.id || '') === id)
     if (hasStart) return false
@@ -2897,10 +2941,10 @@ export function apply(ctx, config = {}) {
         conversationId: String(job.conversationId || ''),
         cwd: String(job.cwd || ''),
         model: String(job.model || ''),
-        status: 'ERROR',
+        status,
         ok: false,
         ms: Math.max(0, now - (Number(job.startedAt) || now)),
-        excerpt: '',
+        excerpt,
         error: String(error?.message ?? error).slice(0, 1200),
       }),
     )
@@ -2916,7 +2960,19 @@ export function apply(ctx, config = {}) {
     const placement = sessionQueue.enqueue({
       key: job.id,
       keys,
-      start: () => runQueued(start, job.id),
+      start: () => runQueued(async () => {
+        if (job.cancelled || asyncQueue.isCancelled(job.id)) return { cancelled: true, cancelledPhase: 'queued' }
+        const value = await start()
+        if (job.cancelled) {
+          return {
+            ...(value && typeof value === 'object' ? value : {}),
+            status: 'CANCELLED',
+            cancelled: true,
+            cancelledPhase: 'running',
+          }
+        }
+        return value
+      }, job.id),
       onStart: () => setAsyncJobStatus(job, 'RUNNING', 0),
       onQueue: ({ position }) => setAsyncJobStatus(job, 'QUEUED', position),
     })
@@ -2930,7 +2986,7 @@ export function apply(ctx, config = {}) {
     beginAsyncJob(job)
     placement.promise
       .then(async (value) => {
-        if (await settleCancelledQueuedJob(ctx, job, null, value)) return job
+        if (value?.cancelledPhase === 'queued' && await settleCancelledQueuedJob(ctx, job, null, value)) return job
         return settleAsyncJob(ctx, job, summarize(value))
       })
       .catch(async (error) => {
@@ -3024,6 +3080,11 @@ export function apply(ctx, config = {}) {
         ms: Date.now() - job.startedAt,
         error: 'cancelled',
         excerpt: 'cancelled',
+      })
+    } else {
+      recordAsyncStartFailure(job, 'cancelled while queued', {
+        status: 'CANCELLED',
+        excerpt: '排队时被取消，进程没有启动',
       })
     }
     await settleAsyncJob(ctx, job, {
@@ -3441,7 +3502,7 @@ export function apply(ctx, config = {}) {
           timeoutMs: (Number(timeoutSec) || defaultTimeout) * 1000,
         })
         acpPool.touch(key)
-        return {
+        const result = {
           ok: true,
           text: String(value?.text || ''),
           stopReason: value?.stopReason ?? null,
@@ -3450,8 +3511,10 @@ export function apply(ctx, config = {}) {
           ms: Date.now() - started,
           resumed: true,
         }
+        return run.cancelled ? { ...result, ok: false, cancelled: true, error: 'cancelled' } : result
       } catch (error) {
         acpPool.release(key)
+        if (run.cancelled) return { ok: false, cancelled: true, error: 'cancelled' }
         noteAcpFallback(hand, run.id, error?.message ?? error)
         return null
       }
@@ -3469,18 +3532,24 @@ export function apply(ctx, config = {}) {
         permission,
         onUpdate: (update) => run.feedEvent?.(update),
       })
+      if (run.cancelled) return { ...result, ok: false, cancelled: true, error: 'cancelled' }
       if (result?.ok) return result
       noteAcpFallback(hand, run.id, result?.error || 'acp failed')
       return null
     } catch (error) {
+      if (run.cancelled) return { ok: false, cancelled: true, error: 'cancelled' }
       noteAcpFallback(hand, run.id, error?.message ?? error)
       return null
     }
   }
 
   // ACP 没有 exit code，用 ok 折算成 outcome() 认的形状；超时按错误文本认。
-  function acpOutcome(acp) {
-    return outcome({ code: acp?.ok ? 0 : 1, timedOut: /timeout/i.test(String(acp?.error || '')) })
+  function acpOutcome(acp, cancelled = false) {
+    return outcome({
+      code: acp?.ok ? 0 : 1,
+      timedOut: /timeout/i.test(String(acp?.error || '')),
+      cancelled: acp?.cancelled || cancelled,
+    })
   }
 
   // 宿主重启后先把上次的孤儿 start 收尸，再算今天的次数。
@@ -3698,8 +3767,8 @@ export function apply(ctx, config = {}) {
               }, 15000)
               timers.push(ping)
 
-              // ── 旧版：没带 key 时事件名、id 格式、250ms/15s 节拍一律照旧 ──
-              if (!u.searchParams.has('key')) {
+              // ── 旧版：完全没带 key/hand 时事件名、id 格式、250ms/15s 节拍一律照旧 ──
+              if (!u.searchParams.has('key') && !u.searchParams.has('hand')) {
                 let lastRunning = -1
                 let lastHistory = -1
                 const writeEvent = (name, data) => {
@@ -3738,11 +3807,14 @@ export function apply(ctx, config = {}) {
 
               // ── v2：带 key 时只订阅这一条会话，事件拆成 agents / sessions / turns / live ──
               const key = String(u.searchParams.get('key') || '')
-              const hand = key.includes('/') ? key.slice(0, key.indexOf('/')) : ''
-              // key 不认识也照常建连：先发一帧 agents，之后只跟 agents 的变化。
-              const known =
+              const hand = key.includes('/')
+                ? key.slice(0, key.indexOf('/'))
+                : String(u.searchParams.get('hand') || '')
+              const validHand = Object.hasOwn(HANDS, hand)
+              // key 可能在建连时还不存在；sessions 先按合法 hand 推，后续 revision 变化再重查 key。
+              let known =
                 !!key &&
-                !!hand &&
+                validHand &&
                 sessionsForHand(hand).sessions.some((row) => row.key === key || row.sessionKey === key)
 
               // id: 只在有 revision 的事件上写；live 没有 revision，沿用上一个 id。
@@ -3773,7 +3845,7 @@ export function apply(ctx, config = {}) {
               }
 
               const sendSessions = (force = false) => {
-                if (!known) return
+                if (!validHand) return
                 const revision = sessionsRevisionOf(hand)
                 lastSessionsRev = revision
                 const payload = sessionsForHand(hand)
@@ -3863,8 +3935,8 @@ export function apply(ctx, config = {}) {
               }
 
               sendAgents(true)
+              if (validHand) sendSessions(true)
               if (known) {
-                sendSessions(true)
                 sendTurns(true)
                 sendLive()
               }
@@ -3872,10 +3944,20 @@ export function apply(ctx, config = {}) {
               const timer = setInterval(() => {
                 if (closed || res.destroyed || res.writableEnded) return
                 if (agentsRevision !== lastAgentsRev) sendAgents()
-                if (!known) return
+                if (!validHand) return
+                if (!known) {
+                  known = sessionsForHand(hand).sessions.some((row) => row.key === key || row.sessionKey === key)
+                  if (known) {
+                    sendSessions(true)
+                    sendTurns(true)
+                    sendLive()
+                    return
+                  }
+                }
                 // 恢复任务可能由重启前的旧进程直接写 end（新进程的 revision 不会 bump）；
                 // 每轮都算指纹，变化才发，保证侧栏行与 turn 的 RUNNING → OK/INTERRUPTED 及时更新。
                 sendSessions()
+                if (!known) return
                 sendTurns()
                 sendLive()
               }, 250)
@@ -4001,6 +4083,23 @@ export function apply(ctx, config = {}) {
                   if (sessionQueue.cancel(id) || asyncQueue.cancel(id)) {
                     return send(200, { ok: true, id, cancelled: 'queued', killed: false })
                   }
+                  // ACP 或已出队但还没有子进程句柄：标记取消，让 perform 收尾时如实报 CANCELLED。
+                  const job = ASYNC_JOBS.get(id)
+                  const run = RUNNING.get(id)
+                  if ((job && !job.endedAt) || (run && !run.finished)) {
+                    if (job) job.cancelled = true
+                    if (run && !run.finished) {
+                      run.cancelled = true
+                      finishDispatch(run, {
+                        status: 'CANCELLED',
+                        ok: false,
+                        ms: Number.isFinite(run.startedMs) ? Date.now() - run.startedMs : undefined,
+                        error: 'cancelled',
+                        excerpt: 'cancelled',
+                      })
+                    }
+                    return send(200, { ok: true, id, cancelled: 'running', killed: false })
+                  }
                   // 幂等：跑完的、取消过的、不存在的 id 都按「没在跑」回，别谎报成功
                   return send(404, {
                     ok: false,
@@ -4023,8 +4122,8 @@ export function apply(ctx, config = {}) {
                 }
                 RUNNING_PROCS.delete(id)
                 // 只杀自己起的 pid 的进程树；taskkill /T /F 因为 CLI 常留孙进程。
-                const treeKilled = await killProcessTree(pid)
-                return send(200, { ok: true, id, killed: true, pid: pid || null, treeKilled })
+                const treeKilled = pid ? await killProcessTree(pid) : false
+                return send(200, { ok: true, id, killed: !!pid, pid: pid || null, treeKilled })
               } catch (e) {
                 return fail(500, e)
               }
@@ -4213,31 +4312,36 @@ export function apply(ctx, config = {}) {
         onChunk: run.push,
         onSpawn: (child) => trackProc(run.id, child, run),
       })
+      result.cancelled = !!run.cancelled
       const parsed = collectAgy(result.stdout)
-      const verdict = outcome(result, parsed?.status ?? (result.code === 0 ? 'SUCCESS' : 'ERROR'))
+      const verdict = outcome(
+        result,
+        parsed?.status ?? (result.code === 0 ? (parsed ? 'SUCCESS' : 'UNPARSED') : 'ERROR'),
+      )
       finishDispatch(run, {
         status: verdict.status,
         ok: verdict.ok,
         ms: result.ms,
         exitCode: result.code,
         excerpt: String(parsed?.response ?? result.stdout ?? ''),
-        error: result.timedOut ? 'timeout' : result.code === 0 ? '' : String(result.stderr || ''),
+        error: result.cancelled ? 'cancelled' : result.timedOut ? 'timeout' : result.code === 0 ? '' : String(result.stderr || ''),
         conversationId: parsed?.conversation_id || resumeId,
         tokens: parsed?.usage,
       })
 
       if (!parsed) {
         return {
-          status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'UNPARSED' : 'ERROR',
+          status: verdict.status,
           response: String(run.entry.output || result.stdout || '').slice(0, 20000),
           stderr: String(result.stderr ?? '').slice(0, 4000),
           exitCode: result.code,
+          cancelled: !!result.cancelled,
           elapsedSec: Number((result.ms / 1000).toFixed(1)),
         }
       }
 
       const out = {
-        status: result.timedOut ? 'TIMEOUT' : (parsed.status ?? (result.code === 0 ? 'SUCCESS' : 'ERROR')),
+        status: verdict.status,
         response: String(parsed.response ?? ''),
         conversationId: parsed.conversation_id,
         numTurns: parsed.num_turns,
@@ -4253,7 +4357,7 @@ export function apply(ctx, config = {}) {
       if (err) out.stderr = err.slice(0, 2000)
 
       // 接不上旧会话时给个明确提示，别让人以为是自己写错了
-      if (resumeId && out.status !== 'SUCCESS' && !String(out.response ?? '').trim()) {
+      if (resumeId && !verdict.ok && !result.cancelled && !String(out.response ?? '').trim()) {
         out.hint = `会话 ${resumeId} 可能已被删除或失效：去掉 session / conversationId 再跑一次就会新开一个。`
       }
 
@@ -4301,7 +4405,7 @@ export function apply(ctx, config = {}) {
           exitCode: value.exitCode,
           excerpt: value.response,
           cost: null,
-          error: value.status === 'SUCCESS' || value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
+          error: value.status === 'SUCCESS' || value.status === 'OK' || value.status === 'CANCELLED' ? '' : String(value.response || '').slice(0, 400),
           jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
         }))
         return clean({
@@ -4663,6 +4767,7 @@ export function apply(ctx, config = {}) {
         onChunk: run.push,
         onSpawn: (child) => trackProc(run.id, child, run),
       })
+      result.cancelled = !!run.cancelled
       const raw = String(result.stdout ?? '')
       const err = String(result.stderr ?? '')
       const collected = collectCodex(raw)
@@ -4692,14 +4797,14 @@ export function apply(ctx, config = {}) {
         ms: result.ms,
         exitCode: result.code,
         excerpt: answer || err.slice(-1200) || raw.slice(-1200),
-        error: result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
+        error: result.cancelled ? 'cancelled' : result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
         conversationId: sid,
         tokens,
       })
 
       return clean({
         // /cancel 杀掉进程后只会得到一个失败码；回传要如实写 CANCELLED
-        status: run.cancelled ? 'CANCELLED' : result.timedOut ? 'TIMEOUT' : collected.failed || result.code !== 0 ? 'ERROR' : 'OK',
+        status: verdict.status,
         response: answer || err.slice(-4000) || raw.slice(-4000),
         sessionId: sid || '',
         resumed,
@@ -4954,6 +5059,7 @@ export function apply(ctx, config = {}) {
 
       // 收尾：解析 + 落记录。同步和异步两条路共用，行为必须一致。
       const settle = (result) => {
+        result.cancelled = !!run.cancelled
         const raw = String(result.stdout ?? '')
         const err = String(result.stderr ?? '')
         const parsed = collectClaude(raw)
@@ -4975,13 +5081,13 @@ export function apply(ctx, config = {}) {
           ms: result.ms,
           exitCode: result.code,
           excerpt: answer || err.slice(-1200) || raw.slice(-1200),
-          error: result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
+          error: result.cancelled ? 'cancelled' : result.timedOut ? 'timeout' : result.code === 0 ? '' : err,
           conversationId: sid,
           tokens: usage,
           cost: parsed?.total_cost_usd,
         })
         return clean({
-          status: result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
+          status: verdict.status,
           response: answer,
           sessionId: sid,
           resumed: !!known,
@@ -5050,7 +5156,7 @@ export function apply(ctx, config = {}) {
           exitCode: value.exitCode,
           excerpt: value.response,
           cost: value.cost,
-          error: value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
+          error: run.cancelled || value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
           jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
         }))
         return clean({
@@ -5203,7 +5309,7 @@ export function apply(ctx, config = {}) {
       if (acp) {
         sid = String(acp.sessionId || known || '')
         answer = String(acp.text || '').trim() || String(run.entry.output || '').slice(-3000)
-        verdict = acpOutcome(acp)
+        verdict = acpOutcome(acp, run.cancelled)
         const usage = acpUsageOf(acp.usage)
         tokens = usage.tokens
         cost = usage.cost
@@ -5220,6 +5326,7 @@ export function apply(ctx, config = {}) {
           onChunk: run.push,
           onSpawn: (child) => trackProc(run.id, child, run),
         })
+        result.cancelled = !!run.cancelled
         // opencode 出的是 JSONL 事件流
         raw = String(result.stdout ?? '')
         err = String(result.stderr ?? '')
@@ -5235,6 +5342,7 @@ export function apply(ctx, config = {}) {
         cost = collected.cost
       }
 
+      if (run.cancelled) verdict = { status: 'CANCELLED', ok: false }
       if (name && sid) {
         recordSessionName('opencode', name, sid, runCwd)
         updateSessionIndex(OPENCODE_INDEX, name, { id: sid, cwd: runCwd, updated: new Date().toISOString() })
@@ -5246,13 +5354,15 @@ export function apply(ctx, config = {}) {
         ms: acp ? acp.ms : result.ms,
         exitCode: acp ? undefined : result.code,
         excerpt: answer,
-        error: acp
-          ? String(acp.error || '')
-          : result.timedOut
-            ? 'timeout'
-            : result.code === 0
-              ? ''
-              : err,
+        error: run.cancelled
+          ? 'cancelled'
+          : acp
+            ? String(acp.error || '')
+            : result.timedOut
+              ? 'timeout'
+              : result.code === 0
+                ? ''
+                : err,
         conversationId: sid,
         tokens,
         cost,
@@ -5261,7 +5371,7 @@ export function apply(ctx, config = {}) {
       })
 
       return clean({
-        status: acp ? verdict.status : result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR',
+        status: verdict.status,
         response: answer,
         sessionId: sid,
         resumed: acp ? !!acp.resumed : !!known,
@@ -5297,7 +5407,7 @@ export function apply(ctx, config = {}) {
           exitCode: value.exitCode,
           excerpt: value.response,
           cost: value.cost,
-          error: value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
+          error: run.cancelled || value.status === 'OK' ? '' : String(value.response || '').slice(0, 400),
           jobFile: path.join(JOBS_DIR, `${job.id}.txt`),
         }))
         return clean({
@@ -5731,7 +5841,7 @@ export function apply(ctx, config = {}) {
       if (acp) {
         sid = String(acp.sessionId || known || '')
         answer = String(acp.text || '').trim() || String(run.entry.output || '').slice(-3000)
-        verdict = acpOutcome(acp)
+        verdict = acpOutcome(acp, run.cancelled)
         status = verdict.status
         const usage = acpUsageOf(acp.usage)
         tokens = usage.tokens
@@ -5746,6 +5856,7 @@ export function apply(ctx, config = {}) {
           onChunk: run.push,
           onSpawn: (child) => trackProc(run.id, child, run),
         })
+        result.cancelled = !!run.cancelled
         raw = String(result.stdout ?? '')
         err = String(result.stderr ?? '')
         sid = hand.pick(raw, runCwd) || hand.pick(err, runCwd) || known || ''
@@ -5755,12 +5866,16 @@ export function apply(ctx, config = {}) {
           err.slice(-3000) ||
           raw.slice(-3000)
         verdict = outcome(result, reportedStatus(to, raw))
-        status = result.timedOut ? 'TIMEOUT' : result.code === 0 ? 'OK' : 'ERROR'
+        status = verdict.status
         const usage = usageOf(to, raw)
         tokens = usage.tokens
         cost = usage.cost
       }
 
+      if (run.cancelled) {
+        verdict = { status: 'CANCELLED', ok: false }
+        status = 'CANCELLED'
+      }
       if (name && sid && sid !== known) {
         recordSessionName(to, name, sid, runCwd)
         updateSessionIndex(idxFile, name, { id: sid, cwd: runCwd, updated: new Date().toISOString() })
@@ -5772,13 +5887,15 @@ export function apply(ctx, config = {}) {
         ms: acp ? acp.ms : result.ms,
         exitCode: acp ? undefined : result.code,
         excerpt: answer,
-        error: acp
-          ? String(acp.error || '')
-          : result.timedOut
-            ? 'timeout'
-            : result.code === 0
-              ? ''
-              : err,
+        error: run.cancelled
+          ? 'cancelled'
+          : acp
+            ? String(acp.error || '')
+            : result.timedOut
+              ? 'timeout'
+              : result.code === 0
+                ? ''
+                : err,
         conversationId: sid,
         tokens,
         cost,
@@ -5842,7 +5959,7 @@ export function apply(ctx, config = {}) {
           excerpt: value.response,
           cost: value.cost ?? null,
           error:
-            value.status === 'OK' || value.status === 'SUCCESS'
+            run.cancelled || value.status === 'OK' || value.status === 'SUCCESS' || value.status === 'CANCELLED'
               ? ''
               : String(value.response || '').slice(0, 400),
           jobFile: path.join(JOBS_DIR, `${job.id}.txt`),

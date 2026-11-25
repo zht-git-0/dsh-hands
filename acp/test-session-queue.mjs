@@ -85,7 +85,7 @@ const deferred = () => {
   assert.equal(queue.cancel('B'), true)
   assert.equal(queue.position('C'), 1)
   assert.equal(queue.position('D'), 2)
-  assert.deepEqual(await b.promise, { cancelled: true })
+  assert.deepEqual(await b.promise, { cancelled: true, cancelledPhase: 'queued' })
   gates[0].resolve({ cancelled: true })
   await flush()
   assert.equal(queue.position('A'), null, 'A 已结束，取消语义由任务结果表示')
@@ -218,6 +218,21 @@ const deferred = () => {
   assert.deepEqual(starts, ['new'])
   await waiting.promise
   console.log('8) 恢复进程会话锁 ok')
+}
+
+// 9) 会话队首已出队但微任务未执行：取消后 start 不运行，下一票接棒。
+{
+  const queue = createSessionQueue()
+  let ran = false
+  const a = queue.enqueue({ key: 'A', keys: ['same'], start: () => { ran = true } })
+  assert.equal(queue.cancel('A'), true)
+  assert.deepEqual(await a.promise, { cancelled: true, cancelledPhase: 'queued' })
+  await flush()
+  assert.equal(ran, false)
+  const b = queue.enqueue({ key: 'B', keys: ['same'], start: () => {} })
+  assert.equal(b.status, 'RUNNING')
+  await b.promise
+  console.log('9) 会话队首出队未启动取消 ok')
 }
 
 console.log('ok')

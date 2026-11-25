@@ -247,7 +247,7 @@ async function until(check, label, tries = 200) {
   assert.equal(store.debug().mode, 'sse', 'SSE 已连上')
   const es = FakeEventSource.instances.at(-1)
   assert.ok(es, 'EventSource 实例存在')
-  assert.match(es.url, /dsh-hands\/stream\?key=opencode%2Falpha$/)
+  assert.match(es.url, /dsh-hands\/stream\?hand=opencode&key=opencode%2Falpha$/)
 
   es.emit('open', {})
   es.emit('live', { key: 'opencode/alpha', id: 't1', delta: 'hello', next: 5 })
@@ -746,6 +746,93 @@ async function until(check, label, tries = 200) {
   await until(() => pollCalls.includes('/dsh-hands/turn?id=r1&from=0'), 'poll running turn from zero')
   polling.stop()
   console.log('13) RUNNING 空输出 / next=0 / 轮询偏移 ok')
+}
+
+// ── 14. 最新页 REST/SSE 刷新不抹掉 loadOlderTurns 已加载的更早页 ────────────
+{
+  FakeEventSource.instances.length = 0
+  const key = 'opencode/paged'
+  const latest = Array.from({ length: 50 }, (_, index) => ({
+    id: `p${52 - index}`,
+    hand: 'opencode',
+    status: 'OK',
+    startedAt: new Date(Date.parse('2026-11-18T12:00:00.000Z') - index * 60_000).toISOString(),
+  }))
+  const older = [
+    { id: 'p2', hand: 'opencode', status: 'OK', startedAt: '2026-11-18T10:00:00.000Z' },
+    { id: 'p1', hand: 'opencode', status: 'OK', startedAt: '2026-11-18T09:00:00.000Z' },
+  ]
+  const fetchImpl = async (url) => {
+    const u = new URL(String(url))
+    if (u.pathname === '/dsh-hands/agents') {
+      return { ok: true, status: 200, json: async () => ({ checkedAt: '', agents: [{ hand: 'opencode' }] }) }
+    }
+    if (u.pathname === '/dsh-hands/sessions') {
+      return { ok: true, status: 200, json: async () => ({ hand: 'opencode', sessions: [{ key, hand: 'opencode', lastAt: latest[0].startedAt }] }) }
+    }
+    if (u.pathname === '/dsh-hands/turns') {
+      const turns = u.searchParams.get('before') ? older : latest
+      return { ok: true, status: 200, json: async () => ({ key, turns }) }
+    }
+    return { ok: false, status: 404, json: async () => ({}) }
+  }
+  const store = createHandsStore({
+    fetchImpl,
+    EventSourceImpl: FakeEventSource,
+    storage: makeStorage({ 'dsh.hands.sel': JSON.stringify({ hand: 'opencode', key, turnId: 'p52', at: '' }) }),
+  })
+  store.start()
+  await until(() => store.getSnapshot().turnsByKey[key]?.length === 50, 'latest turn page')
+  await store.loadOlderTurns(key)
+  const pagedIds = () => store.getSnapshot().turnsByKey[key].map((row) => row.id)
+  assert.equal(pagedIds().length, 52)
+  assert.equal(pagedIds()[0], 'p52')
+  assert.ok(pagedIds().includes('p2'))
+  assert.equal(pagedIds().at(-1), 'p1')
+  const es = FakeEventSource.instances.at(-1)
+  es.emit('turns', { revision: 2, key, turns: latest })
+  assert.equal(pagedIds().length, 52, 'SSE 最新页不抹更早页')
+  assert.equal(pagedIds().at(-1), 'p1')
+  await store.loadTurns(key)
+  assert.equal(pagedIds().length, 52, 'REST 最新页不抹更早页')
+  assert.equal(pagedIds().at(-1), 'p1')
+  assert.equal(store.turnsMore(key), false, '历史耗尽后最新刷新不能把 more 改回 true')
+  store.stop()
+  console.log('14) 分页刷新保留更早轮次 ok')
+}
+
+// ── 15. 空 key 时 agents 事件触发重新解析，新会话出现后自动重连 key 流 ───────
+{
+  FakeEventSource.instances.length = 0
+  const key = 'opencode/new-session'
+  let sessions = []
+  const fetchImpl = async (url) => {
+    const u = new URL(String(url))
+    if (u.pathname === '/dsh-hands/agents') {
+      return { ok: true, status: 200, json: async () => ({ checkedAt: '', agents: [{ hand: 'opencode' }] }) }
+    }
+    if (u.pathname === '/dsh-hands/sessions') {
+      return { ok: true, status: 200, json: async () => ({ hand: 'opencode', sessions }) }
+    }
+    if (u.pathname === '/dsh-hands/turns') {
+      return { ok: true, status: 200, json: async () => ({ key, turns: [] }) }
+    }
+    return { ok: false, status: 404, json: async () => ({}) }
+  }
+  const store = createHandsStore({
+    fetchImpl,
+    EventSourceImpl: FakeEventSource,
+    storage: makeStorage({ 'dsh.hands.sel': JSON.stringify({ hand: 'opencode', key: '', turnId: '', at: '' }) }),
+  })
+  store.start()
+  await until(() => store.debug().mode === 'sse' && store.getSnapshot().selection.hand === 'opencode', 'empty key stream')
+  assert.equal(store.getSnapshot().selection.key, '')
+  sessions = [{ key, hand: 'opencode', name: 'new', lastAt: '2026-11-18T12:00:00.000Z' }]
+  FakeEventSource.instances.at(-1).emit('agents', { revision: 2, agents: [{ hand: 'opencode' }] })
+  await until(() => store.getSnapshot().selection.key === key, 'agents event resolves new key')
+  assert.ok(FakeEventSource.instances.at(-1).url.includes(encodeURIComponent(key)), 'key 出现后重连会话流')
+  store.stop()
+  console.log('15) 空 key agents 事件刷新 ok')
 }
 
 console.log('ok')
