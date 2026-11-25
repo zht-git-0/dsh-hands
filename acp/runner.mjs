@@ -83,13 +83,14 @@ async function selectModel(client, sessionId, model, session) {
 // onUpdate 语义：onUpdate(update) 收到的是 ACP 原始 session/update。
 // session/load、session/resume 会把历史重放成 session/update；这段时间内转发出去的对象
 // 一律带 replay:true，调用方（尤其 live view）应当整块丢弃。恢复完成后恢复正常（不带该字段）。
-async function openSession({ agent, cwd, onUpdate, permission, sessionId }) {
+async function openSession({ agent, cwd, onUpdate, permission, sessionId, onSpawn }) {
   const dir = cwd || process.cwd();
   const state = { chunks: [], usage: null };
   let replaying = false;
   const client = new RunnerClient(agent, {
     cwd: dir,
     permission,
+    onSpawn,
     onUpdate: (update) => {
       const kind = update?.sessionUpdate;
       if (kind === "agent_message_chunk") state.chunks.push(update.content?.text ?? "");
@@ -151,10 +152,11 @@ async function openSession({ agent, cwd, onUpdate, permission, sessionId }) {
  * onUpdate(update)：ACP 原始 session/update，语义和 runAcpTask 相同：
  * resume 重放的历史块带 replay:true（本函数目前不 resume，正常不会出现）。
  */
-export async function createAcpSession({ agent, cwd, onUpdate, permission } = {}) {
-  const { client, state, sessionId, session } = await openSession({ agent, cwd, onUpdate, permission });
+export async function createAcpSession({ agent, cwd, onUpdate, permission, onSpawn } = {}) {
+  const { client, state, sessionId, session } = await openSession({ agent, cwd, onUpdate, permission, onSpawn });
   return {
     sessionId,
+    get child() { return client.child; },
     async prompt(text, opts = {}) {
       state.chunks = [];
       state.usage = null;
@@ -187,6 +189,7 @@ export async function runAcpTask({
   prompt,
   sessionId,
   onUpdate,
+  onSpawn,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   permission = "allow",
   model,
@@ -204,7 +207,7 @@ export async function runAcpTask({
   };
   let opened = null;
   try {
-    opened = await openSession({ agent, cwd, onUpdate, permission, sessionId });
+    opened = await openSession({ agent, cwd, onUpdate, permission, sessionId, onSpawn });
     out.sessionId = opened.sessionId;
     out.resumed = opened.resumed;
     await selectModel(opened.client, opened.sessionId, model, opened.session);

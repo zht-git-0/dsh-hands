@@ -2297,10 +2297,53 @@ export function buildPanelDispatchState(records, asyncJobs = {}, running = [], {
       }
       continue
     }
-    if (!isAsyncJobActive(record, { isAlive, inspectProcess, now, maxAgeMs, startToleranceMs })) continue
+    const active = isAsyncJobActive(record, { isAlive, inspectProcess, now, maxAgeMs, startToleranceMs })
     const start = findAsyncDispatchStart(record, starts)
     const id = String(start?.id || record.dispatchId || record.id || '')
-    if (!id || runningMap.has(id)) continue
+    if (!id) continue
+    if (!active) {
+      // 进程已死但恢复定时器还没补 end：保留一个可解释的占位，避免轮次短暂蒸发。
+      // 已有真正 end（含 INTERRUPTED）时绝不覆盖；asyncState 已收尾也不需要占位。
+      if (record.endedAt || !start || jobById.has(id) || runningMap.has(id)) continue
+      const rawStarted = start.startedAt || start.at || record.startedAt || ''
+      const numericStarted = rawStarted === '' ? NaN : Number(rawStarted)
+      const startedMs = Number.isFinite(numericStarted)
+        ? numericStarted
+        : Date.parse(rawStarted) || Number(record.startedAt) || Number(now) || Date.now()
+      const hand = String(start.hand || record.hand || '')
+      const metadata = recoverSessionMetadata(
+        {
+          ...record,
+          ...start,
+          id,
+          dispatchId: id,
+          hand,
+          status: 'ORPHAN',
+          running: false,
+          queued: false,
+          queuePosition: 0,
+        },
+        sessionIndexes,
+      )
+      const placeholder = {
+        ...metadata,
+        startedAt: String(start.startedAt || start.at || new Date(startedMs).toISOString()),
+        at: String(start.at || start.startedAt || new Date(startedMs).toISOString()),
+        status: 'ORPHAN',
+        ok: false,
+        ms: Math.max(0, (Number.isFinite(Number(now)) ? Number(now) : Date.now()) - startedMs),
+        running: false,
+        queued: false,
+        recovered: true,
+        recoverNote: '进程已退出，等待恢复流程补 end',
+        output: '',
+        outputAt: startedMs,
+      }
+      jobs.push(placeholder)
+      jobById.set(id, placeholder)
+      continue
+    }
+    if (runningMap.has(id)) continue
     const numericRecordStart = Number(record.startedAt)
     const startedMs = Number.isFinite(numericRecordStart)
       ? numericRecordStart
@@ -2950,15 +2993,17 @@ export function apply(ctx, config = {}) {
   // 在跑的进程句柄：id -> { child, startedAt, run }。单独存一份，绝不塞进 RUNNING：
   // RUNNING 会被 clean() 递归序列化，ChildProcess 有循环引用会直接炸。
   const RUNNING_PROCS = new Map()
+  // RUNNING 保存可序列化的 entry；这里额外保存真实 run，供 spawn 前的 cancel 使用。
+  const RUNNING_RUNS = new Map()
   let runSeq = 0
 
-  function trackProc(id, child, run) {
+  function trackProc(id, child, run, meta = {}) {
     if (!id) return
     if (run?.cancelled || run?.finished) {
       void killProcessTree(child?.pid)
       return
     }
-    RUNNING_PROCS.set(String(id), { child, startedAt: Date.now(), run })
+    RUNNING_PROCS.set(String(id), { ...meta, child, startedAt: Date.now(), run })
     // 把 pid 落盘：重启对账用它判「进程还在不在」，比凭无 endedAt 就宣告 ORPHAN 诚实。
     // 只有异步 job 有对应记录；同步派活不进 asyncState。
     try {
@@ -3039,7 +3084,7 @@ export function apply(ctx, config = {}) {
     }
     touchRunning()
     touchAgentDimensions(entry)
-    return {
+    const run = {
       id,
       startedMs,
       entry,
@@ -3071,6 +3116,8 @@ export function apply(ctx, config = {}) {
         entry.outputLength = live.totalLength()
       },
     }
+    RUNNING_RUNS.set(id, run)
+    return run
   }
 
   // 把一次派发收尾：从运行中移除，元信息进日志，全文进 hands-jobs。
@@ -3088,6 +3135,7 @@ export function apply(ctx, config = {}) {
       run.entry.sessionKey || sessionKeyOf(run.entry.hand, run.entry.session, startedMs, run.entry.conversationId || run.id)
     RUNNING.delete(run.id)
     RUNNING_PROCS.delete(run.id)
+    RUNNING_RUNS.delete(run.id)
     appendRecord(
       clean({
         v: 2,
@@ -3202,14 +3250,20 @@ export function apply(ctx, config = {}) {
     if (existingEnd) {
       const finalStatus = String(existingEnd.status || record.status || status).toUpperCase()
       const endedAt = String(existingEnd.at || record.endedAt || new Date().toISOString())
-      const changed = record.status !== finalStatus || record.endedAt !== endedAt
+      const delivery = record.delivery === 'sent' ? 'sent' : 'skipped'
+      const changed = record.status !== finalStatus || record.endedAt !== endedAt || record.delivery !== delivery
       record.status = finalStatus
       record.endedAt = endedAt
+      record.delivery = delivery
       return { appended: false, changed, end: existingEnd, id }
     }
 
     const endedAt = new Date().toISOString()
-    const startedMs = Date.parse(record.startedAt || '') || Date.parse(endedAt)
+    const rawStarted = start?.startedAt || start?.at || record.startedAt || ''
+    const numericStarted = rawStarted === '' ? NaN : Number(rawStarted)
+    const startedMs = Number.isFinite(numericStarted)
+      ? numericStarted
+      : Date.parse(rawStarted) || Date.parse(endedAt)
     record.status = status
     record.endedAt = endedAt
     record.delivery = record.delivery === 'sent' ? 'sent' : 'skipped'
@@ -3886,10 +3940,15 @@ export function apply(ctx, config = {}) {
             agent: hand,
             cwd: workdir,
             permission,
+            onSpawn: (child) => {
+              const activeRun = current.holder.current
+              if (activeRun) trackProc(activeRun.id, child, activeRun, { acpKey: key })
+            },
             onUpdate: (update) => current.holder.current?.feedEvent?.(update),
           })
         })
         slot.holder.current = run
+        trackProc(run.id, slot.handle.child, run, { acpKey: key })
         const started = Date.now()
         const value = await slot.handle.prompt(prompt, {
           model: model || undefined,
@@ -3907,6 +3966,7 @@ export function apply(ctx, config = {}) {
         }
         return run.cancelled ? { ...result, ok: false, cancelled: true, error: 'cancelled' } : result
       } catch (error) {
+        RUNNING_PROCS.delete(run.id)
         acpPool.release(key)
         if (run.cancelled) return { ok: false, cancelled: true, error: 'cancelled' }
         noteAcpFallback(hand, run.id, error?.message ?? error)
@@ -3924,6 +3984,7 @@ export function apply(ctx, config = {}) {
         sessionId: sessionId || undefined,
         timeoutMs: (Number(timeoutSec) || defaultTimeout) * 1000,
         permission,
+        onSpawn: (child) => trackProc(run.id, child, run),
         onUpdate: (update) => run.feedEvent?.(update),
       })
       if (run.cancelled) return { ...result, ok: false, cancelled: true, error: 'cancelled' }
@@ -4516,9 +4577,11 @@ export function apply(ctx, config = {}) {
                   }
                   // ACP 或已出队但还没有子进程句柄：标记取消，让 perform 收尾时如实报 CANCELLED。
                   const job = ASYNC_JOBS.get(id)
-                  const run = RUNNING.get(id)
+                  const activeEntry = RUNNING.get(id)
+                  const run = proc?.run || RUNNING_RUNS.get(id) || null
                   if ((job && !job.endedAt) || (run && !run.finished)) {
                     if (job) job.cancelled = true
+                    if (activeEntry) activeEntry.cancelled = true
                     if (run && !run.finished) {
                       run.cancelled = true
                       finishDispatch(run, {
@@ -4529,7 +4592,9 @@ export function apply(ctx, config = {}) {
                         excerpt: 'cancelled',
                       })
                     }
-                    return send(200, { ok: true, id, cancelled: 'running', killed: false })
+                    const pid = Number(job?.pid) || 0
+                    const treeKilled = pid ? await killProcessTree(pid) : false
+                    return send(200, { ok: true, id, cancelled: 'running', killed: !!pid, pid: pid || null, treeKilled })
                   }
                   // 幂等：跑完的、取消过的、不存在的 id 都按「没在跑」回，别谎报成功
                   return send(404, {
@@ -4554,6 +4619,7 @@ export function apply(ctx, config = {}) {
                 RUNNING_PROCS.delete(id)
                 // 只杀自己起的 pid 的进程树；taskkill /T /F 因为 CLI 常留孙进程。
                 const treeKilled = pid ? await killProcessTree(pid) : false
+                if (proc.acpKey && acpPool) acpPool.release(proc.acpKey)
                 return send(200, { ok: true, id, killed: !!pid, pid: pid || null, treeKilled })
               } catch (e) {
                 return fail(500, e)

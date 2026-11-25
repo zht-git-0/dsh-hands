@@ -54,6 +54,7 @@ export class AcpClient {
       for (const { reject } of this.pending.values()) reject(new Error(`agent exited (${code})`));
       this.pending.clear();
     });
+    if (typeof this.options.onSpawn === "function") this.options.onSpawn(this.child);
     return this;
   }
 

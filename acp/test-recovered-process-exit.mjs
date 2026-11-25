@@ -94,19 +94,22 @@ const realTurns = await call('/dsh-hands/turns?key=' + encodeURIComponent('openc
 assert.equal(realTurns.json.turns[0].status, 'RUNNING')
 fs.writeFileSync(${JSON.stringify(readyFile)}, 'ready')
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const logFile = path.join(process.env.USERPROFILE, '.dsh', 'hands-log.jsonl')
+const readRecords = () => fs.readFileSync(logFile, 'utf8').split(/\\r?\\n/).filter(Boolean).map(JSON.parse)
 let turns = realTurns
-for (let i = 0; i < 180 && turns.json.turns[0]?.status !== 'ORPHAN'; i += 1) {
+for (let i = 0; i < 180; i += 1) {
+  if (readRecords().some((row) => row.id === 'run-old' && row.phase === 'end')) break
   await sleep(100)
   turns = await call('/dsh-hands/turns?key=' + encodeURIComponent('opencode/sid:sid_old'))
 }
 assert.equal(turns.json.turns.length, 1, '进程退出后轮次仍可见')
 assert.equal(turns.json.turns[0].id, 'run-old')
 assert.equal(turns.json.turns[0].status, 'ORPHAN')
-const records = fs.readFileSync(path.join(process.env.USERPROFILE, '.dsh', 'hands-log.jsonl'), 'utf8')
-  .split(/\\r?\\n/).filter(Boolean).map(JSON.parse)
+const records = readRecords()
 const ends = records.filter((row) => row.id === 'run-old' && row.phase === 'end')
 assert.equal(ends.length, 1, '只补一条 end')
 assert.equal(ends[0].status, 'ORPHAN')
+assert.ok(ends[0].ms >= 60000, '数字时间戳恢复 end 的 ms 必须保留真实间隔，实际 ' + ends[0].ms)
 assert.match(ends[0].error, /重启.*进程/)
 const sessions = await call('/dsh-hands/sessions?hand=opencode')
 const row = sessions.json.sessions.find((item) => item.conversationId === 'sid_old')
